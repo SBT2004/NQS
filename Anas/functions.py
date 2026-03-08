@@ -1,7 +1,5 @@
 import numpy as np
-from scipy.sparse import lil_matrix, kron, identity, csr_matrix
-from scipy.sparse.linalg import eigsh
-import matplotlib.pyplot as plt
+from scipy.sparse import lil_matrix, csr_matrix
 
 def construct_basis(L):
     """
