@@ -3,7 +3,6 @@ from scipy.sparse import lil_matrix, csr_matrix
 # General graph Hamiltonian
 
 class SpinGraph:
-
     def __init__(self, N):
         self.N = N
         self.dim = 2**N
