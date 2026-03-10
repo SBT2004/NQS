@@ -1,23 +1,5 @@
 from scipy.sparse import lil_matrix, csr_matrix
 
-# Local spin operators
-
-def sigma_z(state, j):
-    return 1 if ((state >> j) & 1) == 0 else -1
-
-def sigma_x_flip(state, j):
-    return state ^ (1 << j)
-
-def sigma_plus(state, j):
-    if ((state >> j) & 1) == 0:
-        return state ^ (1 << j)
-    return None
-
-def sigma_minus(state, j):
-    if ((state >> j) & 1) == 1:
-        return state ^ (1 << j)
-    return None
-
 # General graph Hamiltonian
 
 class SpinGraph:
