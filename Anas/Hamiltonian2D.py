@@ -1,29 +1,29 @@
 from scipy.sparse import lil_matrix, csr_matrix
 
+# local operators
+def sigma_z(self, state, j):
+    return 1 if ((state >> j) & 1) == 0 else -1
+
+def sigma_x_flip(self, state, j):
+    return state ^ (1 << j)
+
+def sigma_plus(self, state, j):
+    if ((state >> j) & 1) == 0:
+        return state ^ (1 << j)
+    return None
+
+def sigma_minus(self, state, j):
+    if ((state >> j) & 1) == 1:
+        return state ^ (1 << j)
+    return None
+
 class SpinGraph:
     def __init__(self, N):
-        self.N = N              # number of sites
+        self.N = N              
         self.dim = 2**N
         self.H = lil_matrix((self.dim, self.dim), dtype=float)
 
-    # --- local operators (same as before) ---
-    def sigma_z(self, state, j):
-        return 1 if ((state >> j) & 1) == 0 else -1
-
-    def sigma_x_flip(self, state, j):
-        return state ^ (1 << j)
-
-    def sigma_plus(self, state, j):
-        if ((state >> j) & 1) == 0:
-            return state ^ (1 << j)
-        return None
-
-    def sigma_minus(self, state, j):
-        if ((state >> j) & 1) == 1:
-            return state ^ (1 << j)
-        return None
-
-    # --- interaction terms over arbitrary edges ---
+    # interaction terms over arbitrary edges
     def add_zz(self, edges, J):
         for i,j in edges:
             for s in range(self.dim):
