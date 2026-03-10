@@ -1,4 +1,5 @@
 from scipy.sparse import lil_matrix, csr_matrix
+from functions import sigma_z, sigma_plus, sigma_minus, sigma_x_flip
 
 # General graph Hamiltonian
 
