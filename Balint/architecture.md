@@ -213,6 +213,8 @@ Notes:
   the first complete implementation.
 - Complex-valued parameters are not a first requirement, but the interface
   should not make them impossible later.
+- In the current VMC phase, model architectures are project-owned JAX models,
+  even when temporary NetKet backends are used elsewhere in the stack.
 
 ### `sampler`
 
@@ -252,6 +254,8 @@ Notes:
 
 - This should be the main integration point between models, samplers, and
   observables.
+- In the current implementation phase, `vqs` is still project-owned even if it
+  delegates temporary sampling and energy-evaluation work to NetKet adapters.
 
 ### `driver` / `training`
 
@@ -272,6 +276,8 @@ Notes:
 - The notebook already uses a callback to compute entropy during optimization.
 - The training loop should support the same pattern without hard-coding entropy
   into the driver.
+- In the current implementation phase, gradients and parameter updates are
+  computed in project code with JAX autodiff and a project optimizer wrapper.
 
 ### `observables`
 

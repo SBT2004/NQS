@@ -38,7 +38,7 @@ class Graph(ABC):
         seen: set[tuple[int, int]] = set()
         for node in range(self.n_nodes):
             for neighbor in self.get_neighbors(node, n):
-                pair = tuple(sorted((node, neighbor)))
+                pair = (min(node, neighbor), max(node, neighbor))
                 if pair[0] == pair[1] or pair in seen:
                     continue
                 seen.add(pair)

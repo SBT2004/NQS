@@ -90,7 +90,7 @@ class Operator:
                 sigma_prime = sigma.copy()
                 self._write_local_state(sigma_prime, term.sites, int(row))
                 global_index = self.hilbert.state_to_index(sigma_prime)
-                value = term.coefficient * column[row]
+                value = complex(term.coefficient * column[row])
                 contributions[global_index] = contributions.get(global_index, 0.0) + value
 
         return [

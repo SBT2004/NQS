@@ -17,6 +17,9 @@
 - Keep changes minimal and consistent with surrounding code.
 - Prefer reusable logic in `.py` modules. Use notebooks for experiments, demos,
   plots, and exploratory validation.
+- Demos must be notebook-first:
+  use `demo.ipynb` for the user-facing demo and `demo_helper.py` for reusable
+  support code in the same `demos/` folder.
 - Do not leave important shared logic only in notebooks if it belongs in a
   module.
 - Keep subsystem boundaries clean:
@@ -61,6 +64,11 @@
 - Use the narrowest relevant verification available for the change.
 - Prefer targeted Python checks, import smoke tests, small script runs, or
   notebook-cell-level validation over broad unfocused execution.
+- For Python source changes, run `ruff check` on the touched source/tests as a
+  required verification step before closing the task.
+- For Python source changes, run `pyright` on the touched source/tests or the
+  relevant package as a required type/semantic verification step before closing
+  the task.
 - Validate new physics or estimator logic against exact diagonalization whenever
   the system size is small enough.
 - If no automated verification exists for the changed area, say so explicitly
