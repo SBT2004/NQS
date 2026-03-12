@@ -12,7 +12,7 @@ import netket as nk
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from nqs import Adam, CNN, FFNN, RBM, NetKetSampler, SpinHilbert, VMC, VariationalState  # noqa: E402
 
@@ -53,23 +53,25 @@ def run_model_demo(
     length: int,
     seed: int,
     learning_rate: float,
-    n_samples: int = 16,
-    n_discard_per_chain: int = 2,
-    n_chains: int = 4,
-    n_iter: int = 3,
+    n_samples: int = 256,
+    n_discard_per_chain: int = 32,
+    n_chains: int = 16,
+    n_iter: int = 64,
+    eval_samples: int = 4096,
+    eval_repeats: int = 4,
 ) -> tuple[list[float], float]:
-    """Run a short VMC optimization for one model and return its energy trace."""
+    """Optimize one ansatz with sampled VMC and return its energy trace."""
 
     hilbert = SpinHilbert(length)
     params = model.init(jax.random.PRNGKey(seed), hilbert)
-    sampler = NetKetSampler(
+    train_sampler = NetKetSampler(
         hilbert=hilbert,
         n_samples=n_samples,
         n_discard_per_chain=n_discard_per_chain,
         n_chains=n_chains,
         seed=seed,
     )
-    state = VariationalState(model=model, params=params, sampler=sampler)
+    state = VariationalState(model=model, params=params, sampler=train_sampler)
     driver = VMC(
         operator=operator,
         variational_state=state,
@@ -78,8 +80,22 @@ def run_model_demo(
     history = driver.run(n_iter)
 
     energy_trace = [float(jnp.asarray(step["energy"])) for step in history]
-    final_energy = energy_trace[-1]
-    print(f"{model_name:>4} energies: {[round(value, 6) for value in energy_trace]}")
+
+    # Use a separate higher-statistics state for the final benchmark estimate so
+    # the comparison to ED is less noisy than the training trace.
+    eval_sampler = NetKetSampler(
+        hilbert=hilbert,
+        n_samples=eval_samples,
+        n_discard_per_chain=max(n_discard_per_chain, 32),
+        n_chains=n_chains,
+        seed=seed + 101,
+    )
+    eval_state = VariationalState(model=model, params=state.parameters, sampler=eval_sampler)
+    estimates = [float(jnp.asarray(eval_state.energy(operator))) for _ in range(eval_repeats)]
+    final_energy = sum(estimates) / len(estimates)
+    preview = [round(value, 6) for value in energy_trace[:5]]
+    tail = [round(value, 6) for value in energy_trace[-5:]]
+    print(f"{model_name:>4} start: {preview} ... end: {tail}")
     return energy_trace, final_energy
 
 
@@ -93,13 +109,13 @@ def run_demo(
     exact_energy = exact_ground_state_energy(operator)
 
     experiments = [
-        ("RBM", RBM(alpha=1), 1e-2, 0),
-        ("FFNN", FFNN(hidden_dims=(10, 5)), 5e-3, 1),
-        ("CNN", CNN(spatial_shape=(length, 1), channels=(2,), kernel_size=(3, 1)), 5e-3, 2),
+        ("RBM", RBM(alpha=2), 2e-2, 0, 256, 32, 16, 128),
+        ("FFNN", FFNN(hidden_dims=(32, 16)), 1e-2, 1, 256, 32, 16, 128),
+        ("CNN", CNN(spatial_shape=(length, 1), channels=(16, 8), kernel_size=(5, 1)), 5e-3, 2, 256, 32, 16, 256),
     ]
 
     results: list[dict[str, float | list[float] | str]] = []
-    for model_name, model, learning_rate, seed in experiments:
+    for model_name, model, learning_rate, seed, n_samples, n_discard_per_chain, n_chains, n_iter in experiments:
         energy_trace, final_energy = run_model_demo(
             model_name=model_name,
             model=model,
@@ -107,6 +123,10 @@ def run_demo(
             length=length,
             seed=seed,
             learning_rate=learning_rate,
+            n_samples=n_samples,
+            n_discard_per_chain=n_discard_per_chain,
+            n_chains=n_chains,
+            n_iter=n_iter,
         )
         results.append(
             {

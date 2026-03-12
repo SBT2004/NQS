@@ -1,9 +1,11 @@
 {
   "include": [
     "src",
-    "tests"
+    "tests",
+    "demos"
   ],
   "extraPaths": [
+    ".",
     "src"
   ],
   "pythonVersion": "3.11",

@@ -18,9 +18,9 @@ class SupportsLogPsi(Protocol):
 
 
 def states_to_netket(states: jax.Array) -> jax.Array:
-    # NetKet's spin-1/2 convention is typically {-0.5, +0.5}, while our local
-    # project convention is {0, 1}. This helper isolates that mismatch.
-    return states.astype(jnp.float32) - 0.5
+    # NetKet's spin-1/2 convention in this project is {-1, +1}, while our
+    # local project convention is {0, 1}. This helper isolates that mismatch.
+    return 2.0 * states.astype(jnp.float32) - 1.0
 
 
 def states_from_netket(states: jax.Array) -> jax.Array:
@@ -47,12 +47,20 @@ class NetKetSampler:
         self.sampler = nk.sampler.MetropolisLocal(self.netket_hilbert, n_chains=self.n_chains)
 
     def create_mc_state(self, model: SupportsLogPsi, params: ParamTree) -> nk.vqs.MCState:
-        def apply_fun(variables: dict[str, Any], sigma: jax.Array) -> jax.Array:
+        def apply_fun(
+            variables: dict[str, Any],
+            sigma: jax.Array,
+            mutable: Any = False,
+            **_: Any,
+        ) -> jax.Array | tuple[jax.Array, dict[str, Any]]:
             # NetKet calls this function with its own spin convention. We
             # translate into our project convention, evaluate our JAX model, and
             # return the resulting log-amplitudes back to NetKet.
             project_states = states_from_netket(sigma)
-            return model.log_psi(variables["params"], project_states)
+            output = model.log_psi(variables["params"], project_states)
+            if mutable:
+                return output, {}
+            return output
 
         # MCState is used only as a temporary backend object. The public API is
         # still our own VariationalState wrapper.

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import jax
+import jax.numpy as jnp
 import netket as nk
 
 from .loss import energy_loss
@@ -41,6 +42,9 @@ class SupportsVariationalState(Protocol):
     def replace_parameters(self, new_params: ParamTree) -> None:
         ...
 
+    def expect_and_grad(self, operator: nk.operator.AbstractOperator) -> tuple[nk.stats.Stats, Any]:
+        ...
+
 
 @dataclass
 class VMC:
@@ -57,13 +61,21 @@ class VMC:
         self.opt_state = self.optimizer.init(self.variational_state.parameters)
 
     def step(self) -> dict[str, object]:
-        def loss_fn(params):
-            # This nested function captures the fixed operator and variational
-            # state, leaving JAX to differentiate only with respect to params.
-            return energy_loss(self.variational_state, self.operator, params)
+        # Prefer the sampled VMC gradient path when the variational state can
+        # provide it directly. This keeps the demo on an actual Monte Carlo
+        # training path instead of rebuilding backend objects inside autodiff.
+        if hasattr(self.variational_state, "expect_and_grad"):
+            stats, grads = self.variational_state.expect_and_grad(self.operator)
+            energy = jnp.real(stats.mean)
+        else:
+            def loss_fn(params):
+                # This nested function captures the fixed operator and
+                # variational state, leaving JAX to differentiate only with
+                # respect to params.
+                return energy_loss(self.variational_state, self.operator, params)
 
-        # Step 1: evaluate the current scalar objective and its gradient.
-        energy, grads = self.optimizer.compute_gradients(loss_fn, self.variational_state.parameters)
+            # Step 1: evaluate the current scalar objective and its gradient.
+            energy, grads = self.optimizer.compute_gradients(loss_fn, self.variational_state.parameters)
         # Step 2: convert gradients into an updated parameter set.
         new_params, self.opt_state = self.optimizer.update(
             grads,

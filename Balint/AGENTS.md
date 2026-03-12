@@ -74,6 +74,11 @@
 - If no automated verification exists for the changed area, say so explicitly
   and describe the manual validation you performed.
 - Do not claim completion without evidence that the changed path works.
+- For performance-related tasks, run a profiler as part of verification.
+  Use `cProfile` plus `snakeviz` for Python-level hotspots, `scalene` for
+  Python/native time and memory breakdowns, and `jax.profiler` traces for
+  JAX/XLA-heavy paths.
+- Do not run profilers by default for non-performance tasks.
 
 ## Reasoning Guardrails
 

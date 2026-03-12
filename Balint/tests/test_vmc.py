@@ -8,10 +8,29 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from nqs import Adam, CNN, FFNN, RBM, NetKetSampler, SpinHilbert, VMC, VariationalState, energy_loss
+from nqs import (
+    Adam,
+    CNN,
+    FFNN,
+    RBM,
+    NetKetSampler,
+    SpinHilbert,
+    VMC,
+    VariationalState,
+    energy_loss,
+    states_from_netket,
+    states_to_netket,
+)
 
 
 class ModelTests(unittest.TestCase):
+    def test_netket_state_conversion_roundtrip(self) -> None:
+        states = np.array([[0, 1, 0, 1], [1, 1, 0, 0]], dtype=np.uint8)
+        jax_states = jax.numpy.asarray(states)
+        netket_states = states_to_netket(jax_states)
+        np.testing.assert_array_equal(np.asarray(netket_states), np.array([[-1.0, 1.0, -1.0, 1.0], [1.0, 1.0, -1.0, -1.0]]))
+        np.testing.assert_array_equal(np.asarray(states_from_netket(netket_states)), states)
+
     def test_rbm_log_psi_shape(self) -> None:
         hilbert = SpinHilbert(4)
         model = RBM(alpha=2)

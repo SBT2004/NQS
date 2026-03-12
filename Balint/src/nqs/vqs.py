@@ -31,11 +31,12 @@ class VariationalState:
         return self.params
 
     def replace_parameters(self, new_params: ParamTree) -> None:
-        # Rebuilding the backend state avoids hidden mutation issues when JAX is
-        # tracing functions for autodiff. This is slower than a highly tuned
-        # implementation, but much easier to reason about correctly.
+        # During ordinary sampled VMC updates we are outside JAX tracing, so we
+        # can update the live MCState in place and keep the Markov chains warm.
+        # This is both faster and better behaved than restarting the sampler
+        # every optimization step.
         self.params = new_params
-        self._mc_state = self.sampler.create_mc_state(self.model, self.params)
+        self._mc_state.parameters = self.params
 
     def log_value(self, states: jax.Array) -> jax.Array:
         return self.model.log_psi(self.params, states)
@@ -50,6 +51,13 @@ class VariationalState:
         # NetKet in this phase, while state ownership remains ours.
         self._mc_state.parameters = self.params
         return self._mc_state.expect(operator)
+
+    def expect_and_grad(self, operator: nk.operator.AbstractOperator) -> tuple[nk.stats.Stats, ParamTree]:
+        # NetKet already knows how to compute sampled VMC gradients for the
+        # wrapped MCState. Reusing that path avoids rebuilding backend state
+        # inside jax.value_and_grad for every optimization step.
+        self._mc_state.parameters = self.params
+        return self._mc_state.expect_and_grad(operator)
 
     def expect_with_params(
         self,
