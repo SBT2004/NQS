@@ -36,7 +36,7 @@ def von_neumann_entropy(psi, L, LA):
     eigvals = eigvals[eigvals > 1e-12]         # remove numerical zeros
     return -np.sum(eigvals * np.log(eigvals))
 
-def renyi2_entropy(psi, L, LA):
+def renyi2_entropy_ED(psi, L, LA):
     LB = L - LA
     psi_AB = psi.reshape((2**LA, 2**LB))
     rho_A = psi_AB @ psi_AB.conj().T
