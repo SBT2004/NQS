@@ -51,6 +51,17 @@
 5. Verify the exact scenario changed.
 6. Summarize what changed, how it was verified, and any remaining gaps.
 
+## Code Review Workflow
+
+- For review requests, perform your own review first.
+- Then call the `gemini_review_diff` MCP tool for a second opinion when it is
+  available.
+- Prioritize logic errors, correctness bugs, numerical/scientific mistakes,
+  performance issues, and maintainability risks.
+- Treat Gemini findings as advisory, not authoritative.
+- If Gemini is unavailable or returns invalid output, continue with your own
+  review and mention the tool issue briefly.
+
 ## Search
 
 - Use `rg` for repo search; do not guess.
