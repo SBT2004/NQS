@@ -254,7 +254,7 @@ class Optimizer:
 
         flat_params = wavefunction.flatten_params(wavefunction.params)
 
-        self.opt_state = self.optimizer.init(flat_params)
+        self.opt_state = self.optimizer.init(flat_params) #set optimizer to work with a 1D vector 
 
 
     def step(self,key,params,sigma0,n_samples):
@@ -270,16 +270,16 @@ class Optimizer:
             return jnp.mean(self.hamiltonian.energy(p,samples))
             #new loss for each batch/set of samples
 
-        grads = jax.grad(loss_fn)(params)
+        grads = jax.grad(loss_fn)(params) #automatic differentiation of jax
 
-        flat_params,unravel = jax.flatten_util.ravel_pytree(params)
-        flat_grads,_ = jax.flatten_util.ravel_pytree(grads)
+        flat_params,unravel = jax.flatten_util.ravel_pytree(params) #second output is the backward map to pytree from 1D vector
+        flat_grads,_ = jax.flatten_util.ravel_pytree(grads) # ignores second output since we don't need the backward map for gradients
 
-        updates,self.opt_state = self.optimizer.update(flat_grads,self.opt_state)
+        updates,self.opt_state = self.optimizer.update(flat_grads,self.opt_state) #every iteration, the previous gradients & state are given as input, the state includes the mean of gradients and squared gradients used in Adam
 
-        flat_params = optax.apply_updates(flat_params,updates)
+        flat_params = optax.apply_updates(flat_params,updates) #sum the updates with parametersx, Note: only the name is reused, jax arrays are immutable, so optax.apply_updates creates a new list every iteration and assigns teh name "flat_params" to it, no saving of older parameters
 
-        params = unravel(flat_params)
+        params = unravel(flat_params)# restore original shape of params
 
         return params,meanE
 
@@ -305,33 +305,35 @@ class Optimizer:
 
 class Observables:
 
-    def __init__(self,wavefunction):
-
+    def __init__(self, wavefunction):
         self.wavefunction = wavefunction
 
 
-    def renyi2(self,params,samples,LA):
+    @partial(jax.jit, static_argnames=('self',))
+    def renyi2_entropy(self, params, samples1, samples2, LA):
 
-        N = samples.shape[0]
+        # two independent chains
+        s1 = samples1
+        s2 = samples2
 
-        swap = 0
+        # swapped configurations
+        s1p = jnp.concatenate([s2[:, :LA], s1[:, LA:]], axis=1)
+        s2p = jnp.concatenate([s1[:, :LA], s2[:, LA:]], axis=1)
 
-        for i in range(N):
+        logpsi = self.wavefunction.logpsi
 
-            s1 = samples[i]
-            s2 = samples[(i+1)%N]
+        # averaging in log-space avoids overflows in exponentials
+        logpsi_s1  = jax.vmap(logpsi, in_axes=(None, 0))(params, s1)
+        logpsi_s2  = jax.vmap(logpsi, in_axes=(None, 0))(params, s2)
+        logpsi_s1p = jax.vmap(logpsi, in_axes=(None, 0))(params, s1p)
+        logpsi_s2p = jax.vmap(logpsi, in_axes=(None, 0))(params, s2p)
 
-            s1p = jnp.concatenate([s2[:LA],s1[LA:]])
-            s2p = jnp.concatenate([s1[:LA],s2[LA:]])
+        # ratio
+        log_ratio = logpsi_s1p + logpsi_s2p - logpsi_s1 - logpsi_s2
 
-            psi_num = self.wavefunction.psi(params,s1p)*self.wavefunction.psi(params,s2p)
-            psi_den = self.wavefunction.psi(params,s1)*self.wavefunction.psi(params,s2)
+        # factor out maximum to avoid overflow/neglecting small terms
+        max_log = jnp.max(log_ratio)
 
-            swap += psi_num/psi_den
+        swap_estimator = jnp.exp(max_log) * jnp.mean(jnp.exp(log_ratio - max_log))
 
-        swap /= N
-
-        return -jnp.log(jnp.abs(swap))
-
-
-
+        return -jnp.log(jnp.abs(swap_estimator))
