@@ -8,29 +8,30 @@ import optax
 
 class NeuralQuantumState:
 
-    def __init__(self, architecture, params, L):
-
+    def __init__(self, architecture, params, L, c=1e-2):
         self.architecture = architecture
         self.params = params
         self.L = L
-
+        self.c = c  # envelope strength hyperparameter
 
     @partial(jax.jit, static_argnames=('self',))
     def logpsi(self, params, sigma):
-
-        return self.architecture.forward(params, sigma)
-
+        """
+        Returns log(psi(x)) including the envelope term for stability:
+        log(psi) = forward(params, sigma) - c * sum_i sigma_i^2
+        """
+        envelope = -self.c * jnp.sum(sigma**2)
+        return self.architecture.forward(params, sigma) + envelope
 
     @partial(jax.jit, static_argnames=('self',))
     def psi(self, params, sigma):
-
+        """
+        Returns psi(x) = exp(logpsi)
+        """
         return jnp.exp(self.logpsi(params, sigma))
 
-
     def flatten_params(self, params):
-
         flat, _ = jax.flatten_util.ravel_pytree(params)
-
         return flat
 
 
