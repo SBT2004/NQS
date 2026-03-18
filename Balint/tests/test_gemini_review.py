@@ -4,6 +4,9 @@ import subprocess
 from pathlib import Path
 
 from codex_gemini_review.review import (
+    ReviewPayload,
+    SupplementalReviewContext,
+    build_review_prompt_with_context,
     collect_review_payload,
     parse_review_response,
     review_current_diff,
@@ -105,6 +108,75 @@ def test_parse_review_response_accepts_valid_json() -> None:
     assert result.summary == "One issue found"
     assert result.findings[0].severity == "high"
     assert result.findings[0].category == "logic"
+
+
+def test_build_review_prompt_with_context_includes_all_context_sections() -> None:
+    prompt = build_review_prompt_with_context(
+        payload=ReviewPayload(
+            content="### Supplied uncommitted diff\n```diff\n+    return a - b\n```",
+            reviewed_files=["dummy_addition.py"],
+            truncated=False,
+        ),
+        review_focus="logic only",
+        context=SupplementalReviewContext(
+            task_scope="Review only the arithmetic helper change.",
+            baseline_context="This path is hot in profiling.",
+            critical_review_findings=["Potential arithmetic regression in dummy_addition.py"],
+        ),
+    )
+
+    assert "### Task scope" in prompt
+    assert "Review only the arithmetic helper change." in prompt
+    assert "### Relevant baseline / profiler results" in prompt
+    assert "This path is hot in profiling." in prompt
+    assert "### Existing critical review findings" in prompt
+    assert "Potential arithmetic regression in dummy_addition.py" in prompt
+    assert "### Supplied uncommitted diff" in prompt
+
+
+def test_review_current_diff_accepts_supplied_diff_and_context_from_non_git_directory(tmp_path: Path) -> None:
+    supplied_diff = (
+        "diff --git a/dummy_addition.py b/dummy_addition.py\n"
+        "--- a/dummy_addition.py\n"
+        "+++ b/dummy_addition.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-    return a + b\n"
+        "+    return a - b\n"
+    )
+
+    def fake_runner(*_: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        prompt = str(kwargs["input"])
+        assert "### Task scope" in prompt
+        assert "Check only the addition helper." in prompt
+        assert "### Relevant baseline / profiler results" in prompt
+        assert "hot path" in prompt
+        assert "### Existing critical review findings" in prompt
+        assert "Suspicious arithmetic regression" in prompt
+        assert "return a - b" in prompt
+        return subprocess.CompletedProcess(
+            args=["gemini"],
+            returncode=0,
+            stdout=(
+                '{"response":"{\\"summary\\":\\"Found bug\\",\\"findings\\":[{\\"severity\\":\\"high\\",'
+                '\\"category\\":\\"logic\\",\\"file\\":\\"dummy_addition.py\\",\\"line_hint\\":\\"return a - b\\",'
+                '\\"issue\\":\\"Addition subtracts instead of adds\\",\\"why_it_matters\\":\\"Wrong arithmetic\\",'
+                '\\"suggested_fix\\":\\"Use a + b\\"}]}"}'
+            ),
+            stderr="",
+        )
+
+    result = review_current_diff(
+        cwd=tmp_path,
+        task_scope="Check only the addition helper.",
+        baseline_context="This is a hot path in profiling.",
+        uncommitted_diff=supplied_diff,
+        critical_review_findings=["Suspicious arithmetic regression"],
+        command_runner=fake_runner,
+    )
+
+    assert result.status == "ok"
+    assert result.meta.reviewed_files == ["dummy_addition.py"]
+    assert result.findings[0].line_hint == "return a - b"
 
 
 def test_parse_review_response_rejects_invalid_json() -> None:

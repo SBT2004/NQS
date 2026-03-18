@@ -56,6 +56,10 @@
 - For review requests, perform your own review first.
 - Then call the `gemini_review_diff` MCP tool for a second opinion when it is
   available.
+- When you already have higher-signal local context, prefer passing it to
+  `gemini_review_diff` explicitly:
+  `task_scope`, `baseline_context`, `uncommitted_diff`, and
+  `critical_review_findings`.
 - Prioritize logic errors, correctness bugs, numerical/scientific mistakes,
   performance issues, and maintainability risks.
 - Treat Gemini findings as advisory, not authoritative.

@@ -28,11 +28,19 @@ def gemini_review_diff(
     review_focus: Annotated[str | None, Field(default=None)],
     max_input_chars: Annotated[int | None, Field(default=None, ge=1000)],
     path_filters: Annotated[list[str] | None, Field(default=None)],
+    task_scope: Annotated[str | None, Field(default=None)],
+    baseline_context: Annotated[str | None, Field(default=None)],
+    uncommitted_diff: Annotated[str | None, Field(default=None)],
+    critical_review_findings: Annotated[str | list[str] | None, Field(default=None)],
 ) -> ReviewResult:
     return review_current_diff(
         review_focus=review_focus,
         max_input_chars=max_input_chars,
         path_filters=path_filters,
+        task_scope=task_scope,
+        baseline_context=baseline_context,
+        uncommitted_diff=uncommitted_diff,
+        critical_review_findings=critical_review_findings,
     )
 
 
