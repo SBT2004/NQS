@@ -8,11 +8,14 @@ boilerplate.
 from __future__ import annotations
 
 import cProfile
+import gzip
 import io
+import json
 import pstats
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -26,22 +29,49 @@ from demos.ising1d_ed_vs_vmc_helper import (  # noqa: E402
 from nqs import CNN, FFNN, RBM  # noqa: E402
 
 
-PROFILE_EXPERIMENTS: dict[str, tuple[Any, float, int, int, int, int, int]] = {
-    "RBM": (RBM(alpha=2), 2e-2, 0, 256, 32, 16, 128),
-    "FFNN": (FFNN(hidden_dims=(32, 16)), 1e-2, 1, 256, 32, 16, 128),
-    "CNN": (CNN(spatial_shape=(5, 1), channels=(16, 8), kernel_size=(5, 1)), 5e-3, 2, 256, 32, 16, 256),
-}
+@dataclass(frozen=True)
+class ProfileExperiment:
+    model_factory: Callable[[int], Any]
+    learning_rate: float
+    seed: int
+    n_samples: int
+    n_discard_per_chain: int
+    n_chains: int
+    full_iterations: int
+    profile_iterations: int
 
-FAST_PROFILE_ITERATIONS = {
-    "RBM": 8,
-    "FFNN": 8,
-    "CNN": 12,
-}
 
-TRACE_PROFILE_ITERATIONS = {
-    "RBM": 2,
-    "FFNN": 2,
-    "CNN": 3,
+PROFILE_EXPERIMENTS: dict[str, ProfileExperiment] = {
+    "RBM": ProfileExperiment(
+        model_factory=lambda _length: RBM(alpha=2),
+        learning_rate=2e-2,
+        seed=0,
+        n_samples=256,
+        n_discard_per_chain=32,
+        n_chains=16,
+        full_iterations=128,
+        profile_iterations=48,
+    ),
+    "FFNN": ProfileExperiment(
+        model_factory=lambda _length: FFNN(hidden_dims=(32, 16)),
+        learning_rate=1e-2,
+        seed=1,
+        n_samples=256,
+        n_discard_per_chain=32,
+        n_chains=16,
+        full_iterations=128,
+        profile_iterations=96,
+    ),
+    "CNN": ProfileExperiment(
+        model_factory=lambda length: CNN(spatial_shape=(length, 1), channels=(16, 8), kernel_size=(5, 1)),
+        learning_rate=5e-3,
+        seed=2,
+        n_samples=256,
+        n_discard_per_chain=32,
+        n_chains=16,
+        full_iterations=256,
+        profile_iterations=192,
+    ),
 }
 
 
@@ -133,7 +163,8 @@ def _run_profile_model(
 ) -> dict[str, object]:
     """Run one model with an explicit budget override for profiling."""
 
-    model, learning_rate, seed, n_samples, n_discard_per_chain, n_chains, _ = PROFILE_EXPERIMENTS[model_name]
+    experiment = PROFILE_EXPERIMENTS[model_name]
+    model = experiment.model_factory(length)
     _, operator = build_ising_operator(length, transverse_field)
     exact_energy = exact_ground_state_energy(operator)
     energy_trace, final_energy = run_model_demo(
@@ -141,11 +172,11 @@ def _run_profile_model(
         model=model,
         operator=operator,
         length=length,
-        seed=seed,
-        learning_rate=learning_rate,
-        n_samples=n_samples,
-        n_discard_per_chain=n_discard_per_chain,
-        n_chains=n_chains,
+        seed=experiment.seed,
+        learning_rate=experiment.learning_rate,
+        n_samples=experiment.n_samples,
+        n_discard_per_chain=experiment.n_discard_per_chain,
+        n_chains=experiment.n_chains,
         n_iter=n_iter,
         eval_samples=eval_samples,
         eval_repeats=eval_repeats,
@@ -177,12 +208,12 @@ def run_groundstate_search_model(
     if model_name not in PROFILE_EXPERIMENTS:
         raise ValueError(f"Unknown model_name {model_name!r}. Expected one of {sorted(PROFILE_EXPERIMENTS)}.")
 
-    _, _, _, _, _, _, n_iter = PROFILE_EXPERIMENTS[model_name]
+    experiment = PROFILE_EXPERIMENTS[model_name]
     return _run_profile_model(
         model_name=model_name,
         length=length,
         transverse_field=transverse_field,
-        n_iter=FAST_PROFILE_ITERATIONS[model_name] if fast_profile else n_iter,
+        n_iter=experiment.profile_iterations if fast_profile else experiment.full_iterations,
         eval_samples=256 if fast_profile else 4096,
         eval_repeats=1 if fast_profile else 4,
     )
@@ -224,6 +255,7 @@ def _warmup_trace_target(
 
 def cprofile_groundstate_demo_run(
     *,
+    model_name: str | None = "RBM",
     length: int = 5,
     transverse_field: float = 1.0,
     sort_by: str = "tottime",
@@ -241,7 +273,21 @@ def cprofile_groundstate_demo_run(
 
     profiler = cProfile.Profile()
     profiler.enable()
-    result = run_groundstate_search_demo(length=length, transverse_field=transverse_field)
+    if model_name is None:
+        result = run_groundstate_search_demo(length=length, transverse_field=transverse_field)
+    else:
+        run_groundstate_search_model(
+            model_name=model_name,
+            length=length,
+            transverse_field=transverse_field,
+            fast_profile=True,
+        )
+        result = run_groundstate_search_model(
+            model_name=model_name,
+            length=length,
+            transverse_field=transverse_field,
+            fast_profile=True,
+        )
     profiler.disable()
 
     if output_path is not None:
@@ -304,7 +350,7 @@ def trace_groundstate_demo_with_jax_profiler(
                 model_name=model_name,
                 length=length,
                 transverse_field=transverse_field,
-                n_iter=TRACE_PROFILE_ITERATIONS[model_name] if fast_profile else PROFILE_EXPERIMENTS[model_name][6],
+                n_iter=PROFILE_EXPERIMENTS[model_name].profile_iterations if fast_profile else PROFILE_EXPERIMENTS[model_name].full_iterations,
                 eval_samples=128 if fast_profile else 4096,
                 eval_repeats=1 if fast_profile else 4,
             )
@@ -332,6 +378,66 @@ def perfetto_trace_files(log_dir: str | Path) -> list[str]:
     return [str(path) for path in sorted(log_dir.rglob("*.trace.json.gz"))]
 
 
+def _is_compile_event(name: str, category: str) -> bool:
+    label = f"{name} {category}".lower()
+    return "compile" in label or "xla" in label
+
+
+def _event_duration_us(event: dict[str, object]) -> float:
+    value = event.get("dur", 0.0)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return 0.0
+
+
+def summarize_perfetto_trace(
+    log_dir: str | Path,
+    *,
+    metadata: dict[str, object] | None = None,
+    top_n: int = 5,
+) -> dict[str, object]:
+    """Summarize Perfetto-compatible trace files produced by JAX profiling."""
+
+    trace_paths = perfetto_trace_files(log_dir)
+    trace_events: list[dict[str, object]] = []
+    for trace_path in trace_paths:
+        with gzip.open(trace_path, "rt", encoding="utf-8") as handle:
+            payload = cast(dict[str, object], json.load(handle))
+        trace_events.extend(cast(list[dict[str, object]], payload.get("traceEvents", [])))
+
+    duration_events: list[dict[str, object]] = []
+    compile_duration_us = 0.0
+    runtime_duration_us = 0.0
+    for event in trace_events:
+        duration_us = _event_duration_us(event)
+        if duration_us <= 0:
+            continue
+        duration_events.append(event)
+        name = str(event.get("name", ""))
+        category = str(event.get("cat", ""))
+        if _is_compile_event(name, category):
+            compile_duration_us += duration_us
+        else:
+            runtime_duration_us += duration_us
+
+    top_events = sorted(duration_events, key=_event_duration_us, reverse=True)[:top_n]
+    return {
+        "trace_files": trace_paths,
+        "event_count": len(trace_events),
+        "duration_event_count": len(duration_events),
+        "top_events_by_duration_ms": [
+            {
+                "name": str(event.get("name", "")),
+                "category": str(event.get("cat", "")),
+                "duration_ms": _event_duration_us(event) / 1000.0,
+            }
+            for event in top_events
+        ],
+        "dominant_phase": "compile_heavy" if compile_duration_us >= runtime_duration_us else "runtime_heavy",
+        "metadata": {} if metadata is None else metadata,
+    }
+
+
 def scalene_command(
     target: str = "Balint/demos/performance_profiling_helper.py",
     *,
@@ -353,12 +459,18 @@ def scalene_command(
 if __name__ == "__main__":
     length = 5
     transverse_field = 1.0
+    model_name: str | None = "RBM"
     for index, argument in enumerate(sys.argv):
         if argument == "--length" and index + 1 < len(sys.argv):
             length = int(sys.argv[index + 1])
         if argument == "--transverse-field" and index + 1 < len(sys.argv):
             transverse_field = float(sys.argv[index + 1])
+        if argument == "--model-name" and index + 1 < len(sys.argv):
+            model_name = sys.argv[index + 1]
+        if argument == "--all-models":
+            model_name = None
     result = cprofile_groundstate_demo_run(
+        model_name=model_name,
         length=length,
         transverse_field=transverse_field,
         top_n=20,
