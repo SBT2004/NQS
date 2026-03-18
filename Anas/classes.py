@@ -172,12 +172,12 @@ class Sampler:
 
         sigma_new = sigma.at[site].set(-sigma[site])
 
-        psi_old = self.wavefunction.psi(params,sigma)
-        psi_new = self.wavefunction.psi(params,sigma_new)
+        logpsi_old = self.wavefunction.logpsi(params,sigma)
+        logpsi_new = self.wavefunction.logpsi(params,sigma_new)
 
-        ratio = jnp.abs(psi_new)**2 / jnp.abs(psi_old)**2
+        log_ratio = 2 * (logpsi_new - logpsi_old)
 
-        accept = random.uniform(key2) < jnp.minimum(1.0,ratio)
+        accept = jnp.log(random.uniform(key2)) < jnp.minimum(0.0,log_ratio)
 
         sigma = jnp.where(accept,sigma_new,sigma)
 
@@ -219,7 +219,7 @@ class TFIM:
 
         zz = -self.J * jnp.sum(sigma * jnp.roll(sigma,-1))
 
-        psi_sigma = self.wavefunction.psi(params,sigma)
+        logpsi_sigma = self.wavefunction.logpsi(params,sigma)
 
         flip_energy = 0.0
 
@@ -227,9 +227,9 @@ class TFIM:
 
             sigma_flip = sigma.at[i].set(-sigma[i])
 
-            psi_flip = self.wavefunction.psi(params,sigma_flip)
+            logpsi_flip = self.wavefunction.logpsi(params,sigma_flip)
 
-            flip_energy += psi_flip / psi_sigma
+            flip_energy += jnp.exp(logpsi_flip - logpsi_sigma)
 
         return zz - self.g * flip_energy
 
