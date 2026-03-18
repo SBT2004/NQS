@@ -64,6 +64,13 @@ class ReviewPayload:
     truncated: bool
 
 
+@dataclass(frozen=True)
+class SupplementalReviewContext:
+    task_scope: str | None = None
+    baseline_context: str | None = None
+    critical_review_findings: list[str] | None = None
+
+
 class ReviewUnavailableError(RuntimeError):
     """Raised when Gemini cannot be reached or initialized."""
 
@@ -132,7 +139,19 @@ def collect_review_payload(
 
 
 def build_review_prompt(payload: ReviewPayload, review_focus: str | None = None) -> str:
+    return build_review_prompt_with_context(payload=payload, review_focus=review_focus, context=None)
+
+
+def build_review_prompt_with_context(
+    payload: ReviewPayload,
+    review_focus: str | None = None,
+    context: SupplementalReviewContext | None = None,
+) -> str:
     requested_focus = review_focus or "logic, correctness, numerical issues, performance, maintainability"
+    context_sections = _render_context_sections(context)
+    context_block = ""
+    if context_sections:
+        context_block = "Additional context:\n" + "\n\n".join(context_sections) + "\n\n"
     return (
         f"{SYSTEM_PROMPT}\n\n"
         "Use this exact JSON shape:\n"
@@ -152,6 +171,7 @@ def build_review_prompt(payload: ReviewPayload, review_focus: str | None = None)
         "}\n\n"
         f"Requested focus: {requested_focus}\n"
         f"Reviewed files: {', '.join(payload.reviewed_files) if payload.reviewed_files else 'none'}\n\n"
+        f"{context_block}"
         "Changes to review:\n"
         f"{payload.content}"
     )
@@ -162,9 +182,20 @@ def review_current_diff(
     review_focus: str | None = None,
     max_input_chars: int | None = None,
     path_filters: list[str] | None = None,
+    task_scope: str | None = None,
+    baseline_context: str | None = None,
+    uncommitted_diff: str | None = None,
+    critical_review_findings: str | list[str] | None = None,
     command_runner: CommandRunner | None = None,
 ) -> ReviewResult:
-    payload = collect_review_payload(cwd=cwd, path_filters=path_filters, max_input_chars=max_input_chars)
+    if uncommitted_diff and uncommitted_diff.strip():
+        payload = ReviewPayload(
+            content=_normalize_supplied_diff(uncommitted_diff),
+            reviewed_files=_extract_reviewed_files_from_diff(uncommitted_diff),
+            truncated=False,
+        )
+    else:
+        payload = collect_review_payload(cwd=cwd, path_filters=path_filters, max_input_chars=max_input_chars)
     if not payload.content:
         return ReviewResult(
             status="no_changes",
@@ -173,7 +204,15 @@ def review_current_diff(
             meta=ReviewMeta(reviewed_files=[], truncated=False),
         )
 
-    prompt = build_review_prompt(payload=payload, review_focus=review_focus)
+    prompt = build_review_prompt_with_context(
+        payload=payload,
+        review_focus=review_focus,
+        context=SupplementalReviewContext(
+            task_scope=_normalize_optional_text(task_scope),
+            baseline_context=_normalize_optional_text(baseline_context),
+            critical_review_findings=_normalize_findings_input(critical_review_findings),
+        ),
+    )
     try:
         text = generate_review_text(
             prompt=prompt,
@@ -374,6 +413,59 @@ def _extract_cli_error(payload: dict[str, Any] | None) -> str | None:
                 return str(value).strip()
         return json.dumps(error)
     return str(error).strip()
+
+
+def _render_context_sections(context: SupplementalReviewContext | None) -> list[str]:
+    if context is None:
+        return []
+    sections: list[str] = []
+    if context.task_scope:
+        sections.append(f"### Task scope\n{context.task_scope}")
+    if context.baseline_context:
+        sections.append(f"### Relevant baseline / profiler results\n{context.baseline_context}")
+    if context.critical_review_findings:
+        findings = "\n".join(f"- {item}" for item in context.critical_review_findings)
+        sections.append(f"### Existing critical review findings\n{findings}")
+    return sections
+
+
+def _normalize_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _normalize_findings_input(value: str | list[str] | None) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = [item.strip() for item in value.splitlines()]
+    else:
+        items = [str(item).strip() for item in value]
+    normalized = [item for item in items if item]
+    return normalized or None
+
+
+def _normalize_supplied_diff(diff_text: str) -> str:
+    normalized = diff_text.strip()
+    if normalized.startswith("### "):
+        return normalized
+    return f"### Supplied uncommitted diff\n```diff\n{normalized}\n```"
+
+
+def _extract_reviewed_files_from_diff(diff_text: str) -> list[str]:
+    files: set[str] = set()
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4:
+                candidate = parts[3]
+                if candidate.startswith("b/"):
+                    files.add(candidate[2:])
+        elif line.startswith("+++ b/"):
+            files.add(line[6:].strip())
+    return sorted(file for file in files if file and file != "/dev/null")
 
 
 def _render_untracked_files(repo_root: Path, files: Iterable[str]) -> str:
