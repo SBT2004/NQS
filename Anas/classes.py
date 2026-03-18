@@ -145,22 +145,24 @@ class Sampler:
         self.L = wavefunction.L
 
 
-    # ----- single chain step -----
     def metropolis_step_single(self, key, params, sigma):
 
-        key1,key2 = random.split(key)
+        key1, key2 = random.split(key)
 
-        site = random.randint(key1,(),0,self.L)
+        site = random.randint(key1, (), 0, self.L)
+
         sigma_new = sigma.at[site].set(-sigma[site])
 
-        logpsi_old = self.wavefunction.logpsi(params,sigma)
-        logpsi_new = self.wavefunction.logpsi(params,sigma_new)
+        psi_old = self.wavefunction.psi(params, sigma)
+        psi_new = self.wavefunction.psi(params, sigma_new)
 
-        log_ratio = 2 * (logpsi_new - logpsi_old)
+        ratio = (psi_new / psi_old) ** 2
 
-        accept = jnp.log(random.uniform(key2)) < jnp.minimum(0.0,log_ratio)
+        accept_prob = jnp.minimum(1.0, ratio)
 
-        sigma = jnp.where(accept,sigma_new,sigma)
+        accept = random.uniform(key2) < accept_prob
+
+        sigma = jnp.where(accept, sigma_new, sigma)
 
         return sigma
 
