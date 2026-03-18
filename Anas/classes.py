@@ -164,7 +164,7 @@ class Sampler:
         self.L = wavefunction.L
 
 
-    def metropolis_steps(self,key,params,sigma):
+    def metropolis_step(self,key,params,sigma):
 
         key1,key2 = random.split(key)
 
