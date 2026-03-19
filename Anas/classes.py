@@ -170,7 +170,7 @@ class Sampler:
     @partial(jax.jit, static_argnames=('self',))
     def metropolis_step(self, keys, params, sigmas):
 
-        return jax.vmap(self.metropolis_step_single, in_axes=(0,None,0))(
+        return jax.vmap(self.metropolis_steps, in_axes=(0,None,0))(
             keys, params, sigmas
         )
 
