@@ -309,7 +309,7 @@ class Observables:
         self.wavefunction = wavefunction
 
 
-    @partial(jax.jit, static_argnames=('self',))
+    @partial(jax.jit, static_argnames=('self','LA'))
     def renyi2_entropy(self, params, samples1, samples2, LA):
 
         # two independent chains
