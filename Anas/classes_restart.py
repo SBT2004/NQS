@@ -177,7 +177,7 @@ class Sampler:
 
         log_ratio = 2 * (logpsi_new - logpsi_old)
 
-        accept = jnp.log(random.uniform(key2)) < jnp.minimum(0.0,log_ratio)
+        accept = jnp.log(random.uniform(key2)) < jnp.minimum(1.0,log_ratio)
 
         sigma = jnp.where(accept,sigma_new,sigma)
 
