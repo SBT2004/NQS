@@ -15,7 +15,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import nqs  # noqa: E402
+from nqs import Adam  # noqa: E402
+from nqs import CNN  # noqa: E402
+from nqs import FFNN  # noqa: E402
+from nqs import NetKetSampler  # noqa: E402
+from nqs import Operator  # noqa: E402
+from nqs import RBM  # noqa: E402
+from nqs import SpinHilbert  # noqa: E402
+from nqs import SquareLattice  # noqa: E402
+from nqs import VMC  # noqa: E402
+from nqs import VariationalState  # noqa: E402
+from nqs import collect_terms  # noqa: E402
+from nqs import j1_j2  # noqa: E402
+from nqs import sx_term  # noqa: E402
+from nqs import szsz_term  # noqa: E402
+import nqs.observables as observables  # noqa: E402
 
 
 def half_subsystem(n_sites: int) -> tuple[int, ...]:
@@ -25,14 +39,20 @@ def half_subsystem(n_sites: int) -> tuple[int, ...]:
 def make_model(model_name: str, lattice_shape: tuple[int, int], **model_kwargs: Any):
     normalized_name = model_name.upper()
     if normalized_name == "RBM":
-        return nqs.models.RBM(**model_kwargs)
+        return RBM(**model_kwargs)
     if normalized_name == "FFNN":
-        return nqs.models.FFNN(**model_kwargs)
+        return FFNN(**model_kwargs)
     if normalized_name == "CNN":
         kwargs = dict(model_kwargs)
         kwargs.setdefault("spatial_shape", lattice_shape)
-        return nqs.models.CNN(**kwargs)
+        return CNN(**kwargs)
     raise ValueError(f"Unsupported model_name: {model_name}")
+
+
+def build_tfim_operator(spin_space: SpinHilbert, lattice: Any, J: float, h: float) -> Operator:
+    interaction_terms = [szsz_term(edge.i, edge.j, coefficient=-J) for edge in lattice.iter_edges("J1", n=1)]
+    field_terms = [sx_term(site, coefficient=-h) for site in range(spin_space.size)]
+    return Operator(spin_space, collect_terms(interaction_terms, field_terms))
 
 
 def build_system(
@@ -45,21 +65,21 @@ def build_system(
     J1: float = 1.0,
     J2: float = 0.4,
 ) -> dict[str, Any]:
-    graph = nqs.graph.SquareLattice(lattice_shape[0], lattice_shape[1], pbc=pbc)
-    hilbert = nqs.hilbert.SpinHilbert(graph.n_nodes)
+    lattice = SquareLattice(lattice_shape[0], lattice_shape[1], pbc=pbc)
+    spin_space = SpinHilbert(lattice.n_nodes)
 
     if hamiltonian == "tfim":
-        operator = nqs.operator.tfim(hilbert, graph, J=J, h=h)
+        hamiltonian_operator = build_tfim_operator(spin_space, lattice, J=J, h=h)
     elif hamiltonian == "j1_j2":
-        operator = nqs.operator.j1_j2(hilbert, graph, J1=J1, J2=J2)
+        hamiltonian_operator = j1_j2(spin_space, lattice, J1=J1, J2=J2)
     else:
         raise ValueError(f"Unsupported hamiltonian: {hamiltonian}")
 
     return {
-        "graph": graph,
-        "hilbert": hilbert,
-        "operator": operator,
-        "netket_operator": operator.to_netket(),
+        "graph": lattice,
+        "hilbert": spin_space,
+        "operator": hamiltonian_operator,
+        "netket_operator": hamiltonian_operator.to_netket(),
         "hamiltonian": hamiltonian,
         "parameters": {"J": J, "h": h, "J1": J1, "J2": J2, "pbc": pbc},
     }
@@ -125,7 +145,7 @@ def exact_observables_summary(
                 {
                     "site_i": site_i,
                     "site_j": site_j,
-                    "correlation": nqs.observables.spin_spin_correlation(
+                    "correlation": observables.spin_spin_correlation(
                         states,
                         site_i=site_i,
                         site_j=site_j,
@@ -142,13 +162,13 @@ def exact_observables_summary(
     )
 
     entropy_rows: list[dict[str, Any]] = []
-    for subsystem_size in range(1, hilbert.size):
+    for subsystem_size in range(1, (hilbert.size // 2) + 1):
         current_subsystem = tuple(range(subsystem_size))
         entropy_rows.append(
             {
                 "subsystem_size": subsystem_size,
-                "von_neumann": nqs.observables.von_neumann_entropy(exact["ground_state"], current_subsystem),
-                "renyi2": nqs.observables.renyi_entropy_from_statevector(
+                "von_neumann": observables.von_neumann_entropy(exact["ground_state"], current_subsystem),
+                "renyi2": observables.renyi_entropy_from_statevector(
                     exact["ground_state"],
                     current_subsystem,
                     alpha=2.0,
@@ -157,7 +177,7 @@ def exact_observables_summary(
         )
     entropy_table = pd.DataFrame(entropy_rows)
     scaling_fit = (
-        nqs.observables.fit_log_entropy_scaling(
+        observables.fit_log_entropy_scaling(
             entropy_table["subsystem_size"].to_numpy(),
             entropy_table["renyi2"].to_numpy(),
         )
@@ -171,8 +191,8 @@ def exact_observables_summary(
         "spectrum_table": spectrum_table,
         "entropy_table": entropy_table,
         "scaling_fit": scaling_fit,
-        "half_partition_von_neumann": nqs.observables.von_neumann_entropy(exact["ground_state"], subsystem_sites),
-        "half_partition_renyi2": nqs.observables.renyi_entropy_from_statevector(
+        "half_partition_von_neumann": observables.von_neumann_entropy(exact["ground_state"], subsystem_sites),
+        "half_partition_renyi2": observables.renyi_entropy_from_statevector(
             exact["ground_state"],
             subsystem_sites,
             alpha=2.0,
@@ -200,6 +220,47 @@ def history_table(history: list[dict[str, Any]]) -> pd.DataFrame:
     if "renyi2_entropy" in frame.columns:
         frame["renyi2_entropy"] = frame["renyi2_entropy"].astype(float)
     return frame
+
+
+def sampled_entropy_scaling_summary(
+    variational_state: VariationalState,
+    n_sites: int,
+    max_subsystem_size: int | None = None,
+) -> dict[str, Any]:
+    subsystem_limit = max(1, n_sites // 2) if max_subsystem_size is None else max_subsystem_size
+    sample_batch = np.asarray(variational_state.sample())
+    entropy_rows: list[dict[str, Any]] = []
+    for subsystem_size in range(1, subsystem_limit + 1):
+        subsystem = tuple(range(subsystem_size))
+        try:
+            renyi2 = observables.renyi2_entropy_from_samples(
+                variational_state.log_value,
+                sample_batch,
+                subsystem=subsystem,
+            )
+        except ValueError:
+            renyi2 = np.nan
+        entropy_rows.append(
+            {
+                "subsystem_size": subsystem_size,
+                "renyi2": renyi2,
+            }
+        )
+
+    entropy_table = pd.DataFrame(entropy_rows)
+    valid_rows = entropy_table.dropna(subset=["renyi2"])
+    scaling_fit = (
+        observables.fit_log_entropy_scaling(
+            valid_rows["subsystem_size"].to_numpy(),
+            valid_rows["renyi2"].to_numpy(),
+        )
+        if len(valid_rows) >= 2
+        else None
+    )
+    return {
+        "entropy_table": entropy_table,
+        "scaling_fit": scaling_fit,
+    }
 
 
 def run_vmc_experiment(
@@ -233,38 +294,42 @@ def run_vmc_experiment(
     hilbert = system["hilbert"]
     model = make_model(model_name, lattice_shape, **model_kwargs)
     params = model.init(jax.random.PRNGKey(seed), hilbert)
-    sampler = nqs.sampler.NetKetSampler(
+    state_sampler = NetKetSampler(
         hilbert=hilbert,
         n_samples=n_samples,
         n_discard_per_chain=n_discard_per_chain,
         n_chains=n_chains,
         seed=seed,
     )
-    variational_state = nqs.vqs.VariationalState(
+    variational_state = VariationalState(
         model=model,
         params=params,
-        sampler=sampler,
+        sampler=state_sampler,
     )
-    driver = nqs.driver.VMC(
+    vmc_driver = VMC(
         operator=system["netket_operator"],
         variational_state=variational_state,
-        optimizer=nqs.optimizer.Adam(learning_rate=learning_rate),
+        optimizer=Adam(learning_rate=learning_rate),
     )
-    history = driver.run(
-        n_iter,
-        callbacks=[nqs.observables.entropy_callback(subsystem=half_subsystem(hilbert.size))],
-        callback_every=callback_every,
-    )
+    history: list[dict[str, Any]] = []
+    entropy_logger = observables.entropy_callback(subsystem=half_subsystem(hilbert.size))
+    for step in range(n_iter):
+        step_result = dict(vmc_driver.step())
+        step_result["step"] = step
+        if step % callback_every == 0:
+            step_result["observables"] = entropy_logger(step, vmc_driver)
+        history.append(step_result)
     history_df = history_table(history)
     exact = exact_observables_summary(system["operator"])
     final_energy = float(np.asarray(variational_state.energy(system["netket_operator"])))
     final_entropy = float(
-        nqs.observables.renyi2_entropy_from_samples(
+        observables.renyi2_entropy_from_samples(
             variational_state.log_value,
             np.asarray(variational_state.sample()),
             subsystem=half_subsystem(hilbert.size),
         )
     )
+    sampled_entropy = sampled_entropy_scaling_summary(variational_state, hilbert.size)
 
     return {
         "model_name": model_name,
@@ -276,6 +341,8 @@ def run_vmc_experiment(
         "final_energy": final_energy,
         "final_entropy": final_entropy,
         "energy_error": final_energy - exact["ground_energy"],
+        "sampled_entropy_table": sampled_entropy["entropy_table"],
+        "sampled_scaling_fit": sampled_entropy["scaling_fit"],
     }
 
 
