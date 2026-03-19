@@ -78,7 +78,7 @@ class RBM:
         W = random.normal(k1,(self.hidden,self.L))*0.01
         a = jnp.zeros(self.L)
         b = jnp.zeros(self.hidden)
-
+        #kept k2 and k3 in case random initialization is needed for a and b
         return (W,a,b)
 
     @partial(jax.jit, static_argnames=('self',))
@@ -110,7 +110,7 @@ class CNN:
         conv = random.normal(k1,(self.channels,1,self.kernel))*0.1
         dense = random.normal(k2,(self.channels*self.L,1))*0.1
         bias = jnp.zeros(1)
-
+        
         return (conv,dense,bias)
 
     @partial(jax.jit, static_argnames=('self',))
@@ -158,7 +158,7 @@ class Sampler:
 
         log_ratio = 2 * (logpsi_new - logpsi_old)
 
-        accept = jnp.log(random.uniform(key2)) < jnp.minimum(1.0,log_ratio)
+        accept = jnp.log(random.uniform(key2)) < jnp.minimum(0,log_ratio)
 
         sigma = jnp.where(accept,sigma_new,sigma)
 
