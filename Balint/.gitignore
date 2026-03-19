@@ -3,6 +3,8 @@ __pycache__/
 .ruff_cache/
 .ipynb_checkpoints/
 *.prof
+TASKS.md
+evaluation_harness/
 demos/jax_profile_*/
 demos/profiling_results/*
 !demos/profiling_results/README.md
