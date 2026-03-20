@@ -3,7 +3,7 @@ import jax.numpy as jnp
 from jax import random
 import matplotlib.pyplot as plt
 
-from classes_final.py import (
+from classes_final import (
     RBM,
     FFN,
     CNN,
