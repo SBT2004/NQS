@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import numpy as np
@@ -30,6 +30,9 @@ from nqs import j1_j2  # noqa: E402
 from nqs import sx_term  # noqa: E402
 from nqs import szsz_term  # noqa: E402
 import nqs.observables as observables  # noqa: E402
+
+if TYPE_CHECKING:
+    from src.nqs.observables import SupportsSamplingAndLogValue
 
 
 def half_subsystem(n_sites: int) -> tuple[int, ...]:
@@ -223,42 +226,61 @@ def history_table(history: list[dict[str, Any]]) -> pd.DataFrame:
 
 
 def sampled_entropy_scaling_summary(
-    variational_state: VariationalState,
+    variational_state: SupportsSamplingAndLogValue,
     n_sites: int,
     max_subsystem_size: int | None = None,
+    n_independent_runs: int = 1,
 ) -> dict[str, Any]:
+    if n_independent_runs <= 0:
+        raise ValueError("n_independent_runs must be positive.")
     subsystem_limit = max(1, n_sites // 2) if max_subsystem_size is None else max_subsystem_size
-    sample_batch = np.asarray(variational_state.sample())
-    entropy_rows: list[dict[str, Any]] = []
-    for subsystem_size in range(1, subsystem_limit + 1):
-        subsystem = tuple(range(subsystem_size))
-        try:
-            renyi2 = observables.renyi2_entropy_from_samples(
-                variational_state.log_value,
-                sample_batch,
-                subsystem=subsystem,
+    run_tables: list[pd.DataFrame] = []
+    for run_index in range(n_independent_runs):
+        sample_batch = np.asarray(variational_state.independent_sample(seed_offset=run_index))
+        entropy_rows: list[dict[str, Any]] = []
+        for subsystem_size in range(1, subsystem_limit + 1):
+            subsystem = tuple(range(subsystem_size))
+            try:
+                renyi2 = observables.renyi2_entropy_from_samples(
+                    variational_state.log_value,
+                    sample_batch,
+                    subsystem=subsystem,
+                )
+            except ValueError:
+                renyi2 = np.nan
+            entropy_rows.append(
+                {
+                    "subsystem_size": subsystem_size,
+                    "run_index": run_index,
+                    "renyi2": renyi2,
+                }
             )
-        except ValueError:
-            renyi2 = np.nan
-        entropy_rows.append(
-            {
-                "subsystem_size": subsystem_size,
-                "renyi2": renyi2,
-            }
-        )
+        run_tables.append(pd.DataFrame(entropy_rows))
 
-    entropy_table = pd.DataFrame(entropy_rows)
-    valid_rows = entropy_table.dropna(subset=["renyi2"])
+    entropy_samples = pd.concat(run_tables, ignore_index=True)
+    entropy_table = (
+        entropy_samples.groupby("subsystem_size", as_index=False)
+        .agg(
+            renyi2=("renyi2", "mean"),
+            renyi2_std=("renyi2", "std"),
+        )
+        .fillna({"renyi2_std": 0.0})
+    )
+
+    subsystem_sizes = np.asarray(entropy_table["subsystem_size"], dtype=np.float64)
+    renyi_values = np.asarray(entropy_table["renyi2"], dtype=np.float64)
+    valid_mask = np.isfinite(renyi_values)
     scaling_fit = (
         observables.fit_log_entropy_scaling(
-            valid_rows["subsystem_size"].to_numpy(),
-            valid_rows["renyi2"].to_numpy(),
+            subsystem_sizes[valid_mask],
+            renyi_values[valid_mask],
         )
-        if len(valid_rows) >= 2
+        if np.count_nonzero(valid_mask) >= 2
         else None
     )
     return {
         "entropy_table": entropy_table,
+        "entropy_samples": entropy_samples,
         "scaling_fit": scaling_fit,
     }
 
@@ -280,6 +302,7 @@ def run_vmc_experiment(
     n_chains: int = 8,
     n_iter: int = 20,
     callback_every: int = 5,
+    entropy_n_independent_runs: int | None = None,
     seed: int = 0,
 ) -> dict[str, Any]:
     system = build_system(
@@ -322,14 +345,21 @@ def run_vmc_experiment(
     history_df = history_table(history)
     exact = exact_observables_summary(system["operator"])
     final_energy = float(np.asarray(variational_state.energy(system["netket_operator"])))
+    independent_run_count = entropy_n_independent_runs
+    if independent_run_count is None:
+        independent_run_count = 5 if model_name.upper() == "RBM" else 1
     final_entropy = float(
-        observables.renyi2_entropy_from_samples(
-            variational_state.log_value,
-            np.asarray(variational_state.sample()),
+        observables.renyi2_entropy(
+            variational_state,
             subsystem=half_subsystem(hilbert.size),
+            n_repeats=independent_run_count,
         )
     )
-    sampled_entropy = sampled_entropy_scaling_summary(variational_state, hilbert.size)
+    sampled_entropy = sampled_entropy_scaling_summary(
+        variational_state,
+        hilbert.size,
+        n_independent_runs=independent_run_count,
+    )
 
     return {
         "model_name": model_name,
@@ -342,7 +372,9 @@ def run_vmc_experiment(
         "final_entropy": final_entropy,
         "energy_error": final_energy - exact["ground_energy"],
         "sampled_entropy_table": sampled_entropy["entropy_table"],
+        "sampled_entropy_samples": sampled_entropy["entropy_samples"],
         "sampled_scaling_fit": sampled_entropy["scaling_fit"],
+        "entropy_n_independent_runs": independent_run_count,
     }
 
 

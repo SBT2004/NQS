@@ -32,6 +32,10 @@ def _log_amplitude_from_statevector(statevector: np.ndarray):
     return evaluate
 
 
+def _phased_statevector(statevector: np.ndarray, phase: float) -> np.ndarray:
+    return np.asarray(statevector, dtype=np.complex128) * np.exp(1j * phase)
+
+
 class ObservableTests(unittest.TestCase):
     def test_spin_spin_correlation_matches_pm1_average(self) -> None:
         states = np.array([[0, 0], [1, 1], [0, 1]], dtype=np.uint8)
@@ -72,6 +76,27 @@ class ObservableTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(float(np.real(swap_expectation)), 0.5)
+        self.assertAlmostEqual(entropy, np.log(2.0))
+
+    def test_swap_renyi2_entropy_accepts_complex_phase_wavefunction(self) -> None:
+        phased_bell = _phased_statevector(_bell_state(), phase=np.pi / 4.0)
+        log_amplitude = _log_amplitude_from_statevector(phased_bell)
+        samples = np.array(
+            [
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [1, 1],
+            ],
+            dtype=np.uint8,
+        )
+
+        entropy = observables.renyi2_entropy_from_samples(
+            log_amplitude_fn=log_amplitude,
+            samples=samples,
+            subsystem=(0,),
+        )
+
         self.assertAlmostEqual(entropy, np.log(2.0))
 
     def test_log_entropy_scaling_fit_recovers_known_parameters(self) -> None:

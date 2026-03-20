@@ -7,16 +7,16 @@ import numpy as np
 
 
 class SupportsSamplingAndLogValue(Protocol):
-    def sample(self) -> np.ndarray:
+    def sample(self) -> Any:
         ...
 
-    def log_value(self, states: np.ndarray) -> np.ndarray:
+    def log_value(self, states: Any) -> Any:
         ...
 
-    def independent_sample(self, seed_offset: int = 0) -> np.ndarray:
+    def independent_sample(self, seed_offset: int = 0) -> Any:
         ...
 
-    def exact_statevector(self) -> np.ndarray:
+    def exact_statevector(self) -> Any:
         ...
 
 
@@ -204,7 +204,13 @@ def renyi2_entropy_from_samples(
         samples=samples,
         subsystem=subsystem,
     )
-    swap_real = float(np.real_if_close(swap_expectation))
+    swap_value = np.real_if_close(swap_expectation)
+    if np.iscomplexobj(swap_value):
+        if abs(np.imag(swap_value)) > cutoff:
+            raise ValueError("SWAP expectation must be real-valued within tolerance to compute Renyi-2 entropy.")
+        swap_real = float(np.real(swap_value))
+    else:
+        swap_real = float(swap_value)
     if swap_real <= 0:
         raise ValueError("SWAP expectation must be strictly positive to compute Renyi-2 entropy.")
     return float(-np.log(swap_real))

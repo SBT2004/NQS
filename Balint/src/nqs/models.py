@@ -35,11 +35,15 @@ class _RBMModule(nn.Module):
         # returned value behaves like an array, but it is tracked in the
         # parameter pytree so JAX can differentiate with respect to it.
         visible_bias = self.param("visible_bias", nn.initializers.zeros, (x.shape[-1],))
+        phase_bias = self.param("phase_bias", nn.initializers.zeros, (x.shape[-1],))
         # nn.Dense is a standard linear layer: x @ W + b.
         hidden = nn.Dense(self.hidden_features)(x)
+        phase_hidden = nn.Dense(self.hidden_features, name="phase_hidden")(x)
         # This is the usual RBM log-amplitude formula for a visible
         # configuration after summing out hidden spins analytically.
-        return jnp.dot(x, visible_bias) + jnp.sum(jnp.log(jnp.cosh(hidden)), axis=-1)
+        log_amplitude = jnp.dot(x, visible_bias) + jnp.sum(jnp.log(jnp.cosh(hidden)), axis=-1)
+        phase = jnp.pi * jnp.tanh(jnp.dot(x, phase_bias) + jnp.sum(phase_hidden, axis=-1))
+        return log_amplitude + 1j * phase
 
 
 class _FFNNModule(nn.Module):
@@ -56,7 +60,10 @@ class _FFNNModule(nn.Module):
             x = self.activation(x)
         # We return one scalar per configuration because the wavefunction model
         # needs one log-amplitude per sampled spin state.
-        return nn.Dense(1)(x).squeeze(-1)
+        output = nn.Dense(2)(x)
+        log_amplitude = output[..., 0]
+        phase = jnp.pi * jnp.tanh(output[..., 1])
+        return log_amplitude + 1j * phase
 
 
 class _CNNModule(nn.Module):
@@ -79,7 +86,10 @@ class _CNNModule(nn.Module):
         # After the convolution stack we flatten back to a vector so a final
         # dense layer can produce the scalar log-amplitude.
         x = x.reshape((batch, -1))
-        return nn.Dense(1)(x).squeeze(-1)
+        output = nn.Dense(2)(x)
+        log_amplitude = output[..., 0]
+        phase = jnp.pi * jnp.tanh(output[..., 1])
+        return log_amplitude + 1j * phase
 
 
 @dataclass

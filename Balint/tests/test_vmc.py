@@ -22,7 +22,7 @@ from nqs import (
     states_to_netket,
 )
 from nqs.graph import SquareLattice
-from nqs.operator import Operator, collect_terms, sx_term, szsz_term
+from nqs.operator import Operator, collect_terms, j1_j2, sx_term, szsz_term
 
 
 def _tfim_operator(hilbert: SpinHilbert, graph: SquareLattice, J: float = 1.0, h: float = 0.8) -> Operator:
@@ -140,6 +140,34 @@ class VMCTests(unittest.TestCase):
         optimized_energy = float(np.asarray(state.energy(project_operator.to_netket())))
         self.assertLess(abs(optimized_energy - exact_energy), 0.01)
         self.assertEqual(np.asarray(state.exact_statevector()).shape, (hilbert.n_states,))
+
+    def test_j1j2_architectures_match_ed_with_phase_capable_ansatze(self) -> None:
+        hilbert = SpinHilbert(4)
+        graph = SquareLattice(2, 2, pbc=True)
+        project_operator = j1_j2(hilbert, graph, J1=1.0, J2=0.5)
+        exact_energy = _exact_ground_energy(project_operator)
+        architecture_runs = (
+            ("RBM", RBM(alpha=4), 800, 1e-2),
+            ("FFNN", FFNN(hidden_dims=(32, 16)), 400, 1e-2),
+            ("CNN", CNN(spatial_shape=(2, 2), channels=(16, 8), kernel_size=(2, 2)), 400, 1e-2),
+        )
+
+        for label, model, n_steps, learning_rate in architecture_runs:
+            with self.subTest(model=label):
+                params = model.init(jax.random.PRNGKey(0), hilbert)
+                sampler = NetKetSampler(hilbert=hilbert, n_samples=256, n_discard_per_chain=16, n_chains=8, seed=0)
+                state = VariationalState(model=model, params=params, sampler=sampler)
+                driver = VMC(
+                    operator=project_operator.to_netket(),
+                    variational_state=state,
+                    optimizer=Adam(learning_rate=learning_rate),
+                )
+
+                for _ in range(n_steps):
+                    driver.step()
+
+                optimized_energy = float(np.asarray(state.energy(project_operator.to_netket())))
+                self.assertLess(abs(optimized_energy - exact_energy), 0.01)
 
 
 if __name__ == "__main__":
