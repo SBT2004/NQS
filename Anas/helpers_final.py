@@ -13,7 +13,8 @@ from classes_final import (
     Observables,
     AdamOptimizer,
     SROptimizer,
-) 
+)
+
 
 def exact_tfim_ground_energy(L, J, g):
     """
@@ -40,22 +41,32 @@ def exact_tfim_ground_energy(L, J, g):
     return evals[0]
 
 
-def build_model(model_name, L, key):
+def build_model(
+    model_name,
+    L,
+    key,
+    hidden=20,
+    hidden_layers=(32, 32),
+    channels=16,
+    kernel=3,
+    n_conv_layers=1,
+):
     if model_name == "RBM":
-        hidden=20
         arch = RBM(L, hidden=hidden)
         model_info = {"hidden": hidden}
 
     elif model_name == "FFN":
-        hidden_layers = [32, 32]
+        hidden_layers = list(hidden_layers)
         arch = FFN(L, hidden_layers)
         model_info = {"hidden_layers": hidden_layers}
 
     elif model_name == "CNN":
-        channels=16
-        kernel=3
-        arch = CNN(L, channels=channels, kernel=kernel)
-        model_info = {"channels": channels, "kernel": kernel}
+        arch = CNN(L, channels=channels, kernel=kernel, n_conv_layers=n_conv_layers)
+        model_info = {
+            "channels": channels,
+            "kernel": kernel,
+            "n_conv_layers": n_conv_layers,
+        }
 
     else:
         raise ValueError(f"Unknown model: {model_name}")
@@ -64,57 +75,99 @@ def build_model(model_name, L, key):
     return arch, params, model_info
 
 
-def run_model(MODEL):
-    L = 10
-    J = 1.0
-    g = 0.5
+def plot_results(model_name, E_a, S_a, E_s, S_s):
+    plt.figure(figsize=(8, 5))
+    plt.plot(E_a, label="Adam")
+    plt.plot(E_s, label="SR")
+    plt.title(f"{model_name} Total Energy")
+    plt.xlabel("Step")
+    plt.ylabel("Energy")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
-    n_steps = 70
+    plt.figure(figsize=(8, 5))
+    plt.plot(S_a, label="Adam")
+    plt.plot(S_s, label="SR")
+    plt.title(f"{model_name} Rényi-2 Entropy")
+    plt.xlabel("Step")
+    plt.ylabel("S2")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
-    nchains = 32
-    nsamples_per_chain = 16
-    neq = 50
-    nskip = 2
 
-    adam_lr = 1e-2
-    sr_lr = 0.05
-    sr_diag_shift = 1e-2
+def run_model(
+    model_name,
+    *,
+    L=10,
+    J=1.0,
+    g=0.5,
+    n_steps=70,
+    nchains=32,
+    nsamples_per_chain=16,
+    neq=50,
+    nskip=2,
+    adam_lr=1e-2,
+    sr_lr=0.05,
+    sr_diag_shift=1e-2,
+    entropy_pairings=32,
+    entropy_subsystem_size=None,
+    seed=0,
+    hidden=20,
+    hidden_layers=(32, 32),
+    channels=16,
+    kernel=3,
+    n_conv_layers=1,
+    verbose=True,
+    plot=False,
+):
+    if entropy_subsystem_size is None:
+        entropy_subsystem_size = L // 2
 
-    entropy_pairings = 32
-    entropy_subsystem_size = L // 2
-
-    key = random.PRNGKey(0)
-
+    key = random.PRNGKey(seed)
     key, k = random.split(key)
-    arch, params0, model_info = build_model(MODEL, L, k)
 
-    print("\n" + "=" * 50)
-    print("MODEL CONFIGURATION")
-    print("=" * 50)
-    print(f"Model type: {MODEL}")
-    for kk, vv in model_info.items():
-        print(f"  {kk}: {vv}")
+    arch, params0, model_info = build_model(
+        model_name=model_name,
+        L=L,
+        key=k,
+        hidden=hidden,
+        hidden_layers=hidden_layers,
+        channels=channels,
+        kernel=kernel,
+        n_conv_layers=n_conv_layers,
+    )
 
-    print("\nSystem:")
-    print(f"  L = {L}")
-    print(f"  J = {J}")
-    print(f"  g = {g}")
+    if verbose:
+        print("\n" + "=" * 50)
+        print("MODEL CONFIGURATION")
+        print("=" * 50)
+        print(f"Model type: {model_name}")
+        for kk, vv in model_info.items():
+            print(f"  {kk}: {vv}")
 
-    print("\nSampler:")
-    print(f"  nchains = {nchains}")
-    print(f"  nsamples_per_chain = {nsamples_per_chain}")
-    print(f"  neq = {neq}")
-    print(f"  nskip = {nskip}")
+        print("\nSystem:")
+        print(f"  L = {L}")
+        print(f"  J = {J}")
+        print(f"  g = {g}")
 
-    print("\nOptimizers:")
-    print(f"  Adam lr = {adam_lr}")
-    print(f"  SR lr = {sr_lr}")
-    print(f"  SR diag_shift = {sr_diag_shift}")
+        print("\nSampler:")
+        print(f"  nchains = {nchains}")
+        print(f"  nsamples_per_chain = {nsamples_per_chain}")
+        print(f"  neq = {neq}")
+        print(f"  nskip = {nskip}")
 
-    print("\nEntropy:")
-    print(f"  subsystem_size = {entropy_subsystem_size}")
-    print(f"  n_pairings = {entropy_pairings}")
-    print("=" * 50)
+        print("\nOptimizers:")
+        print(f"  Adam lr = {adam_lr}")
+        print(f"  SR lr = {sr_lr}")
+        print(f"  SR diag_shift = {sr_diag_shift}")
+
+        print("\nEntropy:")
+        print(f"  subsystem_size = {entropy_subsystem_size}")
+        print(f"  n_pairings = {entropy_pairings}")
+        print(f"  seed = {seed}")
+        print("=" * 50)
 
     params_adam = jax.tree_util.tree_map(lambda x: x.copy(), params0)
     params_sr = jax.tree_util.tree_map(lambda x: x.copy(), params0)
@@ -142,10 +195,10 @@ def run_model(MODEL):
     E_sr = []
     S_sr = []
 
-    print(f"\n===== {MODEL} =====")
+    if verbose:
+        print(f"\n===== {model_name} =====")
 
     for i in range(n_steps):
-        # Adam step
         k1, sub1 = random.split(k1)
         params_adam, E_a, samples_a = adam.step(sub1, params_adam)
 
@@ -161,7 +214,6 @@ def run_model(MODEL):
         E_adam.append(E_a)
         S_adam.append(S_a)
 
-        # SR step
         k2, sub2 = random.split(k2)
         params_sr, E_s, samples_s = sr.step(sub2, params_sr)
 
@@ -177,54 +229,76 @@ def run_model(MODEL):
         E_sr.append(E_s)
         S_sr.append(S_s)
 
-        print(
-            f"step {i:3d} | "
-            f"Adam: E = {float(E_a): .6f}, S2 = {float(S_a): .6f} | "
-            f"SR: E = {float(E_s): .6f}, S2 = {float(S_s): .6f}"
-        )
-    # -------------------------
-    # Results
-    # -------------------------
-    print("\nFinal results:")
-    print(f"{MODEL} + Adam final energy = {float(E_adam[-1]): .8f}")
-    print(f"{MODEL} + SR   final energy = {float(E_sr[-1]): .8f}")
+        if verbose:
+            print(
+                f"step {i:3d} | "
+                f"Adam: E = {float(E_a): .6f}, S2 = {float(S_a): .6f} | "
+                f"SR: E = {float(E_s): .6f}, S2 = {float(S_s): .6f}"
+            )
 
-    if L <= 14:
-        E0_exact = exact_tfim_ground_energy(L, J, g)
-        print(f"Exact ground energy = {float(E0_exact): .8f}")
-    return (
-        jnp.array(E_adam),
-        jnp.array(S_adam),
-        jnp.array(E_sr),
-        jnp.array(S_sr),
-    )
+    E_adam = jnp.array(E_adam)
+    S_adam = jnp.array(S_adam)
+    E_sr = jnp.array(E_sr)
+    S_sr = jnp.array(S_sr)
+
+    if verbose:
+        print("\nFinal results:")
+        print(f"{model_name} + Adam final energy = {float(E_adam[-1]): .8f}")
+        print(f"{model_name} + SR   final energy = {float(E_sr[-1]): .8f}")
+
+        if L <= 14:
+            E0_exact = exact_tfim_ground_energy(L, J, g)
+            print(f"Exact ground energy = {float(E0_exact): .8f}")
+
+    if plot:
+        plot_results(model_name, E_adam, S_adam, E_sr, S_sr)
+
+    return {
+        "model": model_name,
+        "model_info": model_info,
+        "params": {
+            "L": L,
+            "J": J,
+            "g": g,
+            "n_steps": n_steps,
+            "nchains": nchains,
+            "nsamples_per_chain": nsamples_per_chain,
+            "neq": neq,
+            "nskip": nskip,
+            "adam_lr": adam_lr,
+            "sr_lr": sr_lr,
+            "sr_diag_shift": sr_diag_shift,
+            "entropy_pairings": entropy_pairings,
+            "entropy_subsystem_size": entropy_subsystem_size,
+            "seed": seed,
+        },
+        "E_adam": E_adam,
+        "S_adam": S_adam,
+        "E_sr": E_sr,
+        "S_sr": S_sr,
+    }
 
 
-def main():
-    models = ["CNN"]#,"RBM" , "FFN" ]
+def main(
+    models=("CNN",),
+    **kwargs,
+):
+    results = {}
 
-    for m in models:
-        E_a, S_a, E_s, S_s = run_model(m)
+    for model_name in models:
+        result = run_model(model_name, **kwargs)
+        results[model_name] = result
 
-        plt.figure(figsize=(8, 5))
-        plt.plot(E_a, label="Adam")
-        plt.plot(E_s, label="SR")
-        plt.title(f"{m} Total Energy")
-        plt.xlabel("Step")
-        plt.ylabel("Energy")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
+        if not kwargs.get("plot", False):
+            plot_results(
+                model_name,
+                result["E_adam"],
+                result["S_adam"],
+                result["E_sr"],
+                result["S_sr"],
+            )
 
-        plt.figure(figsize=(8, 5))
-        plt.plot(S_a, label="Adam")
-        plt.plot(S_s, label="SR")
-        plt.title(f"{m} Rényi-2 Entropy")
-        plt.xlabel("Step")
-        plt.ylabel("S2")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
+    return results
 
 
 if __name__ == "__main__":
