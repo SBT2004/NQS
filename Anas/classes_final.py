@@ -84,32 +84,50 @@ class FFN:
 # =========================
 
 class CNN:
-    def __init__(self, L, channels=16, kernel=3):
+    def __init__(self, L, channels=16, kernel=3, n_conv_layers=1):
         self.L = L
         self.channels = channels
         self.kernel = kernel
+        self.n_conv_layers = n_conv_layers
 
     def init_params(self, key):
-        k1, k2 = random.split(key)
-        conv = random.normal(k1, (self.channels, 1, self.kernel)) * 0.5
-        dense = random.normal(k2, (self.channels * self.L, 1)) * 0.5
+        keys = random.split(key, self.n_conv_layers + 1)
+
+        conv_params = []
+
+        # first conv layer: 1 -> channels
+        W0 = random.normal(keys[0], (self.channels, 1, self.kernel)) * 0.5
+        b0 = jnp.zeros(self.channels)
+        conv_params.append((W0, b0))
+
+        # remaining conv layers: channels -> channels
+        for k in keys[1:-1]:
+            W = random.normal(k, (self.channels, self.channels, self.kernel)) * 0.5
+            b = jnp.zeros(self.channels)
+            conv_params.append((W, b))
+
+        # final dense layer
+        dense = random.normal(keys[-1], (self.channels * self.L, 1)) * 0.5
         bias = jnp.zeros(1)
-        return (conv, dense, bias)
+
+        return (conv_params, dense, bias)
 
     @partial(jax.jit, static_argnames=("self",))
     def forward(self, params, sigma):
-        conv, dense, bias = params
+        conv_params, dense, bias = params
         x = sigma.reshape(1, 1, self.L).astype(jnp.float32)
 
-        x = jax.lax.conv_general_dilated(
-            x,
-            conv,
-            window_strides=(1,),
-            padding="SAME",
-            dimension_numbers=("NCH", "OIH", "NCH"),
-        )
+        for W, b in conv_params:
+            x = jax.lax.conv_general_dilated(
+                x,
+                W,
+                window_strides=(1,),
+                padding="SAME",
+                dimension_numbers=("NCH", "OIH", "NCH"),
+            )
+            x = x + b[None, :, None]
+            x = jnp.tanh(x)
 
-        x = jnp.tanh(x)
         x = x.reshape(-1)
         return (dense.T @ x + bias)[0]
 
