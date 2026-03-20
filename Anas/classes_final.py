@@ -107,7 +107,8 @@ class CNN:
     @partial(jax.jit, static_argnames=('self',))
     def forward(self, params, sigma):
         conv,dense,bias = params
-        x = sigma.reshape(1,1,self.L)
+        # Ensure input dtype matches conv kernel dtype for JAX convolution.
+        x = sigma.astype(conv.dtype).reshape(1,1,self.L)
         x = jax.lax.conv_general_dilated(
             x, conv,
             window_strides=(1,),

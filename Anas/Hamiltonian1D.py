@@ -9,19 +9,21 @@ class SpinChain1D:
 
     # ZZ interaction
     def add_zz(self, J):
-        for j in range(self.L-1):
+        for j in range(self.L):
+            jp = (j + 1) % self.L
             for s in range(self.dim):
-                val = sigma_z(s,j) * sigma_z(s,j+1)
+                val = sigma_z(s,j) * sigma_z(s,jp)
                 self.H[s,s] += J * val
 
     # XX + YY interaction
     def add_xx_yy(self, J):
-        for j in range(self.L-1):
+        for j in range(self.L):
+            jp = (j + 1) % self.L
             for s in range(self.dim):
                 sp = sigma_plus(s,j)
-                sm = sigma_minus(s,j+1)
+                sm = sigma_minus(s,jp)
                 if sp is not None and sm is not None:
-                    self.H[sp ^ (1 << (j+1)), s] += J
+                    self.H[sp ^ (1 << jp), s] += J
 
     # Transverse field
     def add_x_field(self, g):
