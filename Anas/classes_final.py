@@ -3,7 +3,6 @@ import jax.numpy as jnp
 from jax import random
 from functools import partial
 import optax
-import netket as nk
 
 
 # =========================
@@ -11,19 +10,17 @@ import netket as nk
 # =========================
 
 class NeuralQuantumState:
-
     def __init__(self, architecture, params, L):
         self.architecture = architecture
         self.params = params
         self.L = L
 
-    @partial(jax.jit, static_argnames=('self',))
+    @partial(jax.jit, static_argnames=("self",))
     def logpsi(self, params, sigma):
         return self.architecture.forward(params, sigma)
 
-    @partial(jax.jit, static_argnames=('self',))
-    def psi(self, params, sigma):
-        return jnp.exp(self.logpsi(params, sigma))
+    def vmap_logpsi(self, params, sigmas):
+        return jax.vmap(self.logpsi, in_axes=(None, 0))(params, sigmas)
 
     def flatten_params(self, params):
         flat, unravel = jax.flatten_util.ravel_pytree(params)
@@ -31,59 +28,55 @@ class NeuralQuantumState:
 
 
 # =========================
-# Feed Forward Network
+# RBM
+# =========================
+
+class RBM:
+    def __init__(self, L, hidden):
+        self.L = L
+        self.hidden = hidden
+
+    def init_params(self, key):
+        k1, k2, k3 = random.split(key, 3)
+        W = random.normal(k1, (self.hidden, self.L)) * 0.1
+        a = jnp.zeros(self.L)
+        b = jnp.zeros(self.hidden)
+        return (W, a, b)
+
+    @partial(jax.jit, static_argnames=("self",))
+    def forward(self, params, sigma):
+        W, a, b = params
+        visible = jnp.dot(a, sigma)
+        hidden = jnp.sum(jnp.log(2.0 * jnp.cosh(b + W @ sigma)))
+        return visible + hidden
+
+
+# =========================
+# FFN
 # =========================
 
 class FFN:
-
     def __init__(self, L, hidden_layers):
         self.L = L
         self.hidden_layers = hidden_layers
 
     def init_params(self, key):
         layer_sizes = [self.L] + self.hidden_layers + [1]
-        keys = random.split(key, len(layer_sizes)-1)
-
+        keys = random.split(key, len(layer_sizes) - 1)
         params = []
-        for k,(m,n) in zip(keys, zip(layer_sizes[:-1], layer_sizes[1:])):
-            W = random.normal(k,(n,m))*jnp.sqrt(2/m)
+        for k, (m, n) in zip(keys, zip(layer_sizes[:-1], layer_sizes[1:])):
+            W = random.normal(k, (n, m)) * jnp.sqrt(2.0 / m)
             b = jnp.zeros(n)
-            params.append((W,b))
-
+            params.append((W, b))
         return params
 
-    @partial(jax.jit, static_argnames=('self',))
+    @partial(jax.jit, static_argnames=("self",))
     def forward(self, params, sigma):
         x = sigma
-        for W,b in params[:-1]:
-            x = jnp.tanh(W@x + b)
-        W,b = params[-1]
-        return (W@x + b)[0]
-
-
-# =========================
-# RBM
-# =========================
-
-class RBM:
-
-    def __init__(self, L, hidden):
-        self.L = L
-        self.hidden = hidden
-
-    def init_params(self, key):
-        k1,k2,k3 = random.split(key,3)
-        W = random.normal(k1,(self.hidden,self.L))*0.01
-        a = jnp.zeros(self.L)
-        b = jnp.zeros(self.hidden)
-        return (W,a,b)
-
-    @partial(jax.jit, static_argnames=('self',))
-    def forward(self, params, sigma):
-        W,a,b = params
-        visible = jnp.dot(a,sigma)
-        hidden = jnp.sum(jnp.log(2*jnp.cosh(b + W@sigma)))
-        return visible + hidden
+        for W, b in params[:-1]:
+            x = jnp.tanh(W @ x + b)
+        W, b = params[-1]
+        return (W @ x + b)[0]
 
 
 # =========================
@@ -91,150 +84,113 @@ class RBM:
 # =========================
 
 class CNN:
-
     def __init__(self, L, channels=16, kernel=3):
         self.L = L
         self.channels = channels
         self.kernel = kernel
 
     def init_params(self, key):
-        k1,k2,k3 = random.split(key,3)
-        conv = random.normal(k1,(self.channels,1,self.kernel))*0.1
-        dense = random.normal(k2,(self.channels*self.L,1))*0.1
+        k1, k2 = random.split(key)
+        conv = random.normal(k1, (self.channels, 1, self.kernel)) * 0.5
+        dense = random.normal(k2, (self.channels * self.L, 1)) * 0.5
         bias = jnp.zeros(1)
-        return (conv,dense,bias)
+        return (conv, dense, bias)
 
-    @partial(jax.jit, static_argnames=('self',))
+    @partial(jax.jit, static_argnames=("self",))
     def forward(self, params, sigma):
-        conv,dense,bias = params
-        # Ensure input dtype matches conv kernel dtype for JAX convolution.
-        x = sigma.astype(conv.dtype).reshape(1,1,self.L)
+        conv, dense, bias = params
+        x = sigma.reshape(1, 1, self.L).astype(jnp.float32)
+
         x = jax.lax.conv_general_dilated(
-            x, conv,
+            x,
+            conv,
             window_strides=(1,),
             padding="SAME",
-            dimension_numbers=("NCH","OIH","NCH")
+            dimension_numbers=("NCH", "OIH", "NCH"),
         )
+
         x = jnp.tanh(x)
         x = x.reshape(-1)
         return (dense.T @ x + bias)[0]
 
 
 # =========================
-# NetKet Sampler
+# Sampler
 # =========================
 
-class NetKetSampler:
-
-    def __init__(self, wavefunction, n_chains):
+class Sampler:
+    def __init__(self, nchains, nsamples_per_chain, neq, nskip, wavefunction):
+        self.nchains = nchains
+        self.nsamples_per_chain = nsamples_per_chain
+        self.neq = neq
+        self.nskip = nskip
         self.wavefunction = wavefunction
         self.L = wavefunction.L
-        self.n_chains = n_chains
 
-        self.hilbert = nk.hilbert.Spin(s=1/2, N=self.L)
-        self.sampler = nk.sampler.MetropolisLocal(
-            self.hilbert,
-            n_chains=n_chains
-        )
+    @partial(jax.jit, static_argnames=("self",))
+    def step(self, vals):
+        sigma_o, logpsi_o, params, key = vals
+        key, subkey1, subkey2 = random.split(key, 3)
 
-    def sample_chains(self, key, params, n_samples, n_chains, burn=200):
+        sites = random.randint(subkey1, (self.nchains,), 0, self.L)
+        sigma_n = sigma_o.at[jnp.arange(self.nchains), sites].multiply(-1)
 
-        nk.random.seed(int(jax.random.randint(key, (), 0, 1e6)))
+        logpsi_n = jax.vmap(self.wavefunction.logpsi, in_axes=(None, 0))(params, sigma_n)
+        log_ratio = 2.0 * (logpsi_n - logpsi_o)
 
-        def logpsi_fn(sigma):
-            return self.wavefunction.logpsi(params, jnp.array(sigma))
+        accept = jnp.log(random.uniform(subkey2, (self.nchains,))) < log_ratio
 
-        logpsi_batch = jax.vmap(logpsi_fn)
+        sigma_o = jnp.where(accept[:, None], sigma_n, sigma_o)
+        logpsi_o = jnp.where(accept, logpsi_n, logpsi_o)
 
-        state = self.sampler.init_state()
+        return sigma_o, logpsi_o, params, key
+
+    def sample_chain(self, key, params):
+        key_init, key_mc = random.split(key)
+        sigma0 = random.choice(key_init, jnp.array([-1, 1]), shape=(self.nchains, self.L))
+        logpsi0 = jax.vmap(self.wavefunction.logpsi, in_axes=(None, 0))(params, sigma0)
+
+        vals = (sigma0, logpsi0, params, key_mc)
+
+        for _ in range(self.neq):
+            vals = self.step(vals)
 
         samples = []
-        for _ in range(n_samples + burn):
-            state, σ = self.sampler.sample(logpsi_batch, state)
-            samples.append(σ)
+        for _ in range(self.nsamples_per_chain):
+            for _ in range(self.nskip):
+                vals = self.step(vals)
+            samples.append(vals[0])
 
-        samples = jnp.array(samples)[burn:]
-        samples = samples.reshape(-1, self.L)
-
-        # convert {0,1} → {-1,1}
-        samples = 2 * samples - 1
-
-        return samples
+        samples = jnp.stack(samples)
+        return samples.reshape(-1, self.L)
 
 
 # =========================
-# TFIM Hamiltonian
+# TFIM
 # =========================
 
 class TFIM:
-
     def __init__(self, wavefunction, J, g):
         self.wavefunction = wavefunction
         self.J = J
         self.g = g
         self.L = wavefunction.L
 
-    @partial(jax.jit, static_argnames=('self',))
+    @partial(jax.jit, static_argnames=("self",))
     def local_energy(self, params, sigma):
-
-        zz = -self.J * jnp.sum(sigma * jnp.roll(sigma,-1))
-
-        logpsi_sigma = self.wavefunction.logpsi(params,sigma)
-
-        def flip_term(i):
-            sigma_flip = sigma.at[i].set(-sigma[i])
-            logpsi_flip = self.wavefunction.logpsi(params,sigma_flip)
-            return jnp.exp(logpsi_flip - logpsi_sigma)
-
-        flip_energy = jax.vmap(flip_term)(jnp.arange(self.L)).sum()
-
-        return zz - self.g * flip_energy
-
-    @partial(jax.jit, static_argnames=('self',))
-    def energy(self, params, samples):
-        return jax.vmap(self.local_energy, in_axes=(None,0))(params,samples)
-
-
-# =========================
-# XXZ Hamiltonian
-# =========================
-
-class XXZ:
-
-    def __init__(self, wavefunction, J=1.0, Delta=1.0):
-        self.wavefunction = wavefunction
-        self.J = J
-        self.Delta = Delta
-        self.L = wavefunction.L
-
-    @partial(jax.jit, static_argnames=('self',))
-    def local_energy(self, params, sigma):
-
-        zz = self.J * self.Delta * jnp.sum(
-            sigma * jnp.roll(sigma, -1)
-        )
-
+        zz = -self.J * jnp.sum(sigma * jnp.roll(sigma, -1))
         logpsi_sigma = self.wavefunction.logpsi(params, sigma)
 
-        def flip_pair(i):
-            j = (i + 1) % self.L
-            cond = sigma[i] != sigma[j]
+        def flip(i):
+            sigma_flip = sigma.at[i].set(-sigma[i])
+            logpsi_flip = self.wavefunction.logpsi(params, sigma_flip)
+            return jnp.exp(logpsi_flip - logpsi_sigma)
 
-            def flipped():
-                sigma_new = sigma.at[i].set(-sigma[i])
-                sigma_new = sigma_new.at[j].set(-sigma[j])
-                logpsi_new = self.wavefunction.logpsi(params, sigma_new)
-                return jnp.exp(logpsi_new - logpsi_sigma)
+        flip_energy = jnp.sum(jax.vmap(flip)(jnp.arange(self.L)))
+        return zz - self.g * flip_energy
 
-            return jnp.where(cond, flipped(), 0.0)
-
-        flip_terms = jax.vmap(flip_pair)(jnp.arange(self.L)).sum()
-
-        return zz - self.J * flip_terms
-
-    @partial(jax.jit, static_argnames=('self',))
     def energy(self, params, samples):
-        return jax.vmap(self.local_energy, in_axes=(None,0))(params,samples)
+        return jax.vmap(self.local_energy, in_axes=(None, 0))(params, samples)
 
 
 # =========================
@@ -242,109 +198,122 @@ class XXZ:
 # =========================
 
 class Observables:
-
-    def __init__(self, wavefunction, sampler):
+    def __init__(self, wavefunction):
         self.wavefunction = wavefunction
-        self.sampler = sampler
+        self.L = wavefunction.L
 
-    def renyi2_entropy(self, key, params, n_samples, n_chains, LA, n_disorder=4):
+    def _swap_estimator_from_perm(self, params, samples, perm, subsystem_size):
+        LA = subsystem_size
 
-        entropies = []
+        sigma = samples
+        sigma_p = samples[perm]
 
-        for _ in range(n_disorder):
+        sigma_swap = jnp.concatenate([sigma[:, :LA], sigma_p[:, LA:]], axis=1)
+        sigma_p_swap = jnp.concatenate([sigma_p[:, :LA], sigma[:, LA:]], axis=1)
 
-            key, k1, k2 = random.split(key, 3)
+        logpsi = self.wavefunction.vmap_logpsi(params, sigma)
+        logpsi_p = self.wavefunction.vmap_logpsi(params, sigma_p)
+        logpsi_swap = self.wavefunction.vmap_logpsi(params, sigma_swap)
+        logpsi_p_swap = self.wavefunction.vmap_logpsi(params, sigma_p_swap)
 
-            s1 = self.sampler.sample_chains(k1, params, n_samples, n_chains)
-            s2 = self.sampler.sample_chains(k2, params, n_samples, n_chains)
+        log_ratio = logpsi_swap + logpsi_p_swap - logpsi - logpsi_p
+        return jnp.exp(log_ratio)
 
-            s1p = jnp.concatenate([s2[:, :LA], s1[:, LA:]], axis=1)
-            s2p = jnp.concatenate([s1[:, :LA], s2[:, LA:]], axis=1)
+    def renyi2_entropy_swap(self, params, samples, key, subsystem_size=None, n_pairings=8, eps=1e-12):
+        """
+        Rényi-2 entropy from the swap trick:
+            S2(A) = -log <Swap_A>
 
-            logpsi = self.wavefunction.logpsi
+        A is taken to be the first `subsystem_size` spins.
+        If subsystem_size is None, use half chain.
 
-            logpsi_s1  = jax.vmap(logpsi, in_axes=(None, 0))(params, s1)
-            logpsi_s2  = jax.vmap(logpsi, in_axes=(None, 0))(params, s2)
-            logpsi_s1p = jax.vmap(logpsi, in_axes=(None, 0))(params, s1p)
-            logpsi_s2p = jax.vmap(logpsi, in_axes=(None, 0))(params, s2p)
+        n_pairings:
+            number of independent random pairings/permutations to average over.
+        """
+        if subsystem_size is None:
+            subsystem_size = self.L // 2
 
-            log_ratio = logpsi_s1p + logpsi_s2p - logpsi_s1 - logpsi_s2
+        N = samples.shape[0]
+        keys = random.split(key, n_pairings)
 
-            max_log = jnp.max(log_ratio)
-            swap = jnp.exp(max_log) * jnp.mean(jnp.exp(log_ratio - max_log))
+        swap_means = []
+        for k in keys:
+            perm = random.permutation(k, N)
+            swap_vals = self._swap_estimator_from_perm(params, samples, perm, subsystem_size)
+            swap_means.append(jnp.mean(swap_vals))
 
-            S2 = -jnp.log(jnp.abs(swap))
-
-            entropies.append(S2)
-
-        return jnp.mean(jnp.array(entropies))
+        swap_mean = jnp.mean(jnp.stack(swap_means))
+        return -jnp.log(swap_mean + eps)
 
 
 # =========================
-# Optimizer (with entropy tracking)
+# Adam optimizer
 # =========================
 
-class Optimizer:
-
-    def __init__(self, wavefunction, hamiltonian, sampler, lr=1e-3):
-
-        self.wavefunction = wavefunction
-        self.hamiltonian = hamiltonian
+class AdamOptimizer:
+    def __init__(self, wf, ham, sampler, lr=1e-2):
+        self.wf = wf
+        self.ham = ham
         self.sampler = sampler
+        self.opt = optax.adam(lr)
 
-        self.optimizer = optax.adam(lr)
+        flat, _ = wf.flatten_params(wf.params)
+        self.state = self.opt.init(flat)
 
-        flat_params, _ = wavefunction.flatten_params(wavefunction.params)
-        self.opt_state = self.optimizer.init(flat_params)
+    def step(self, key, params):
+        samples = self.sampler.sample_chain(key, params)
+        energies = self.ham.energy(params, samples)
+        E_mean = jnp.mean(energies)
 
-    def step(self, key, params, n_samples, n_chains):
+        def grad_logpsi(p, s):
+            g = jax.grad(self.wf.logpsi)(p, s)
+            return jax.flatten_util.ravel_pytree(g)[0]
 
-        samples = self.sampler.sample_chains(
-            key, params, n_samples, n_chains
-        )
+        O = jax.vmap(grad_logpsi, in_axes=(None, 0))(params, samples)
+        O_mean = jnp.mean(O, axis=0)
 
-        energies = self.hamiltonian.energy(params, samples)
-        meanE = jnp.mean(energies)
+        grad_E = 2.0 * jnp.mean((energies - E_mean)[:, None] * (O - O_mean), axis=0)
 
-        def loss_fn(p):
-            return jnp.mean(self.hamiltonian.energy(p, samples))
+        flat, unravel = jax.flatten_util.ravel_pytree(params)
+        updates, self.state = self.opt.update(grad_E, self.state, flat)
+        flat = optax.apply_updates(flat, updates)
 
-        grads = jax.grad(loss_fn)(params)
+        return unravel(flat), E_mean, samples
 
-        flat_params, unravel = jax.flatten_util.ravel_pytree(params)
-        flat_grads,_ = jax.flatten_util.ravel_pytree(grads)
 
-        updates, self.opt_state = self.optimizer.update(
-            flat_grads, self.opt_state
-        )
+# =========================
+# SR optimizer
+# =========================
 
-        flat_params = optax.apply_updates(flat_params, updates)
-        params = unravel(flat_params)
+class SROptimizer:
+    def __init__(self, wf, ham, sampler, lr=0.05, diag_shift=1e-3):
+        self.wf = wf
+        self.ham = ham
+        self.sampler = sampler
+        self.lr = lr
+        self.diag_shift = diag_shift
 
-        return params, meanE
+    def step(self, key, params):
+        samples = self.sampler.sample_chain(key, params)
+        energies = self.ham.energy(params, samples)
+        E_mean = jnp.mean(energies)
 
-    def optimize(self, key, params, n_steps, n_samples, n_chains,
-                 observables=None, entropy_every=10, LA=None):
+        def grad_logpsi(p, s):
+            g = jax.grad(self.wf.logpsi)(p, s)
+            return jax.flatten_util.ravel_pytree(g)[0]
 
-        energies = []
-        entropies = []
+        O = jax.vmap(grad_logpsi, in_axes=(None, 0))(params, samples)
+        O_mean = jnp.mean(O, axis=0, keepdims=True)
+        Oc = O - O_mean
 
-        for step in range(n_steps):
+        grad_E = 2.0 * jnp.mean((energies - E_mean)[:, None] * Oc, axis=0)
 
-            key, subkey = random.split(key)
-            params, E = self.step(subkey, params, n_samples, n_chains)
+        S = (Oc.T @ Oc) / O.shape[0]
+        S = S + self.diag_shift * jnp.eye(S.shape[0])
 
-            energies.append(E)
+        delta = -self.lr * jnp.linalg.solve(S, grad_E)
 
-            # ---- entropy tracking ----
-            if observables is not None and step % entropy_every == 0:
-                key, subkey = random.split(key)
-                S2 = observables.renyi2_entropy(
-                    subkey, params, n_samples, n_chains, LA
-                )
-                entropies.append(S2)
-                print(f"step {step} | E = {E:.6f} | S2 = {S2:.6f}")
-            else:
-                print(f"step {step} | E = {E:.6f}")
+        flat, unravel = jax.flatten_util.ravel_pytree(params)
+        flat = flat + delta
 
-        return params, jnp.array(energies), jnp.array(entropies)
+        return unravel(flat), E_mean, samples
