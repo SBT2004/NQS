@@ -46,7 +46,7 @@ class NetKetSampler:
         self.netket_hilbert = nk.hilbert.Spin(s=0.5, N=self.hilbert.size)
         self.sampler = nk.sampler.MetropolisLocal(self.netket_hilbert, n_chains=self.n_chains)
 
-    def create_mc_state(self, model: SupportsLogPsi, params: ParamTree) -> nk.vqs.MCState:
+    def _make_apply_fun(self, model: SupportsLogPsi):
         def apply_fun(
             variables: dict[str, Any],
             sigma: jax.Array,
@@ -61,6 +61,17 @@ class NetKetSampler:
             if mutable:
                 return output, {}
             return output
+        return apply_fun
+
+    def create_mc_state(
+        self,
+        model: SupportsLogPsi,
+        params: ParamTree,
+        *,
+        seed: int | None = None,
+    ) -> nk.vqs.MCState:
+        apply_fun = self._make_apply_fun(model)
+        state_seed = self.seed if seed is None else seed
 
         # MCState is used only as a temporary backend object. The public API is
         # still our own VariationalState wrapper.
@@ -70,6 +81,17 @@ class NetKetSampler:
             variables={"params": params},
             n_samples=self.n_samples,
             n_discard_per_chain=self.n_discard_per_chain,
-            seed=self.seed,
-            sampler_seed=self.seed,
+            seed=state_seed,
+            sampler_seed=state_seed,
+        )
+
+    def create_fullsum_state(
+        self,
+        model: SupportsLogPsi,
+        params: ParamTree,
+    ) -> nk.vqs.FullSumState:
+        return nk.vqs.FullSumState(
+            self.netket_hilbert,
+            apply_fun=self._make_apply_fun(model),
+            variables={"params": params},
         )

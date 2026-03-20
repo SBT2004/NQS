@@ -13,6 +13,12 @@ class SupportsSamplingAndLogValue(Protocol):
     def log_value(self, states: np.ndarray) -> np.ndarray:
         ...
 
+    def independent_sample(self, seed_offset: int = 0) -> np.ndarray:
+        ...
+
+    def exact_statevector(self) -> np.ndarray:
+        ...
+
 
 def observable_callback(
     name: str,
@@ -209,14 +215,79 @@ def renyi2_entropy(
     subsystem: Sequence[int] | str,
     samples: np.ndarray | Sequence[Sequence[int]] | None = None,
     cutoff: float = 1e-12,
+    n_repeats: int = 4,
 ) -> float:
-    sample_batch = state.sample() if samples is None else samples
-    return renyi2_entropy_from_samples(
-        log_amplitude_fn=state.log_value,
-        samples=sample_batch,
-        subsystem=subsystem,
-        cutoff=cutoff,
+    if samples is None and hasattr(state, "exact_statevector"):
+        return float(
+            renyi_entropy_from_statevector(
+                state.exact_statevector(),
+                subsystem=subsystem,
+                alpha=2.0,
+                cutoff=cutoff,
+            )
+        )
+    return float(
+        renyi2_entropy_statistics(
+            state=state,
+            subsystem=subsystem,
+            samples=samples,
+            cutoff=cutoff,
+            n_repeats=n_repeats,
+        )["mean"]
     )
+
+
+def renyi2_entropy_statistics(
+    state: SupportsSamplingAndLogValue,
+    subsystem: Sequence[int] | str,
+    samples: np.ndarray | Sequence[Sequence[int]] | None = None,
+    cutoff: float = 1e-12,
+    n_repeats: int = 4,
+) -> dict[str, float]:
+    if n_repeats <= 0:
+        raise ValueError("n_repeats must be positive.")
+
+    if samples is not None:
+        estimates = [
+            renyi2_entropy_from_samples(
+                log_amplitude_fn=state.log_value,
+                samples=samples,
+                subsystem=subsystem,
+                cutoff=cutoff,
+            )
+        ]
+    else:
+        estimates = []
+        for repeat_index in range(n_repeats):
+            sample_batch = (
+                state.independent_sample(seed_offset=repeat_index)
+                if hasattr(state, "independent_sample")
+                else state.sample()
+            )
+            estimates.append(
+                renyi2_entropy_from_samples(
+                    log_amplitude_fn=state.log_value,
+                    samples=sample_batch,
+                    subsystem=subsystem,
+                    cutoff=cutoff,
+                )
+            )
+
+    estimate_array = np.asarray(estimates, dtype=np.float64)
+    result = {
+        "mean": float(np.mean(estimate_array)),
+        "std": float(np.std(estimate_array, ddof=0)),
+        "n_repeats": float(len(estimates)),
+    }
+    if hasattr(state, "exact_statevector"):
+        result["exact"] = float(
+            renyi_entropy_from_statevector(
+                state.exact_statevector(),
+                subsystem=subsystem,
+                alpha=2.0,
+            )
+        )
+    return result
 
 
 def fit_log_entropy_scaling(
@@ -256,10 +327,15 @@ def fit_log_entropy_scaling(
 def entropy_callback(
     subsystem: Sequence[int] | str,
     name: str = "renyi2_entropy",
+    n_repeats: int = 4,
 ) -> Callable[[int, Any], dict[str, object]]:
     return observable_callback(
         name=name,
-        observable_fn=lambda driver: renyi2_entropy(driver.variational_state, subsystem=subsystem),
+        observable_fn=lambda driver: renyi2_entropy(
+            driver.variational_state,
+            subsystem=subsystem,
+            n_repeats=n_repeats,
+        ),
     )
 
 
@@ -270,6 +346,7 @@ __all__ = [
     "SupportsSamplingAndLogValue",
     "reduced_density_matrix",
     "renyi2_entropy",
+    "renyi2_entropy_statistics",
     "renyi2_entropy_from_samples",
     "renyi2_swap_expectation",
     "renyi_entropy_from_density_matrix",
