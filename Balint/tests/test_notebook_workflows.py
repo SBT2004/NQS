@@ -7,8 +7,21 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+if str(PROJECT_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from demos.demo_helper import ghz_state_metrics, ghz_statevector, history_table, run_architecture_disorder_comparison, run_ghz_bonus_workflow, run_hamiltonian_system_size_sweep, run_vmc_experiment, sampled_entropy_scaling_summary  # noqa: E402
+from nqs.workflows import (  # noqa: E402
+    history_table,
+    run_architecture_benchmark,
+    run_architecture_comparison,
+    run_ghz_bonus_workflow,
+    run_hamiltonian_system_size_sweep,
+    run_random_architecture_study,
+    run_vmc_experiment,
+    sampled_entropy_scaling_summary,
+    tfim_config,
+    tfim_proxy_sweep_points,
+)
 
 
 def _bell_log_amplitude(states: np.ndarray) -> np.ndarray:
@@ -22,7 +35,7 @@ def _bell_log_amplitude(states: np.ndarray) -> np.ndarray:
     return result
 
 
-class DemoHelperTests(unittest.TestCase):
+class NotebookWorkflowTests(unittest.TestCase):
     def test_sampled_entropy_scaling_summary_averages_independent_runs(self) -> None:
         class FakeState:
             def __init__(self) -> None:
@@ -58,6 +71,15 @@ class DemoHelperTests(unittest.TestCase):
         self.assertAlmostEqual(float(summary["entropy_table"]["renyi2_std"].iloc[0]), 0.0)
         self.assertEqual(len(summary["entropy_samples"]), 3)
 
+    def test_tfim_helpers_return_notebook_ready_configurations(self) -> None:
+        config = tfim_config(lattice_shape=(4, 1), h=1.0, pbc=False)
+        sweep_points = tfim_proxy_sweep_points([4, 6], h=1.0, pbc=False)
+
+        self.assertEqual(config["hamiltonian"], "tfim")
+        self.assertEqual(config["lattice_shape"], (4, 1))
+        self.assertEqual([point["label"] for point in sweep_points], ["tfim_1d_4x1", "tfim_1d_6x1"])
+        self.assertEqual([point["lattice_shape"] for point in sweep_points], [(4, 1), (6, 1)])
+
     def test_run_vmc_experiment_records_all_steps_and_rbm_entropy_repeat_default(self) -> None:
         result = run_vmc_experiment(
             model_name="RBM",
@@ -75,9 +97,10 @@ class DemoHelperTests(unittest.TestCase):
         self.assertEqual(len(result["history"]), 3)
         self.assertEqual(result["history_df"]["step"].tolist(), [0, 1, 2])
         self.assertEqual(result["entropy_n_independent_runs"], 5)
+        self.assertTrue(np.isfinite(result["entropy_scan_table"]["renyi2"]).all())
 
-    def test_run_architecture_disorder_comparison_returns_exam_ready_tables(self) -> None:
-        result = run_architecture_disorder_comparison(
+    def test_run_architecture_comparison_returns_exam_ready_tables(self) -> None:
+        result = run_architecture_comparison(
             architecture_configs={
                 "RBM": {"alpha": 1},
                 "FFNN": {"hidden_dims": (4,)},
@@ -89,16 +112,69 @@ class DemoHelperTests(unittest.TestCase):
             n_samples=4,
             n_discard_per_chain=1,
             n_chains=2,
+            n_iter=1,
+            callback_every=1,
             entropy_n_independent_runs=1,
         )
 
         self.assertEqual(result["summary_table"]["model"].tolist(), ["CNN", "FFNN", "RBM"])
         self.assertTrue((result["summary_table"]["parameter_count"] > 0).all())
+        self.assertIn("final_energy", result["summary_table"].columns)
+        self.assertIn("energy_error", result["summary_table"].columns)
         self.assertEqual(result["trial_table"]["seed"].tolist(), [0, 1, 0, 1, 0, 1])
         self.assertEqual(
             result["entropy_scan_table"]["subsystem_size"].drop_duplicates().tolist(),
             [1, 2],
         )
+        self.assertTrue(np.isfinite(result["entropy_scan_table"]["renyi2"]).all())
+
+    def test_run_architecture_benchmark_reports_netket_gap_column(self) -> None:
+        result = run_architecture_benchmark(
+            architecture_configs={
+                "RBM": {"alpha": 1},
+                "FFNN": {"hidden_dims": (4,)},
+                "CNN": {"channels": (2,), "kernel_size": (1, 1)},
+            },
+            lattice_shape=(2, 2),
+            hamiltonian="tfim",
+            n_iter=1,
+            n_samples=16,
+            n_discard_per_chain=2,
+            n_chains=4,
+            netket_reference_energy=-5.0,
+        )
+
+        self.assertEqual(result["summary_table"]["model"].tolist(), ["CNN", "FFNN", "RBM"])
+        self.assertTrue((result["summary_table"]["netket_reference_energy"] == -5.0).all())
+        self.assertIn("netket_gap", result["summary_table"].columns)
+
+    def test_run_random_architecture_study_reports_sampled_and_exact_entropy(self) -> None:
+        result = run_random_architecture_study(
+            architecture_configs={
+                "FFNN": {"hidden_dims": (4,)},
+                "CNN": {"channels": (2,), "kernel_size": (1, 1)},
+            },
+            seeds=(0, 1),
+            lattice_shape=(2, 2),
+            hamiltonian="tfim",
+            n_samples=16,
+            n_discard_per_chain=2,
+            n_chains=4,
+            entropy_n_independent_runs=2,
+            real_amplitude_only=True,
+        )
+
+        self.assertEqual(result["summary_table"]["model"].tolist(), ["CNN", "FFNN"])
+        self.assertTrue((result["summary_table"]["parameter_count"] > 0).all())
+        self.assertIn("half_partition_exact_renyi2", result["summary_table"].columns)
+        self.assertIn("half_partition_sampled_renyi2", result["summary_table"].columns)
+        self.assertEqual(result["trial_table"]["seed"].tolist(), [0, 1, 0, 1])
+        self.assertEqual(
+            result["entropy_scan_table"]["subsystem_size"].drop_duplicates().tolist(),
+            [1, 2],
+        )
+        self.assertTrue(np.isfinite(result["entropy_scan_table"]["exact_renyi2"]).all())
+        self.assertTrue(np.isfinite(result["entropy_scan_table"]["sampled_renyi2"]).all())
 
     def test_run_hamiltonian_system_size_sweep_tracks_training_entropy(self) -> None:
         result = run_hamiltonian_system_size_sweep(
@@ -135,13 +211,6 @@ class DemoHelperTests(unittest.TestCase):
             set(result["training_history_table"]["sweep_label"].tolist()),
             {"tfim_critical", "j1j2_frustrated"},
         )
-
-    def test_ghz_state_metrics_match_ideal_ghz_state(self) -> None:
-        metrics = ghz_state_metrics(ghz_statevector(4))
-
-        self.assertAlmostEqual(metrics["ghz_fidelity"], 1.0)
-        self.assertAlmostEqual(metrics["cat_sector_weight"], 1.0)
-        self.assertAlmostEqual(metrics["half_partition_renyi2"], np.log(2.0))
 
     def test_run_ghz_bonus_workflow_returns_training_outputs(self) -> None:
         result = run_ghz_bonus_workflow(

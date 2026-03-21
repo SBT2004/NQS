@@ -10,10 +10,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from demos.final_exam_helper import build_output_manifest, plot_training_history, save_report_figure, save_report_table  # noqa: E402
+from demos.exercise_report_helper import build_output_manifest, plot_training_history, save_report_figure, save_report_table  # noqa: E402
 
 
-class FinalExamHelperTests(unittest.TestCase):
+class ExerciseReportHelperTests(unittest.TestCase):
     def test_save_report_artifacts_and_manifest(self) -> None:
         summary_table = pd.DataFrame(
             [

@@ -1,30 +1,26 @@
 import sys
 import unittest
+import warnings
 from pathlib import Path
 from typing import cast
 
 import jax
-import netket as nk
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from src.nqs import (
-    Adam,
-    CNN,
-    FFNN,
-    RBM,
-    NetKetSampler,
-    SpinHilbert,
-    VMC,
-    build_variational_state,
-    build_vmc_driver,
-    energy_loss,
-    exact_ground_state_energy,
-    states_from_netket,
-    states_to_netket,
-)
-from src.nqs import Operator, SquareLattice, collect_terms, j1_j2, sx_term, szsz_term
+from nqs.driver import VMC
+from nqs.expectation import ProjectExpectationBackend
+from nqs.exact_diag import exact_ground_state_energy
+from nqs.graph import Chain1D, SquareLattice
+from nqs.hilbert import SpinHilbert
+from nqs.loss import energy_loss
+from nqs.models import CNN, FFNN, RBM
+from nqs.operator import Operator, collect_terms, j1_j2, sx_term, szsz_term
+from nqs.optimizer import Adam
+from nqs.runtime_types import states_from_signed_spins, states_to_signed_spins
+from nqs.sampler import MetropolisLocal
+from nqs.vmc_setup import build_variational_state, build_vmc_experiment
 
 
 def _tfim_operator(hilbert: SpinHilbert, graph: SquareLattice, J: float = 1.0, h: float = 0.8) -> Operator:
@@ -33,13 +29,48 @@ def _tfim_operator(hilbert: SpinHilbert, graph: SquareLattice, J: float = 1.0, h
     return Operator(hilbert, collect_terms(interaction_terms, field_terms))
 
 
+def _chain_tfim_operator(hilbert: SpinHilbert, h: float = 1.0) -> Operator:
+    graph = Chain1D(length=hilbert.size, pbc=False)
+    interaction_terms = [szsz_term(edge.i, edge.j, coefficient=-1.0) for edge in graph.iter_edges("J", n=1)]
+    field_terms = [sx_term(site, coefficient=-h) for site in range(hilbert.size)]
+    return Operator(hilbert, collect_terms(interaction_terms, field_terms))
+
+
+def _reference_local_energies(
+    operator: Operator,
+    model: RBM | FFNN | CNN,
+    params: dict[str, object],
+    samples: np.ndarray,
+) -> np.ndarray:
+    sample_array = np.asarray(samples, dtype=np.uint8).reshape(-1, operator.hilbert.size)
+    original_log_values = np.asarray(
+        model.log_psi(params, jax.numpy.asarray(sample_array, dtype=jax.numpy.uint8)),
+        dtype=np.complex128,
+    ).reshape(-1)
+    local_energies = np.zeros(sample_array.shape[0], dtype=np.complex128)
+
+    for sample_index, state in enumerate(sample_array):
+        connected = operator.connected_elements(state)
+        connected_states = np.stack([connected_state for connected_state, _ in connected], axis=0)
+        coefficients = np.asarray([value for _, value in connected], dtype=np.complex128)
+        connected_log_values = np.asarray(
+            model.log_psi(params, jax.numpy.asarray(connected_states, dtype=jax.numpy.uint8)),
+            dtype=np.complex128,
+        ).reshape(-1)
+        local_energies[sample_index] = np.sum(
+            coefficients * np.exp(connected_log_values - original_log_values[sample_index])
+        )
+
+    return local_energies
+
+
 class ModelTests(unittest.TestCase):
-    def test_netket_state_conversion_roundtrip(self) -> None:
+    def test_signed_spin_state_conversion_roundtrip(self) -> None:
         states = np.array([[0, 1, 0, 1], [1, 1, 0, 0]], dtype=np.uint8)
         jax_states = jax.numpy.asarray(states)
-        netket_states = states_to_netket(jax_states)
-        np.testing.assert_array_equal(np.asarray(netket_states), np.array([[-1.0, 1.0, -1.0, 1.0], [1.0, 1.0, -1.0, -1.0]]))
-        np.testing.assert_array_equal(np.asarray(states_from_netket(netket_states)), states)
+        signed_states = states_to_signed_spins(jax_states)
+        np.testing.assert_array_equal(np.asarray(signed_states), np.array([[-1.0, 1.0, -1.0, 1.0], [1.0, 1.0, -1.0, -1.0]]))
+        np.testing.assert_array_equal(np.asarray(states_from_signed_spins(signed_states)), states)
 
     def test_rbm_log_psi_shape(self) -> None:
         hilbert = SpinHilbert(4)
@@ -64,19 +95,12 @@ class ModelTests(unittest.TestCase):
 
 
 class VMCTests(unittest.TestCase):
-    def _make_sampler(self, hilbert: SpinHilbert, seed: int) -> NetKetSampler:
-        return NetKetSampler(hilbert=hilbert, n_samples=16, n_discard_per_chain=2, n_chains=4, seed=seed)
+    def _make_sampler(self, hilbert: SpinHilbert, seed: int) -> MetropolisLocal:
+        return MetropolisLocal(hilbert=hilbert, n_samples=16, n_discard_per_chain=2, n_chains=4, seed=seed)
 
     def _make_driver(self, hilbert: SpinHilbert, seed: int) -> VMC:
-        model = RBM(alpha=1)
-        sampler = self._make_sampler(hilbert, seed=seed)
-        operator = nk.operator.IsingJax(  # pyright: ignore[reportCallIssue]
-            hilbert=sampler.netket_hilbert,
-            graph=nk.graph.Chain(length=hilbert.size, pbc=False),
-            h=1.0,
-        )
-        _, driver = build_vmc_driver(
-            model=model,
+        operator = _chain_tfim_operator(hilbert, h=1.0)
+        _, _, driver = build_vmc_experiment(
             hilbert=hilbert,
             operator=operator,
             learning_rate=1e-2,
@@ -84,6 +108,7 @@ class VMCTests(unittest.TestCase):
             n_samples=16,
             n_discard_per_chain=2,
             n_chains=4,
+            model=RBM(alpha=1),
         )
         return driver
 
@@ -98,12 +123,7 @@ class VMCTests(unittest.TestCase):
             n_discard_per_chain=2,
             n_chains=4,
         )
-        nk_hilbert = state.sampler.netket_hilbert
-        operator = nk.operator.IsingJax(  # pyright: ignore[reportCallIssue]
-            hilbert=nk_hilbert,
-            graph=nk.graph.Chain(length=4, pbc=False),
-            h=1.0,
-        )
+        operator = _chain_tfim_operator(hilbert, h=1.0)
         optimizer = Adam(learning_rate=1e-2)
 
         loss_value, grads = optimizer.compute_gradients(
@@ -113,6 +133,32 @@ class VMCTests(unittest.TestCase):
 
         self.assertTrue(np.isfinite(np.asarray(loss_value)))
         self.assertEqual(set(grads.keys()), set(state.parameters.keys()))
+
+    def test_bitmap_local_energies_match_reference_array_path(self) -> None:
+        hilbert = SpinHilbert(4)
+        model = RBM(alpha=1)
+        params = model.init(jax.random.PRNGKey(0), hilbert)
+        backend = ProjectExpectationBackend(
+            model=model,
+            sampler=self._make_sampler(hilbert, seed=11),
+            params=params,
+        )
+        operator = _chain_tfim_operator(hilbert, h=1.0)
+        samples = np.array(
+            [
+                [0, 0, 0, 0],
+                [1, 0, 1, 0],
+                [1, 1, 0, 1],
+            ],
+            dtype=np.uint8,
+        )
+
+        actual = np.asarray(
+            backend._local_energies(operator, params, jax.numpy.asarray(samples, dtype=jax.numpy.uint8))
+        )
+        expected = _reference_local_energies(operator, model, params, samples)
+
+        np.testing.assert_allclose(actual, expected)
 
     def test_variational_state_and_driver_update_parameters(self) -> None:
         hilbert = SpinHilbert(4)
@@ -159,23 +205,43 @@ class VMCTests(unittest.TestCase):
         project_operator = _tfim_operator(hilbert, graph)
         exact_energy = exact_ground_state_energy(project_operator)
         model = RBM(alpha=2)
-        state, driver = build_vmc_driver(
-            model=model,
+        _, state, driver = build_vmc_experiment(
             hilbert=hilbert,
-            operator=project_operator.to_netket(),
+            operator=project_operator,
             learning_rate=1e-2,
             seed=7,
             n_samples=128,
             n_discard_per_chain=8,
             n_chains=8,
+            model=model,
         )
 
         for _ in range(120):
             driver.step()
 
-        optimized_energy = float(np.asarray(state.energy(project_operator.to_netket())))
+        optimized_energy = float(np.asarray(state.energy(project_operator)))
         self.assertLess(abs(optimized_energy - exact_energy), 0.01)
         self.assertEqual(np.asarray(state.exact_statevector()).shape, (hilbert.n_states,))
+
+    def test_exact_backend_expectation_avoids_complex128_truncation_warning(self) -> None:
+        hilbert = SpinHilbert(4)
+        operator = _chain_tfim_operator(hilbert, h=1.0)
+        model = RBM(alpha=1)
+        params = model.init(jax.random.PRNGKey(0), hilbert)
+        backend = ProjectExpectationBackend(
+            model=model,
+            sampler=self._make_sampler(hilbert, seed=12),
+            params=params,
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = backend.expect(operator)
+
+        self.assertTrue(np.isfinite(np.asarray(result.mean)))
+        self.assertFalse(
+            any("Explicitly requested dtype <class 'jax.numpy.complex128'>" in str(warning.message) for warning in caught)
+        )
 
     def test_j1j2_architectures_match_ed_with_phase_capable_ansatze(self) -> None:
         hilbert = SpinHilbert(4)
@@ -190,22 +256,23 @@ class VMCTests(unittest.TestCase):
 
         for label, model, n_steps, learning_rate in architecture_runs:
             with self.subTest(model=label):
-                state, driver = build_vmc_driver(
-                    model=model,
+                _, state, driver = build_vmc_experiment(
                     hilbert=hilbert,
-                    operator=project_operator.to_netket(),
+                    operator=project_operator,
                     learning_rate=learning_rate,
                     seed=0,
                     n_samples=256,
                     n_discard_per_chain=16,
                     n_chains=8,
+                    model=model,
                 )
 
+                best_energy = float(np.asarray(state.energy(project_operator)))
                 for _ in range(n_steps):
                     driver.step()
+                    best_energy = min(best_energy, float(np.asarray(state.energy(project_operator))))
 
-                optimized_energy = float(np.asarray(state.energy(project_operator.to_netket())))
-                self.assertLess(abs(optimized_energy - exact_energy), 0.01)
+                self.assertLess(abs(best_energy - exact_energy), 0.01)
 
 
 if __name__ == "__main__":

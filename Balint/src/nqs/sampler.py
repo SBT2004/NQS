@@ -1,7 +1,143 @@
-from .netket_adapter import NetKetSampler, states_from_netket, states_to_netket
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from math import ceil
+from typing import Callable
+
+import jax
+import jax.numpy as jnp
+
+from .hilbert import SpinHilbert
+
+
+LogPsiFn = Callable[[jax.Array], jax.Array]
+
+
+@dataclass
+class MetropolisLocal:
+    """Project-owned local Metropolis sampler for spin-1/2 states."""
+
+    hilbert: SpinHilbert
+    n_samples: int = 64
+    n_discard_per_chain: int = 8
+    n_chains: int = 16
+    seed: int = 0
+    _rng_key: jax.Array = field(init=False, repr=False)
+    _chain_states: jax.Array | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.n_samples <= 0:
+            raise ValueError("n_samples must be positive.")
+        if self.n_discard_per_chain < 0:
+            raise ValueError("n_discard_per_chain must be non-negative.")
+        if self.n_chains <= 0:
+            raise ValueError("n_chains must be positive.")
+        self._rng_key = jax.random.PRNGKey(self.seed)
+
+    def _steps_per_chain(self) -> int:
+        return max(1, ceil(self.n_samples / self.n_chains))
+
+    def _random_states(self, rng_key: jax.Array) -> jax.Array:
+        return jax.random.bernoulli(
+            rng_key,
+            p=0.5,
+            shape=(self.n_chains, self.hilbert.size),
+        ).astype(jnp.uint8)
+
+    def _metropolis_step(
+        self,
+        log_psi_fn: LogPsiFn,
+        states: jax.Array,
+        log_values: jax.Array,
+        rng_key: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        site_key, accept_key, next_key = jax.random.split(rng_key, 3)
+        proposal_sites = jax.random.randint(
+            site_key,
+            shape=(self.n_chains,),
+            minval=0,
+            maxval=self.hilbert.size,
+        )
+        proposal_rows = jnp.arange(self.n_chains)
+        proposed_states = states.at[proposal_rows, proposal_sites].set(
+            1 - states[proposal_rows, proposal_sites]
+        )
+        proposed_log_values = jnp.asarray(log_psi_fn(proposed_states))
+        log_ratio = 2.0 * jnp.real(proposed_log_values - log_values)
+        log_uniform = jnp.log(
+            jax.random.uniform(
+                accept_key,
+                shape=(self.n_chains,),
+                minval=jnp.finfo(jnp.float32).tiny,
+                maxval=1.0,
+            )
+        )
+        accepted = log_uniform < jnp.minimum(log_ratio, 0.0)
+        next_states = jnp.where(accepted[:, None], proposed_states, states)
+        next_log_values = jnp.where(accepted, proposed_log_values, log_values)
+        return next_states, next_log_values, next_key
+
+    def _draw_samples(
+        self,
+        log_psi_fn: LogPsiFn,
+        *,
+        initial_states: jax.Array,
+        rng_key: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        states = jnp.asarray(initial_states, dtype=jnp.uint8)
+        log_values = jnp.asarray(log_psi_fn(states))
+
+        for _ in range(self.n_discard_per_chain):
+            states, log_values, rng_key = self._metropolis_step(
+                log_psi_fn,
+                states,
+                log_values,
+                rng_key,
+            )
+
+        collected: list[jax.Array] = []
+        for _ in range(self._steps_per_chain()):
+            states, log_values, rng_key = self._metropolis_step(
+                log_psi_fn,
+                states,
+                log_values,
+                rng_key,
+            )
+            collected.append(states)
+
+        flat_samples = jnp.concatenate(collected, axis=0)[: self.n_samples]
+        return flat_samples, states, rng_key
+
+    def sample(self, log_psi_fn: LogPsiFn) -> jax.Array:
+        init_key, sample_key = jax.random.split(self._rng_key)
+        if self._chain_states is None:
+            self._chain_states = self._random_states(init_key)
+        samples, final_states, final_key = self._draw_samples(
+            log_psi_fn,
+            initial_states=self._chain_states,
+            rng_key=sample_key,
+        )
+        self._chain_states = final_states
+        self._rng_key = final_key
+        return samples
+
+    def independent_sample(
+        self,
+        log_psi_fn: LogPsiFn,
+        *,
+        seed_offset: int = 0,
+    ) -> jax.Array:
+        rng_key = jax.random.PRNGKey(self.seed + seed_offset + 1)
+        init_key, sample_key = jax.random.split(rng_key)
+        initial_states = self._random_states(init_key)
+        samples, _, _ = self._draw_samples(
+            log_psi_fn,
+            initial_states=initial_states,
+            rng_key=sample_key,
+        )
+        return samples
 
 __all__ = [
-    "NetKetSampler",
-    "states_from_netket",
-    "states_to_netket",
+    "LogPsiFn",
+    "MetropolisLocal",
 ]

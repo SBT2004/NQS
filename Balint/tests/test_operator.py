@@ -2,13 +2,14 @@ import sys
 import unittest
 from pathlib import Path
 
-import netket as nk
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from src.nqs import LocalTerm, Operator, SpinHilbert, SquareLattice, heisenberg_term, j1_j2, local_matrix, sigmax, sigmaz
-from src.nqs.operator import tfim
+from nqs.exact_diag import operator_matrix
+from nqs.graph import SquareLattice
+from nqs.hilbert import SpinHilbert
+from nqs.operator import LocalTerm, Operator, heisenberg_term, j1_j2, local_matrix, sigmax, sigmaz, tfim
 
 
 class OperatorTests(unittest.TestCase):
@@ -66,13 +67,37 @@ class OperatorTests(unittest.TestCase):
         np.testing.assert_array_equal(connected[0][0], np.array([1, 1, 1], dtype=np.uint8))
         self.assertEqual(connected[0][1], 1.5)
 
+    def test_bitmap_connected_elements_match_array_path(self) -> None:
+        hilbert = SpinHilbert(4)
+        op = Operator(
+            hilbert,
+            [
+                LocalTerm((0,), sigmax(), coefficient=2.0),
+                LocalTerm((1, 3), local_matrix([[1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 1]])),
+            ],
+        )
+        state = np.array([1, 0, 0, 1], dtype=np.uint8)
+        state_bits = hilbert.state_to_index(state)
+
+        connected_arrays = [(hilbert.state_to_index(connected_state), value) for connected_state, value in op.connected_elements(state)]
+        connected_bits = op.connected_elements_bits(state_bits)
+
+        self.assertEqual(connected_bits, connected_arrays)
+
+    def test_bitmap_connected_elements_reject_out_of_range_state(self) -> None:
+        hilbert = SpinHilbert(3)
+        op = Operator(hilbert, [LocalTerm((0,), sigmax())])
+
+        with self.assertRaises(ValueError):
+            op.connected_elements_bits(8)
+
     def test_reject_repeated_sites(self) -> None:
         with self.assertRaises(ValueError):
-            LocalTerm((1, 1), np.eye(4))
+            LocalTerm((1, 1), np.eye(4, dtype=np.complex128))
 
     def test_reject_wrong_matrix_shape(self) -> None:
         with self.assertRaises(ValueError):
-            LocalTerm((0, 1), np.eye(2))
+            LocalTerm((0, 1), np.eye(2, dtype=np.complex128))
 
     def test_reject_site_outside_hilbert_space(self) -> None:
         hilbert = SpinHilbert(2)
@@ -117,14 +142,22 @@ class OperatorTests(unittest.TestCase):
         self.assertEqual(sum(1 for term in operator.terms if len(term.sites) == 2), 4)
         self.assertEqual(sum(1 for term in operator.terms if len(term.sites) == 1), 4)
 
-    def test_operator_to_netket_returns_local_operator(self) -> None:
-        graph = SquareLattice(2, 2, pbc=False)
-        hilbert = SpinHilbert(graph.n_nodes)
-        operator = j1_j2(hilbert, graph, J1=1.0, J2=0.5)
+    def test_exact_diag_matrix_matches_operator_action(self) -> None:
+        hilbert = SpinHilbert(2)
+        operator = Operator(hilbert, [LocalTerm((0,), sigmax()), LocalTerm((1,), sigmaz())])
 
-        adapted = operator.to_netket()
+        matrix = operator_matrix(operator)
+        expected = np.array(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, -1, 1],
+                [0, 0, 1, -1],
+            ],
+            dtype=np.complex128,
+        )
 
-        self.assertIsInstance(adapted, nk.operator.LocalOperator)
+        np.testing.assert_allclose(matrix, expected)
 
 
 if __name__ == "__main__":

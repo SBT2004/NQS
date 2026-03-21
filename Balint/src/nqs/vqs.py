@@ -6,23 +6,24 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from .expectation import NetKetExpectationBackend, SupportsExpectationBackend
-from .netket_adapter import NetKetSampler, SupportsLogPsi
+from .expectation import ProjectExpectationBackend, SupportsExpectationBackend
+from .runtime_types import SupportsLogPsi
+from .sampler import MetropolisLocal
 
 ParamTree = Any
 
 
 @dataclass
 class VariationalState:
-    """Project-owned variational state backed by an expectation backend."""
+    """Project-owned variational state backed by a project-owned expectation backend."""
 
     model: SupportsLogPsi
     params: ParamTree
-    sampler: NetKetSampler
+    sampler: MetropolisLocal
     exact_backend_max_states: int = 4096
 
     def __post_init__(self) -> None:
-        self._expectation_backend: SupportsExpectationBackend = NetKetExpectationBackend(
+        self._expectation_backend: SupportsExpectationBackend = ProjectExpectationBackend(
             model=self.model,
             sampler=self.sampler,
             params=self.params,
@@ -63,8 +64,6 @@ class VariationalState:
         return self._expectation_backend.expect_with_params(operator, params)
 
     def energy(self, operator: Any) -> jax.Array:
-        # NetKet returns a structured statistics object; we extract the scalar
-        # mean because that is the quantity used by the optimizer.
         return jnp.real(self.expect(operator).mean)
 
     def energy_with_params(
