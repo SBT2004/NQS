@@ -108,3 +108,10 @@ class CNN:
 
         x = x.reshape(-1)
         return (dense.T @ x + bias)[0]
+    
+def count_parameters(params):
+    """
+    Count total number of scalar trainable parameters in a pytree.
+    """
+    flat, _ = jax.flatten_util.ravel_pytree(params)
+    return int(flat.size)
