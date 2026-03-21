@@ -22,11 +22,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from demos.ising1d_ed_vs_vmc_helper import (  # noqa: E402
     build_ising_operator,
-    exact_ground_state_energy,
+    exact_ground_state_energy_netket,
     run_demo,
     run_model_demo,
 )
-from nqs import CNN, FFNN, RBM  # noqa: E402
+from src.nqs import CNN, FFNN, RBM  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -59,8 +59,8 @@ PROFILE_EXPERIMENTS: dict[str, ProfileExperiment] = {
         n_samples=256,
         n_discard_per_chain=32,
         n_chains=16,
-        full_iterations=128,
-        profile_iterations=96,
+        full_iterations=160,
+        profile_iterations=160,
     ),
     "CNN": ProfileExperiment(
         model_factory=lambda length: CNN(spatial_shape=(length, 1), channels=(16, 8), kernel_size=(5, 1)),
@@ -70,7 +70,7 @@ PROFILE_EXPERIMENTS: dict[str, ProfileExperiment] = {
         n_discard_per_chain=32,
         n_chains=16,
         full_iterations=256,
-        profile_iterations=192,
+        profile_iterations=256,
     ),
 }
 
@@ -166,7 +166,7 @@ def _run_profile_model(
     experiment = PROFILE_EXPERIMENTS[model_name]
     model = experiment.model_factory(length)
     _, operator = build_ising_operator(length, transverse_field)
-    exact_energy = exact_ground_state_energy(operator)
+    exact_energy = exact_ground_state_energy_netket(operator)
     energy_trace, final_energy = run_model_demo(
         model_name=model_name,
         model=model,

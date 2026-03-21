@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from typing import cast
 
 import jax
 import netket as nk
@@ -8,7 +9,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from nqs import (
+from src.nqs import (
     Adam,
     CNN,
     FFNN,
@@ -16,30 +17,20 @@ from nqs import (
     NetKetSampler,
     SpinHilbert,
     VMC,
-    VariationalState,
+    build_variational_state,
+    build_vmc_driver,
     energy_loss,
+    exact_ground_state_energy,
     states_from_netket,
     states_to_netket,
 )
-from nqs.graph import SquareLattice
-from nqs.operator import Operator, collect_terms, j1_j2, sx_term, szsz_term
+from src.nqs import Operator, SquareLattice, collect_terms, j1_j2, sx_term, szsz_term
 
 
 def _tfim_operator(hilbert: SpinHilbert, graph: SquareLattice, J: float = 1.0, h: float = 0.8) -> Operator:
     interaction_terms = [szsz_term(edge.i, edge.j, coefficient=-J) for edge in graph.iter_edges("J1", n=1)]
     field_terms = [sx_term(site, coefficient=-h) for site in range(hilbert.size)]
     return Operator(hilbert, collect_terms(interaction_terms, field_terms))
-
-
-def _exact_ground_energy(project_operator: Operator) -> float:
-    hilbert = project_operator.hilbert
-    dimension = hilbert.n_states
-    matrix = np.zeros((dimension, dimension), dtype=np.complex128)
-    for column_index, state in enumerate(hilbert.all_states()):
-        for connected_state, value in project_operator.connected_elements(state):
-            row_index = hilbert.state_to_index(connected_state)
-            matrix[row_index, column_index] += value
-    return float(np.min(np.linalg.eigvalsh(matrix).real))
 
 
 class ModelTests(unittest.TestCase):
@@ -76,13 +67,38 @@ class VMCTests(unittest.TestCase):
     def _make_sampler(self, hilbert: SpinHilbert, seed: int) -> NetKetSampler:
         return NetKetSampler(hilbert=hilbert, n_samples=16, n_discard_per_chain=2, n_chains=4, seed=seed)
 
+    def _make_driver(self, hilbert: SpinHilbert, seed: int) -> VMC:
+        model = RBM(alpha=1)
+        sampler = self._make_sampler(hilbert, seed=seed)
+        operator = nk.operator.IsingJax(  # pyright: ignore[reportCallIssue]
+            hilbert=sampler.netket_hilbert,
+            graph=nk.graph.Chain(length=hilbert.size, pbc=False),
+            h=1.0,
+        )
+        _, driver = build_vmc_driver(
+            model=model,
+            hilbert=hilbert,
+            operator=operator,
+            learning_rate=1e-2,
+            seed=seed,
+            n_samples=16,
+            n_discard_per_chain=2,
+            n_chains=4,
+        )
+        return driver
+
     def test_jax_gradient_matches_param_structure(self) -> None:
         hilbert = SpinHilbert(4)
         model = RBM(alpha=1)
-        params = model.init(jax.random.PRNGKey(0), hilbert)
-        sampler = self._make_sampler(hilbert, seed=0)
-        state = VariationalState(model=model, params=params, sampler=sampler)
-        nk_hilbert = sampler.netket_hilbert
+        state = build_variational_state(
+            model=model,
+            hilbert=hilbert,
+            seed=0,
+            n_samples=16,
+            n_discard_per_chain=2,
+            n_chains=4,
+        )
+        nk_hilbert = state.sampler.netket_hilbert
         operator = nk.operator.IsingJax(  # pyright: ignore[reportCallIssue]
             hilbert=nk_hilbert,
             graph=nk.graph.Chain(length=4, pbc=False),
@@ -100,38 +116,58 @@ class VMCTests(unittest.TestCase):
 
     def test_variational_state_and_driver_update_parameters(self) -> None:
         hilbert = SpinHilbert(4)
-        model = RBM(alpha=1)
-        params = model.init(jax.random.PRNGKey(3), hilbert)
-        sampler = self._make_sampler(hilbert, seed=3)
-        state = VariationalState(model=model, params=params, sampler=sampler)
-        operator = nk.operator.IsingJax(  # pyright: ignore[reportCallIssue]
-            hilbert=sampler.netket_hilbert,
-            graph=nk.graph.Chain(length=4, pbc=False),
-            h=1.0,
-        )
-        driver = VMC(operator=operator, variational_state=state, optimizer=Adam(learning_rate=1e-2))
-
-        before = jax.tree_util.tree_leaves(state.parameters)
+        driver = self._make_driver(hilbert, seed=3)
+        before = jax.tree_util.tree_leaves(driver.variational_state.parameters)
         history = driver.run(2)
-        after = jax.tree_util.tree_leaves(state.parameters)
+        after = jax.tree_util.tree_leaves(driver.variational_state.parameters)
 
         self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["step"], 0)
+        self.assertEqual(history[1]["step"], 1)
         self.assertIn("energy", history[0])
         self.assertTrue(any(not np.allclose(np.asarray(a), np.asarray(b)) for a, b in zip(before, after)))
+
+    def test_vmc_run_records_callback_outputs_with_cadence(self) -> None:
+        hilbert = SpinHilbert(4)
+        driver = self._make_driver(hilbert, seed=4)
+
+        history = driver.run(
+            3,
+            callback=lambda step, current_driver: {
+                "marker": step,
+                "energy_snapshot": float(np.asarray(current_driver.variational_state.energy(current_driver.operator))),
+            },
+            callback_every=2,
+        )
+        first_observables = cast(dict[str, object], history[0]["observables"])
+        last_observables = cast(dict[str, object], history[2]["observables"])
+
+        self.assertEqual(first_observables["marker"], 0)
+        self.assertNotIn("observables", history[1])
+        self.assertEqual(last_observables["marker"], 2)
+
+    def test_vmc_run_rejects_nonpositive_callback_every(self) -> None:
+        hilbert = SpinHilbert(4)
+        driver = self._make_driver(hilbert, seed=5)
+
+        with self.assertRaises(ValueError):
+            driver.run(1, callback=lambda step, _: {"step": step}, callback_every=0)
 
     def test_small_system_exact_backend_matches_ed_to_within_target(self) -> None:
         hilbert = SpinHilbert(4)
         graph = SquareLattice(2, 2, pbc=True)
         project_operator = _tfim_operator(hilbert, graph)
-        exact_energy = _exact_ground_energy(project_operator)
+        exact_energy = exact_ground_state_energy(project_operator)
         model = RBM(alpha=2)
-        params = model.init(jax.random.PRNGKey(7), hilbert)
-        sampler = NetKetSampler(hilbert=hilbert, n_samples=128, n_discard_per_chain=8, n_chains=8, seed=7)
-        state = VariationalState(model=model, params=params, sampler=sampler)
-        driver = VMC(
+        state, driver = build_vmc_driver(
+            model=model,
+            hilbert=hilbert,
             operator=project_operator.to_netket(),
-            variational_state=state,
-            optimizer=Adam(learning_rate=1e-2),
+            learning_rate=1e-2,
+            seed=7,
+            n_samples=128,
+            n_discard_per_chain=8,
+            n_chains=8,
         )
 
         for _ in range(120):
@@ -145,7 +181,7 @@ class VMCTests(unittest.TestCase):
         hilbert = SpinHilbert(4)
         graph = SquareLattice(2, 2, pbc=True)
         project_operator = j1_j2(hilbert, graph, J1=1.0, J2=0.5)
-        exact_energy = _exact_ground_energy(project_operator)
+        exact_energy = exact_ground_state_energy(project_operator)
         architecture_runs = (
             ("RBM", RBM(alpha=4), 800, 1e-2),
             ("FFNN", FFNN(hidden_dims=(32, 16)), 400, 1e-2),
@@ -154,13 +190,15 @@ class VMCTests(unittest.TestCase):
 
         for label, model, n_steps, learning_rate in architecture_runs:
             with self.subTest(model=label):
-                params = model.init(jax.random.PRNGKey(0), hilbert)
-                sampler = NetKetSampler(hilbert=hilbert, n_samples=256, n_discard_per_chain=16, n_chains=8, seed=0)
-                state = VariationalState(model=model, params=params, sampler=sampler)
-                driver = VMC(
+                state, driver = build_vmc_driver(
+                    model=model,
+                    hilbert=hilbert,
                     operator=project_operator.to_netket(),
-                    variational_state=state,
-                    optimizer=Adam(learning_rate=learning_rate),
+                    learning_rate=learning_rate,
+                    seed=0,
+                    n_samples=256,
+                    n_discard_per_chain=16,
+                    n_chains=8,
                 )
 
                 for _ in range(n_steps):

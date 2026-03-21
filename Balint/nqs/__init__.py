@@ -1,58 +1,42 @@
-"""Compatibility package that re-exports the implementation from ``src.nqs``.
+"""Compatibility package that forwards notebook-style imports to ``src.nqs``."""
 
-Demo notebooks live outside ``src/``, so this shim makes ``import nqs`` work
-from the Balint workspace root without relying on IDE-specific source-root
-configuration.
-"""
+from importlib import import_module
 
-from src.nqs import Adam
-from src.nqs import CNN
-from src.nqs import FFNN
-from src.nqs import Chain1D
-from src.nqs import Edge
-from src.nqs import Graph
-from src.nqs import LocalTerm
-from src.nqs import NetKetSampler
-from src.nqs import Operator
-from src.nqs import RBM
-from src.nqs import SpinHilbert
-from src.nqs import SquareLattice
-from src.nqs import VMC
-from src.nqs import VariationalState
-from src.nqs import energy_loss
-from src.nqs import identity
-from src.nqs import local_matrix
-from src.nqs import projector_one
-from src.nqs import projector_zero
-from src.nqs import sigmax
-from src.nqs import sigmay
-from src.nqs import sigmaz
-from src.nqs import states_from_netket
-from src.nqs import states_to_netket
+import src.nqs as _impl
 
-__all__ = [
-    "Adam",
-    "CNN",
-    "FFNN",
-    "Edge",
-    "Graph",
-    "Chain1D",
-    "LocalTerm",
-    "NetKetSampler",
-    "Operator",
-    "RBM",
-    "SpinHilbert",
-    "SquareLattice",
-    "VMC",
-    "VariationalState",
-    "energy_loss",
-    "identity",
-    "local_matrix",
-    "projector_one",
-    "projector_zero",
-    "sigmax",
-    "sigmay",
-    "sigmaz",
-    "states_from_netket",
-    "states_to_netket",
-]
+# Reuse src.nqs as the package search root so nqs.<module> imports resolve
+# without maintaining a second set of wrapper files.
+__path__ = list(_impl.__path__)
+
+_FORWARDED_SUBMODULES = (
+    "driver",
+    "expectation",
+    "exact_diag",
+    "graph",
+    "hilbert",
+    "models",
+    "observables",
+    "operator",
+    "optimizer",
+    "sampler",
+    "vmc_setup",
+    "vqs",
+)
+
+for export_name in _impl.__all__:
+    globals()[export_name] = getattr(_impl, export_name)
+
+driver = import_module("src.nqs.driver")
+expectation = import_module("src.nqs.expectation")
+exact_diag = import_module("src.nqs.exact_diag")
+graph = import_module("src.nqs.graph")
+hilbert = import_module("src.nqs.hilbert")
+models = import_module("src.nqs.models")
+observables = import_module("src.nqs.observables")
+operator = import_module("src.nqs.operator")
+optimizer = import_module("src.nqs.optimizer")
+sampler = import_module("src.nqs.sampler")
+vmc_setup = import_module("src.nqs.vmc_setup")
+vqs = import_module("src.nqs.vqs")
+
+__all__ = [*_impl.__all__, *_FORWARDED_SUBMODULES]

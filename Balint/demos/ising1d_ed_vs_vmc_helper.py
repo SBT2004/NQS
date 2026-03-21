@@ -14,7 +14,7 @@ import netket as nk
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from nqs import Adam, CNN, FFNN, RBM, NetKetSampler, SpinHilbert, VMC, VariationalState  # noqa: E402
+from src.nqs import CNN, FFNN, RBM, SpinHilbert, build_variational_state, build_vmc_driver  # noqa: E402
 
 
 class SupportsDemoModel(Protocol):
@@ -40,7 +40,7 @@ def build_ising_operator(length: int, field_strength: float) -> tuple[Any, nk.op
     return netket_hilbert, operator
 
 
-def exact_ground_state_energy(operator: nk.operator.AbstractOperator) -> float:
+def exact_ground_state_energy_netket(operator: nk.operator.AbstractOperator) -> float:
     """Compute the exact ground-state energy with NetKet's Lanczos ED helper."""
 
     return float(nk.exact.lanczos_ed(operator, k=1, compute_eigenvectors=False)[0])
@@ -63,19 +63,15 @@ def run_model_demo(
     """Optimize one ansatz with sampled VMC and return its energy trace."""
 
     hilbert = SpinHilbert(length)
-    params = model.init(jax.random.PRNGKey(seed), hilbert)
-    train_sampler = NetKetSampler(
+    state, driver = build_vmc_driver(
+        model=model,
         hilbert=hilbert,
+        operator=operator,
+        learning_rate=learning_rate,
+        seed=seed,
         n_samples=n_samples,
         n_discard_per_chain=n_discard_per_chain,
         n_chains=n_chains,
-        seed=seed,
-    )
-    state = VariationalState(model=model, params=params, sampler=train_sampler)
-    driver = VMC(
-        operator=operator,
-        variational_state=state,
-        optimizer=Adam(learning_rate=learning_rate),
     )
     history = driver.run(n_iter)
 
@@ -83,14 +79,15 @@ def run_model_demo(
 
     # Use a separate higher-statistics state for the final benchmark estimate so
     # the comparison to ED is less noisy than the training trace.
-    eval_sampler = NetKetSampler(
+    eval_state = build_variational_state(
+        model=model,
         hilbert=hilbert,
+        params=state.parameters,
+        seed=seed + 101,
         n_samples=eval_samples,
         n_discard_per_chain=max(n_discard_per_chain, 32),
         n_chains=n_chains,
-        seed=seed + 101,
     )
-    eval_state = VariationalState(model=model, params=state.parameters, sampler=eval_sampler)
     estimates = [float(jnp.asarray(eval_state.energy(operator))) for _ in range(eval_repeats)]
     final_energy = sum(estimates) / len(estimates)
     preview = [round(value, 6) for value in energy_trace[:5]]
@@ -106,7 +103,7 @@ def run_demo(
     """Run the full benchmark and return exact energy plus model results."""
 
     _, operator = build_ising_operator(length, transverse_field)
-    exact_energy = exact_ground_state_energy(operator)
+    exact_energy = exact_ground_state_energy_netket(operator)
 
     experiments = [
         ("RBM", RBM(alpha=2), 2e-2, 0, 256, 32, 16, 128),

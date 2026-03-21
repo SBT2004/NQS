@@ -22,6 +22,17 @@ def _states_to_pm1(states: jax.Array) -> jax.Array:
     return 2.0 * states.astype(jnp.float32) - 1.0
 
 
+def _complex_log_output(log_amplitude: jax.Array, raw_phase: jax.Array) -> jax.Array:
+    phase = jnp.pi * jnp.tanh(raw_phase)
+    return log_amplitude + 1j * phase
+
+
+def _dense_complex_head(output: jax.Array) -> jax.Array:
+    """Assume `output[..., 0]` is log amplitude and `output[..., 1]` is raw phase."""
+
+    return _complex_log_output(output[..., 0], output[..., 1])
+
+
 class _RBMModule(nn.Module):
     hidden_features: int
 
@@ -42,8 +53,8 @@ class _RBMModule(nn.Module):
         # This is the usual RBM log-amplitude formula for a visible
         # configuration after summing out hidden spins analytically.
         log_amplitude = jnp.dot(x, visible_bias) + jnp.sum(jnp.log(jnp.cosh(hidden)), axis=-1)
-        phase = jnp.pi * jnp.tanh(jnp.dot(x, phase_bias) + jnp.sum(phase_hidden, axis=-1))
-        return log_amplitude + 1j * phase
+        raw_phase = jnp.dot(x, phase_bias) + jnp.sum(phase_hidden, axis=-1)
+        return _complex_log_output(log_amplitude, raw_phase)
 
 
 class _FFNNModule(nn.Module):
@@ -61,9 +72,7 @@ class _FFNNModule(nn.Module):
         # We return one scalar per configuration because the wavefunction model
         # needs one log-amplitude per sampled spin state.
         output = nn.Dense(2)(x)
-        log_amplitude = output[..., 0]
-        phase = jnp.pi * jnp.tanh(output[..., 1])
-        return log_amplitude + 1j * phase
+        return _dense_complex_head(output)
 
 
 class _CNNModule(nn.Module):
@@ -87,9 +96,7 @@ class _CNNModule(nn.Module):
         # dense layer can produce the scalar log-amplitude.
         x = x.reshape((batch, -1))
         output = nn.Dense(2)(x)
-        log_amplitude = output[..., 0]
-        phase = jnp.pi * jnp.tanh(output[..., 1])
-        return log_amplitude + 1j * phase
+        return _dense_complex_head(output)
 
 
 @dataclass

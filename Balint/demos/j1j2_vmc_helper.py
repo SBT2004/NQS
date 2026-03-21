@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 from typing import Any, Literal, cast
 
-import jax
 import jax.numpy as jnp
 import netket as nk
 import numpy as np
@@ -19,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from nqs import Adam, RBM, NetKetSampler, SpinHilbert, SquareLattice, VMC, VariationalState, j1_j2  # noqa: E402
+from src.nqs import RBM, SpinHilbert, SquareLattice, VMC, build_variational_state, build_vmc_driver, j1_j2  # noqa: E402
 
 
 BenchmarkMode = Literal["comparison", "speed"]
@@ -96,14 +95,15 @@ def _evaluate_final_energy(
     n_discard_per_chain: int,
     seed: int,
 ) -> float:
-    eval_sampler = NetKetSampler(
+    eval_state = build_variational_state(
+        model=model,
         hilbert=hilbert,
+        params=params,
+        seed=seed + 101,
         n_samples=eval_samples,
         n_discard_per_chain=max(n_discard_per_chain, 32),
         n_chains=n_chains,
-        seed=seed + 101,
     )
-    eval_state = VariationalState(model=model, params=params, sampler=eval_sampler)
     estimates = [float(jnp.asarray(eval_state.energy(operator))) for _ in range(eval_repeats)]
     return sum(estimates) / len(estimates)
 
@@ -123,16 +123,16 @@ def _run_single_operator_path(
 ) -> dict[str, object]:
     total_start = time.perf_counter()
     model = RBM(alpha=2)
-    params = model.init(jax.random.PRNGKey(seed), hilbert)
-    sampler = NetKetSampler(
+    state, driver = build_vmc_driver(
+        model=model,
         hilbert=hilbert,
+        operator=operator,
+        learning_rate=1e-2,
+        seed=seed,
         n_samples=n_samples,
         n_discard_per_chain=n_discard_per_chain,
         n_chains=n_chains,
-        seed=seed,
     )
-    state = VariationalState(model=model, params=params, sampler=sampler)
-    driver = VMC(operator=operator, variational_state=state, optimizer=Adam(learning_rate=1e-2))
     history, iteration_timing = _run_driver_with_timing(driver, n_iter)
     energy_trace = [float(jnp.asarray(step["energy"])) for step in history]
     final_energy = _evaluate_final_energy(

@@ -8,3 +8,7 @@ evaluation_harness/
 demos/jax_profile_*/
 demos/profiling_results/*
 !demos/profiling_results/README.md
+!demos/profiling_results/*/
+demos/profiling_results/*/**
+!demos/profiling_results/**/summary.md
+!demos/profiling_results/**/summary.json
