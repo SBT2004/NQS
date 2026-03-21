@@ -148,14 +148,45 @@ class ObservableTests(unittest.TestCase):
                 return bell
 
         state = FakeState()
-        stats = observables.renyi2_entropy_statistics(state, subsystem=(0,), n_repeats=3)
+        stats = observables.renyi2_entropy_statistics(
+            state,
+            subsystem=(0,),
+            n_repeats=3,
+            force_sampled=True,
+        )
 
         self.assertEqual(state.sample_calls, [0, 1, 2])
         self.assertAlmostEqual(stats["mean"], np.log(2.0))
         self.assertAlmostEqual(stats["std"], 0.0)
-        self.assertAlmostEqual(stats["exact"], np.log(2.0))
+        self.assertNotIn("exact", stats)
 
-    def test_entropy_callback_uses_repeated_entropy_average(self) -> None:
+    def test_renyi2_entropy_prefers_exact_statevector_by_default(self) -> None:
+        bell = _bell_state()
+
+        class FakeState:
+            def __init__(self) -> None:
+                self.exact_calls = 0
+
+            def sample(self) -> np.ndarray:
+                raise AssertionError("sampled path should not be used by default")
+
+            def independent_sample(self, seed_offset: int = 0) -> np.ndarray:
+                raise AssertionError("sampled path should not be used by default")
+
+            def log_value(self, states: np.ndarray) -> np.ndarray:
+                raise AssertionError("sampled path should not be used by default")
+
+            def exact_statevector(self) -> np.ndarray:
+                self.exact_calls += 1
+                return bell
+
+        state = FakeState()
+        entropy = observables.renyi2_entropy(state, subsystem=(0,))
+
+        self.assertEqual(state.exact_calls, 1)
+        self.assertAlmostEqual(entropy, np.log(2.0))
+
+    def test_renyi2_entropy_can_force_sampled_path(self) -> None:
         bell = _bell_state()
         log_amplitude = _log_amplitude_from_statevector(bell)
         controlled_samples = np.array(
@@ -169,21 +200,75 @@ class ObservableTests(unittest.TestCase):
         )
 
         class FakeState:
+            def __init__(self) -> None:
+                self.sample_calls: list[int] = []
+
+            def sample(self) -> np.ndarray:
+                return controlled_samples
+
             def independent_sample(self, seed_offset: int = 0) -> np.ndarray:
+                self.sample_calls.append(seed_offset)
                 return controlled_samples
 
             def log_value(self, states: np.ndarray) -> np.ndarray:
                 return log_amplitude(states)
 
             def exact_statevector(self) -> np.ndarray:
-                return bell
+                raise AssertionError("exact path should not be used when force_sampled=True")
+
+        state = FakeState()
+        entropy = observables.renyi2_entropy(
+            state,
+            subsystem=(0,),
+            n_repeats=2,
+            force_sampled=True,
+        )
+
+        self.assertEqual(state.sample_calls, [0, 1])
+        self.assertAlmostEqual(entropy, np.log(2.0))
+
+    def test_entropy_callback_can_force_sampled_mode(self) -> None:
+        bell = _bell_state()
+        log_amplitude = _log_amplitude_from_statevector(bell)
+        controlled_samples = np.array(
+            [
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [1, 1],
+            ],
+            dtype=np.uint8,
+        )
+
+        class FakeState:
+            def __init__(self) -> None:
+                self.sample_calls: list[int] = []
+
+            def sample(self) -> np.ndarray:
+                return controlled_samples
+
+            def independent_sample(self, seed_offset: int = 0) -> np.ndarray:
+                self.sample_calls.append(seed_offset)
+                return controlled_samples
+
+            def log_value(self, states: np.ndarray) -> np.ndarray:
+                return log_amplitude(states)
+
+            def exact_statevector(self) -> np.ndarray:
+                raise AssertionError("exact path should not be used when force_sampled=True")
 
         class FakeDriver:
             def __init__(self) -> None:
                 self.variational_state = FakeState()
 
-        callback = observables.entropy_callback(subsystem=(0,), n_repeats=2)
-        result = callback(0, FakeDriver())
+        callback = observables.entropy_callback(
+            subsystem=(0,),
+            n_repeats=2,
+            force_sampled=True,
+        )
+        driver = FakeDriver()
+        result = callback(0, driver)
+        self.assertEqual(cast(FakeState, driver.variational_state).sample_calls, [0, 1])
         self.assertAlmostEqual(float(cast(float, result["renyi2_entropy"])), np.log(2.0))
 
 

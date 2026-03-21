@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from codex_gemini_review.review import (
+from gemini_review_tool.codex_gemini_review.review import (
     ReviewPayload,
     SupplementalReviewContext,
     build_review_prompt_with_context,

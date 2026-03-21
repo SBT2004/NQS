@@ -11,9 +11,10 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+TOOL_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = TOOL_ROOT.parent
+if str(TOOL_ROOT) not in sys.path:
+    sys.path.insert(0, str(TOOL_ROOT))
 
 from codex_gemini_review.review import (  # noqa: E402
     DEFAULT_CLI_COMMAND,
@@ -22,7 +23,7 @@ from codex_gemini_review.review import (  # noqa: E402
     review_current_diff,
 )
 
-REPORTS_ROOT = PROJECT_ROOT / "gemini_review_reports"
+REPORTS_ROOT = TOOL_ROOT / "gemini_review_reports"
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,14 @@ class ScenarioSpec:
     use_real_cli: bool
     max_input_chars: int | None = None
     runner_factory: Callable[[], Callable[..., subprocess.CompletedProcess[str]] | None] | None = None
+
+
+def _normalized_path_filters(path_filters: str | list[str] | None) -> list[str] | None:
+    if path_filters is None:
+        return None
+    if isinstance(path_filters, str):
+        return [path_filters]
+    return path_filters
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -201,10 +210,11 @@ def _evaluate_scenario(run_dir: Path, spec: ScenarioSpec) -> dict[str, Any]:
     repo_dir = run_dir / "temp_repos" / spec.scenario_id
     _init_repo(repo_dir)
     _apply_scenario(repo_dir, spec.scenario_id)
+    path_filters = _normalized_path_filters(spec.path_filters)
 
     payload = collect_review_payload(
         cwd=repo_dir,
-        path_filters=spec.path_filters,
+        path_filters=path_filters,
         max_input_chars=spec.max_input_chars,
     )
     payload_path = Path(
@@ -228,7 +238,7 @@ def _evaluate_scenario(run_dir: Path, spec: ScenarioSpec) -> dict[str, Any]:
         started = perf_counter()
         result = review_current_diff(
             cwd=repo_dir,
-            path_filters=spec.path_filters,
+            path_filters=path_filters,
             max_input_chars=spec.max_input_chars,
             command_runner=runner,
         )

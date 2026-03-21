@@ -222,8 +222,9 @@ def renyi2_entropy(
     samples: np.ndarray | Sequence[Sequence[int]] | None = None,
     cutoff: float = 1e-12,
     n_repeats: int = 4,
+    force_sampled: bool = False,
 ) -> float:
-    if samples is None and hasattr(state, "exact_statevector"):
+    if not force_sampled and samples is None and hasattr(state, "exact_statevector"):
         return float(
             renyi_entropy_from_statevector(
                 state.exact_statevector(),
@@ -239,6 +240,7 @@ def renyi2_entropy(
             samples=samples,
             cutoff=cutoff,
             n_repeats=n_repeats,
+            force_sampled=force_sampled,
         )["mean"]
     )
 
@@ -249,9 +251,26 @@ def renyi2_entropy_statistics(
     samples: np.ndarray | Sequence[Sequence[int]] | None = None,
     cutoff: float = 1e-12,
     n_repeats: int = 4,
+    force_sampled: bool = False,
 ) -> dict[str, float]:
     if n_repeats <= 0:
         raise ValueError("n_repeats must be positive.")
+
+    if not force_sampled and samples is None and hasattr(state, "exact_statevector"):
+        exact_entropy = float(
+            renyi_entropy_from_statevector(
+                state.exact_statevector(),
+                subsystem=subsystem,
+                alpha=2.0,
+                cutoff=cutoff,
+            )
+        )
+        return {
+            "mean": exact_entropy,
+            "std": 0.0,
+            "n_repeats": 1.0,
+            "exact": exact_entropy,
+        }
 
     if samples is not None:
         estimates = [
@@ -285,7 +304,7 @@ def renyi2_entropy_statistics(
         "std": float(np.std(estimate_array, ddof=0)),
         "n_repeats": float(len(estimates)),
     }
-    if hasattr(state, "exact_statevector"):
+    if not force_sampled and hasattr(state, "exact_statevector"):
         result["exact"] = float(
             renyi_entropy_from_statevector(
                 state.exact_statevector(),
@@ -334,6 +353,7 @@ def entropy_callback(
     subsystem: Sequence[int] | str,
     name: str = "renyi2_entropy",
     n_repeats: int = 4,
+    force_sampled: bool = False,
 ) -> Callable[[int, Any], dict[str, object]]:
     return observable_callback(
         name=name,
@@ -341,6 +361,7 @@ def entropy_callback(
             driver.variational_state,
             subsystem=subsystem,
             n_repeats=n_repeats,
+            force_sampled=force_sampled,
         ),
     )
 
