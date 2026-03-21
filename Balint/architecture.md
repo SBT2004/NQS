@@ -3,7 +3,7 @@
 ## Project Goal
 
 This project aims to reproduce the high-level workflow used in
-[Netket.ipynb](C:\Users\balin\PycharmProjects\NQS\Balint\demos\Netket.ipynb)
+[netket_benchmark.ipynb](C:\Users\balin\PycharmProjects\NQS\Balint\demos\netket_benchmark.ipynb)
 without depending on NetKet at runtime. NetKet is the reference for API shape
 and user experience, but the implementation should be project-owned and built
 with JAX.
@@ -20,6 +20,20 @@ specialized to:
 The intended user flow mirrors the notebook:
 
 `graph -> hilbert -> operator/hamiltonian -> model -> sampler -> variational state -> optimizer/driver -> observables`
+
+## Notebook Layout
+
+The repository is allowed to contain more than two user-facing notebook files.
+The intended notebook surface is:
+
+- `demos/netket_benchmark.ipynb` for project-vs-reference comparisons
+- `demos/exercise_1.ipynb` for Exercise 1, keeping sub-exercises in exam order
+- `demos/exercise_2.ipynb` for Exercise 2, keeping sub-exercises in exam order
+- `demos/exercise_3.ipynb` for Exercise 3, keeping sub-exercises in exam order
+
+These exercise notebooks should share the same helper modules and public API
+style, but the exam-solving workflow should not be forced into one monolithic
+document when that harms readability.
 
 ## Scope
 
@@ -75,37 +89,48 @@ implementation details.
 
 ## Notebook-Derived Target Usage
 
-The current notebook expresses the desired user experience:
+Each retained notebook should express the same user-facing workflow:
 
 ```python
 import nqs
 
-L = 4
+Lx = 4
+Ly = 4
 J = 1.0
 h = 1.0
 n_iter = 300
 
-g = nqs.graph.SquareLattice(length=L, n_dim=2, pbc=True)
-hi = nqs.hilbert.SpinHalf(N=g.n_nodes)
+g = nqs.graph.SquareLattice(Lx, Ly, pbc=True)
+hi = nqs.hilbert.SpinHilbert(g.n_nodes)
 
-H = nqs.operator.tfim(hi=hi, graph=g, J=J, h=h)
+H = nqs.operator.tfim(hi, g, J=J, h=h)
 
-model = nqs.models.RBM(alpha=2, param_dtype=float)
-sampler = nqs.sampler.MetropolisLocal(hi, n_chains=256)
+model = nqs.models.RBM(alpha=2)
 
-vstate = nqs.vqs.MCState(
-    sampler=sampler,
+vstate = nqs.vmc_setup.build_variational_state(
     model=model,
+    hilbert=hi,
+    seed=0,
     n_samples=512,
     n_discard_per_chain=100,
+    n_chains=256,
 )
 
-opt = nqs.optimizer.Adam(learning_rate=1e-2)
-driver = nqs.driver.VMC(H, opt, variational_state=vstate)
-driver.run(
+driver = nqs.vmc_setup.build_vmc_driver(
+    model=model,
+    hilbert=hi,
+    operator=H,
+    learning_rate=1e-2,
+    seed=0,
+    n_samples=512,
+    n_discard_per_chain=100,
+    n_chains=256,
+)[1]
+
+history = driver.run(
     n_iter=n_iter,
     callback=nqs.observables.entropy_callback(subsystem="half"),
-    step_size=1,
+    callback_every=1,
 )
 ```
 
@@ -213,8 +238,8 @@ Notes:
   the first complete implementation.
 - Complex-valued parameters are not a first requirement, but the interface
   should not make them impossible later.
-- In the current VMC phase, model architectures are project-owned JAX models,
-  even when temporary NetKet backends are used elsewhere in the stack.
+- In the current implementation phase, model architectures are project-owned
+  JAX models on the ordinary runtime path.
 
 ### `sampler`
 
@@ -254,8 +279,8 @@ Notes:
 
 - This should be the main integration point between models, samplers, and
   observables.
-- In the current implementation phase, `vqs` is still project-owned even if it
-  delegates temporary sampling and energy-evaluation work to NetKet adapters.
+- In the current implementation phase, `vqs` is project-owned on the ordinary
+  runtime path.
 
 ### `driver` / `training`
 

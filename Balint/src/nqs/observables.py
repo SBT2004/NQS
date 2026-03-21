@@ -156,6 +156,21 @@ def renyi_entropy_from_statevector(
     return renyi_entropy_from_density_matrix(rho, alpha=alpha, cutoff=cutoff)
 
 
+def entanglement_spectrum(
+    statevector: np.ndarray | Sequence[complex],
+    subsystem: Sequence[int] | str,
+    n_sites: int | None = None,
+    n_levels: int | None = None,
+) -> np.ndarray:
+    eigenvalues = np.linalg.eigvalsh(reduced_density_matrix(statevector, subsystem=subsystem, n_sites=n_sites))
+    ordered = np.sort(np.clip(eigenvalues.real, 0.0, None))[::-1]
+    if n_levels is None:
+        return ordered
+    if n_levels <= 0:
+        raise ValueError("n_levels must be positive when provided.")
+    return ordered[:n_levels]
+
+
 def renyi2_swap_expectation(
     log_amplitude_fn,
     samples: np.ndarray | Sequence[Sequence[int]],
@@ -371,6 +386,7 @@ __all__ = [
     "fit_log_entropy_scaling",
     "observable_callback",
     "SupportsSamplingAndLogValue",
+    "entanglement_spectrum",
     "reduced_density_matrix",
     "renyi2_entropy",
     "renyi2_entropy_statistics",

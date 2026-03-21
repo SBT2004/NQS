@@ -1,0 +1,43 @@
+"""High-level reusable workflow helpers for notebook-facing experiments."""
+
+from ._core import (
+    build_system,
+    edge_table,
+    exact_observables_summary,
+    half_subsystem,
+    history_table,
+    parameter_table,
+    renyi2_subsystem_scan_summary,
+    run_architecture_benchmark,
+    run_architecture_comparison,
+    run_architecture_disorder_comparison,
+    run_random_architecture_study,
+    run_architecture_sweep,
+    run_ghz_bonus_workflow,
+    run_hamiltonian_system_size_sweep,
+    run_vmc_experiment,
+    sampled_entropy_scaling_summary,
+    tfim_config,
+    tfim_proxy_sweep_points,
+)
+
+__all__ = [
+    "build_system",
+    "edge_table",
+    "exact_observables_summary",
+    "half_subsystem",
+    "history_table",
+    "parameter_table",
+    "renyi2_subsystem_scan_summary",
+    "run_architecture_benchmark",
+    "run_architecture_comparison",
+    "run_architecture_disorder_comparison",
+    "run_random_architecture_study",
+    "run_architecture_sweep",
+    "run_ghz_bonus_workflow",
+    "run_hamiltonian_system_size_sweep",
+    "run_vmc_experiment",
+    "sampled_entropy_scaling_summary",
+    "tfim_config",
+    "tfim_proxy_sweep_points",
+]

@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from nqs import Chain1D, Graph, SquareLattice
+from nqs.graph import Chain1D, Graph, SquareLattice
 
 
 class GraphHierarchyTests(unittest.TestCase):

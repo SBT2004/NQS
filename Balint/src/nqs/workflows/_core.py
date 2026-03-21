@@ -1,51 +1,27 @@
-"""Helper functions for the high-level NQS showcase notebook."""
+"""Shared experiment helpers for notebook-facing workflows."""
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence, cast
+
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pandas as pd
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from src.nqs import CNN  # noqa: E402
-from src.nqs import FFNN  # noqa: E402
-from src.nqs import RBM  # noqa: E402
-from src.nqs import SpinHilbert  # noqa: E402
-from src.nqs import SquareLattice  # noqa: E402
-from src.nqs import build_variational_state  # noqa: E402
-from src.nqs import build_vmc_driver  # noqa: E402
-from src.nqs import j1_j2  # noqa: E402
-from src.nqs.exact_diag import exact_ground_state  # noqa: E402
-from src.nqs.operator import tfim  # noqa: E402
-import src.nqs.observables as observables  # noqa: E402
+from .. import observables
+from ..exact_diag import exact_ground_state
+from ..graph import SquareLattice
+from ..hilbert import SpinHilbert
+from ..operator import j1_j2, tfim
+from ..vmc_setup import build_model, build_variational_state, build_vmc_experiment
 
 if TYPE_CHECKING:
-    from src.nqs.observables import SupportsSamplingAndLogValue
+    from ..observables import SupportsSamplingAndLogValue
 
 
 def half_subsystem(n_sites: int) -> tuple[int, ...]:
     return tuple(range(max(1, n_sites // 2)))
-
-
-def make_model(model_name: str, lattice_shape: tuple[int, int], **model_kwargs: Any):
-    normalized_name = model_name.upper()
-    if normalized_name == "RBM":
-        return RBM(**model_kwargs)
-    if normalized_name == "FFNN":
-        return FFNN(**model_kwargs)
-    if normalized_name == "CNN":
-        kwargs = dict(model_kwargs)
-        kwargs.setdefault("spatial_shape", lattice_shape)
-        return CNN(**kwargs)
-    raise ValueError(f"Unsupported model_name: {model_name}")
-
 
 def build_system(
     lattice_shape: tuple[int, int] = (2, 2),
@@ -71,10 +47,43 @@ def build_system(
         "graph": lattice,
         "hilbert": spin_space,
         "operator": hamiltonian_operator,
-        "netket_operator": hamiltonian_operator.to_netket(),
         "hamiltonian": hamiltonian,
         "parameters": {"J": J, "h": h, "J1": J1, "J2": J2, "pbc": pbc},
     }
+
+
+def tfim_config(
+    *,
+    lattice_shape: tuple[int, int] = (2, 2),
+    J: float = 1.0,
+    h: float,
+    pbc: bool,
+) -> dict[str, Any]:
+    return {
+        "lattice_shape": lattice_shape,
+        "hamiltonian": "tfim",
+        "J": J,
+        "h": h,
+        "pbc": pbc,
+    }
+
+
+def tfim_proxy_sweep_points(
+    lengths: Sequence[int],
+    *,
+    J: float = 1.0,
+    h: float,
+    pbc: bool,
+) -> list[dict[str, Any]]:
+    if not lengths:
+        raise ValueError("lengths must contain at least one system size.")
+    return [
+        {
+            "label": f"tfim_1d_{int(length)}x1",
+            **tfim_config(lattice_shape=(int(length), 1), J=J, h=h, pbc=pbc),
+        }
+        for length in lengths
+    ]
 
 
 def edge_table(graph: Any) -> pd.DataFrame:
@@ -281,16 +290,17 @@ def run_vmc_experiment(
         J2=J2,
     )
     hilbert = system["hilbert"]
-    model = make_model(model_name, lattice_shape, **model_kwargs)
-    variational_state, vmc_driver = build_vmc_driver(
-        model=model,
+    model, variational_state, vmc_driver = build_vmc_experiment(
         hilbert=hilbert,
-        operator=system["netket_operator"],
+        operator=system["operator"],
         learning_rate=learning_rate,
         seed=seed,
         n_samples=n_samples,
         n_discard_per_chain=n_discard_per_chain,
         n_chains=n_chains,
+        model_name=model_name,
+        model_kwargs=model_kwargs,
+        lattice_shape=lattice_shape,
     )
     entropy_logger = observables.entropy_callback(
         subsystem=half_subsystem(hilbert.size),
@@ -303,7 +313,7 @@ def run_vmc_experiment(
     )
     history_df = history_table(history)
     exact = exact_observables_summary(system["operator"])
-    final_energy = float(np.asarray(variational_state.energy(system["netket_operator"])))
+    final_energy = float(np.asarray(variational_state.energy(system["operator"])))
     independent_run_count = entropy_n_independent_runs
     if independent_run_count is None:
         independent_run_count = 5 if model_name.upper() == "RBM" else 1
@@ -315,11 +325,21 @@ def run_vmc_experiment(
             force_sampled=entropy_force_sampled,
         )
     )
-    sampled_entropy = sampled_entropy_scaling_summary(
-        variational_state,
-        hilbert.size,
-        n_independent_runs=independent_run_count,
-    )
+    if hamiltonian == "tfim" and not entropy_force_sampled:
+        entropy_scan = renyi2_subsystem_scan_summary(
+            variational_state,
+            hilbert.size,
+            n_independent_runs=independent_run_count,
+            force_sampled=False,
+        )
+        sampled_entropy = entropy_scan
+    else:
+        sampled_entropy = sampled_entropy_scaling_summary(
+            variational_state,
+            hilbert.size,
+            n_independent_runs=independent_run_count,
+        )
+        entropy_scan = sampled_entropy
 
     return {
         "model_name": model_name,
@@ -328,9 +348,13 @@ def run_vmc_experiment(
         "history": history,
         "history_df": history_df,
         "exact": exact,
+        "parameter_count": _count_model_parameters(variational_state.parameters),
         "final_energy": final_energy,
         "final_entropy": final_entropy,
         "energy_error": final_energy - exact["ground_energy"],
+        "entropy_scan_table": entropy_scan["entropy_table"],
+        "entropy_scan_samples": entropy_scan["entropy_samples"],
+        "entropy_scan_fit": entropy_scan["scaling_fit"],
         "sampled_entropy_table": sampled_entropy["entropy_table"],
         "sampled_entropy_samples": sampled_entropy["entropy_samples"],
         "sampled_scaling_fit": sampled_entropy["scaling_fit"],
@@ -339,7 +363,7 @@ def run_vmc_experiment(
     }
 
 
-def comparison_table(results: list[dict[str, Any]]) -> pd.DataFrame:
+def _comparison_table(results: list[dict[str, Any]]) -> pd.DataFrame:
     rows = [
         {
             "model": result["model_name"],
@@ -353,8 +377,33 @@ def comparison_table(results: list[dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("energy_error", key=np.abs).reset_index(drop=True)
 
 
-def count_model_parameters(params: Any) -> int:
+def _count_model_parameters(params: Any) -> int:
     return int(sum(np.asarray(leaf).size for leaf in jax.tree_util.tree_leaves(params)))
+
+
+def _zero_phase_parameters(params: Any) -> Any:
+    if isinstance(params, dict):
+        updated: dict[str, Any] = {}
+        for key, value in params.items():
+            lower_key = key.lower()
+            if "phase" in lower_key:
+                updated[key] = jax.tree_util.tree_map(lambda leaf: jnp.zeros_like(leaf), value)
+                continue
+            if key.startswith("Dense_") and isinstance(value, dict):
+                dense_update: dict[str, Any] = {}
+                for leaf_name, leaf in value.items():
+                    leaf_array = jnp.asarray(leaf)
+                    if leaf_name == "bias" and leaf_array.shape == (2,):
+                        dense_update[leaf_name] = leaf_array.at[1].set(0)
+                    elif leaf_name == "kernel" and leaf_array.shape[-1] == 2:
+                        dense_update[leaf_name] = leaf_array.at[..., 1].set(0)
+                    else:
+                        dense_update[leaf_name] = _zero_phase_parameters(leaf)
+                updated[key] = dense_update
+                continue
+            updated[key] = _zero_phase_parameters(value)
+        return updated
+    return params
 
 
 def renyi2_subsystem_scan_summary(
@@ -402,7 +451,7 @@ def renyi2_subsystem_scan_summary(
     }
 
 
-def run_architecture_disorder_comparison(
+def run_architecture_comparison(
     architecture_configs: dict[str, dict[str, Any]],
     *,
     seeds: Sequence[int],
@@ -416,6 +465,9 @@ def run_architecture_disorder_comparison(
     n_samples: int = 128,
     n_discard_per_chain: int = 16,
     n_chains: int = 8,
+    learning_rate: float = 1e-2,
+    n_iter: int = 20,
+    callback_every: int = 5,
     entropy_n_independent_runs: int = 1,
     max_subsystem_size: int | None = None,
     entropy_force_sampled: bool = False,
@@ -435,45 +487,50 @@ def run_architecture_disorder_comparison(
         J1=J1,
         J2=J2,
     )
-    hilbert = system["hilbert"]
 
     trial_rows: list[dict[str, Any]] = []
     entropy_scan_rows: list[pd.DataFrame] = []
     trial_results: list[dict[str, Any]] = []
     for model_name, model_kwargs in architecture_configs.items():
         for seed in seed_values:
-            model = make_model(model_name, lattice_shape, **model_kwargs)
-            variational_state = build_variational_state(
-                model=model,
-                hilbert=hilbert,
-                seed=seed,
+            result = run_vmc_experiment(
+                model_name=model_name,
+                model_kwargs=model_kwargs,
+                lattice_shape=lattice_shape,
+                pbc=pbc,
+                hamiltonian=hamiltonian,
+                J=J,
+                h=h,
+                J1=J1,
+                J2=J2,
+                learning_rate=learning_rate,
                 n_samples=n_samples,
                 n_discard_per_chain=n_discard_per_chain,
                 n_chains=n_chains,
+                n_iter=n_iter,
+                callback_every=callback_every,
+                entropy_n_independent_runs=entropy_n_independent_runs,
+                entropy_force_sampled=entropy_force_sampled,
+                seed=seed,
             )
-            entropy_summary = renyi2_subsystem_scan_summary(
-                variational_state,
-                n_sites=hilbert.size,
-                max_subsystem_size=max_subsystem_size,
-                n_independent_runs=entropy_n_independent_runs,
-                force_sampled=entropy_force_sampled,
-            )
-            parameter_count = count_model_parameters(variational_state.parameters)
-            entropy_table = entropy_summary["entropy_table"].copy()
+            entropy_table = result["entropy_scan_table"].copy()
             entropy_table["model"] = model_name
             entropy_table["seed"] = seed
-            entropy_table["parameter_count"] = parameter_count
+            entropy_table["parameter_count"] = result["parameter_count"]
             entropy_scan_rows.append(entropy_table)
 
             max_partition = int(entropy_table["subsystem_size"].max())
             half_partition_row = entropy_table.loc[entropy_table["subsystem_size"] == max_partition].iloc[0]
-            scaling_fit = entropy_summary["scaling_fit"]
+            scaling_fit = result["entropy_scan_fit"]
             trial_rows.append(
                 {
                     "model": model_name,
                     "seed": seed,
-                    "parameter_count": parameter_count,
+                    "parameter_count": result["parameter_count"],
                     "max_subsystem_size": max_partition,
+                    "final_energy": result["final_energy"],
+                    "exact_ground_energy": result["exact"]["ground_energy"],
+                    "energy_error": result["energy_error"],
                     "half_partition_renyi2": float(half_partition_row["renyi2"]),
                     "scaling_slope": float(scaling_fit["slope"]) if scaling_fit is not None else np.nan,
                     "scaling_r_squared": float(scaling_fit["r_squared"]) if scaling_fit is not None else np.nan,
@@ -481,13 +538,9 @@ def run_architecture_disorder_comparison(
             )
             trial_results.append(
                 {
-                    "model_name": model_name,
-                    "model_kwargs": dict(model_kwargs),
+                    **result,
                     "seed": seed,
-                    "parameter_count": parameter_count,
-                    "entropy_table": entropy_summary["entropy_table"],
-                    "entropy_samples": entropy_summary["entropy_samples"],
-                    "scaling_fit": scaling_fit,
+                    "parameter_count": result["parameter_count"],
                 }
             )
 
@@ -510,6 +563,9 @@ def run_architecture_disorder_comparison(
         .agg(
             parameter_count=("parameter_count", "first"),
             n_trials=("seed", "nunique"),
+            final_energy=("final_energy", "mean"),
+            exact_ground_energy=("exact_ground_energy", "first"),
+            energy_error=("energy_error", "mean"),
             half_partition_renyi2=("half_partition_renyi2", "mean"),
             half_partition_renyi2_std=("half_partition_renyi2", "std"),
             scaling_slope=("scaling_slope", "mean"),
@@ -525,6 +581,257 @@ def run_architecture_disorder_comparison(
         "trial_results": trial_results,
         "entropy_n_independent_runs": entropy_n_independent_runs,
         "entropy_force_sampled": entropy_force_sampled,
+    }
+
+
+def run_architecture_disorder_comparison(
+    architecture_configs: dict[str, dict[str, Any]],
+    *,
+    seeds: Sequence[int],
+    lattice_shape: tuple[int, int] = (2, 2),
+    pbc: bool = True,
+    hamiltonian: str = "tfim",
+    J: float = 1.0,
+    h: float = 0.8,
+    J1: float = 1.0,
+    J2: float = 0.4,
+    n_samples: int = 128,
+    n_discard_per_chain: int = 16,
+    n_chains: int = 8,
+    learning_rate: float = 1e-2,
+    n_iter: int = 20,
+    callback_every: int = 5,
+    entropy_n_independent_runs: int = 1,
+    max_subsystem_size: int | None = None,
+    entropy_force_sampled: bool = False,
+) -> dict[str, Any]:
+    return run_architecture_comparison(
+        architecture_configs,
+        seeds=seeds,
+        lattice_shape=lattice_shape,
+        pbc=pbc,
+        hamiltonian=hamiltonian,
+        J=J,
+        h=h,
+        J1=J1,
+        J2=J2,
+        n_samples=n_samples,
+        n_discard_per_chain=n_discard_per_chain,
+        n_chains=n_chains,
+        learning_rate=learning_rate,
+        n_iter=n_iter,
+        callback_every=callback_every,
+        entropy_n_independent_runs=entropy_n_independent_runs,
+        max_subsystem_size=max_subsystem_size,
+        entropy_force_sampled=entropy_force_sampled,
+    )
+
+
+def run_architecture_benchmark(
+    *,
+    architecture_configs: dict[str, dict[str, Any]],
+    lattice_shape: tuple[int, int] = (2, 2),
+    pbc: bool = True,
+    hamiltonian: str = "tfim",
+    J: float = 1.0,
+    h: float = 0.8,
+    J1: float = 1.0,
+    J2: float = 0.4,
+    learning_rate: float = 1e-2,
+    n_samples: int = 128,
+    n_discard_per_chain: int = 16,
+    n_chains: int = 8,
+    n_iter: int = 20,
+    callback_every: int = 5,
+    entropy_force_sampled: bool = False,
+    base_seed: int = 0,
+    netket_reference_energy: float | None = None,
+) -> dict[str, Any]:
+    results = run_architecture_sweep(
+        architecture_configs,
+        lattice_shape=lattice_shape,
+        pbc=pbc,
+        hamiltonian=hamiltonian,
+        J=J,
+        h=h,
+        J1=J1,
+        J2=J2,
+        learning_rate=learning_rate,
+        n_samples=n_samples,
+        n_discard_per_chain=n_discard_per_chain,
+        n_chains=n_chains,
+        n_iter=n_iter,
+        callback_every=callback_every,
+        entropy_force_sampled=entropy_force_sampled,
+        base_seed=base_seed,
+    )
+    summary_table = _comparison_table(results)
+    summary_table = summary_table.sort_values("model").reset_index(drop=True)
+    summary_table["netket_reference_energy"] = netket_reference_energy
+    summary_table["netket_gap"] = (
+        np.nan
+        if netket_reference_energy is None
+        else summary_table["final_energy"] - float(netket_reference_energy)
+    )
+    return {
+        "results": results,
+        "summary_table": summary_table,
+        "netket_reference_energy": netket_reference_energy,
+    }
+
+
+def run_random_architecture_study(
+    architecture_configs: dict[str, dict[str, Any]],
+    *,
+    seeds: Sequence[int],
+    lattice_shape: tuple[int, int] = (2, 2),
+    pbc: bool = True,
+    hamiltonian: str = "tfim",
+    J: float = 1.0,
+    h: float = 0.8,
+    J1: float = 1.0,
+    J2: float = 0.4,
+    n_samples: int = 128,
+    n_discard_per_chain: int = 16,
+    n_chains: int = 8,
+    entropy_n_independent_runs: int = 4,
+    max_subsystem_size: int | None = None,
+    real_amplitude_only: bool = False,
+) -> dict[str, Any]:
+    if not architecture_configs:
+        raise ValueError("architecture_configs must not be empty.")
+    seed_values = tuple(int(seed) for seed in seeds)
+    if not seed_values:
+        raise ValueError("seeds must contain at least one value.")
+
+    system = build_system(
+        lattice_shape=lattice_shape,
+        pbc=pbc,
+        hamiltonian=hamiltonian,
+        J=J,
+        h=h,
+        J1=J1,
+        J2=J2,
+    )
+    hilbert = system["hilbert"]
+    subsystem_limit = max(1, hilbert.size // 2) if max_subsystem_size is None else max_subsystem_size
+
+    trial_rows: list[dict[str, Any]] = []
+    entropy_scan_rows: list[pd.DataFrame] = []
+    trial_results: list[dict[str, Any]] = []
+    for model_name, model_kwargs in architecture_configs.items():
+        model = build_model(
+            model_name=model_name,
+            model_kwargs=model_kwargs,
+            lattice_shape=lattice_shape,
+        )
+        for seed in seed_values:
+            params = model.init(jax.random.PRNGKey(seed), hilbert)
+            if real_amplitude_only:
+                params = _zero_phase_parameters(params)
+            variational_state = build_variational_state(
+                model=model,
+                hilbert=hilbert,
+                seed=seed,
+                n_samples=n_samples,
+                n_discard_per_chain=n_discard_per_chain,
+                n_chains=n_chains,
+                params=params,
+            )
+            exact_entropy_scan = renyi2_subsystem_scan_summary(
+                variational_state,
+                hilbert.size,
+                max_subsystem_size=subsystem_limit,
+                n_independent_runs=1,
+                force_sampled=False,
+            )
+            sampled_entropy_scan = sampled_entropy_scaling_summary(
+                variational_state,
+                hilbert.size,
+                max_subsystem_size=subsystem_limit,
+                n_independent_runs=entropy_n_independent_runs,
+            )
+            parameter_count = _count_model_parameters(variational_state.parameters)
+
+            sampled_table = sampled_entropy_scan["entropy_table"].copy()
+            sampled_table["model"] = model_name
+            sampled_table["seed"] = seed
+            sampled_table["parameter_count"] = parameter_count
+            exact_table = exact_entropy_scan["entropy_table"].copy().rename(
+                columns={"renyi2": "exact_renyi2", "renyi2_std": "exact_renyi2_std"}
+            )
+            sampled_table = sampled_table.merge(
+                exact_table[["subsystem_size", "exact_renyi2", "exact_renyi2_std"]],
+                on="subsystem_size",
+                how="left",
+            )
+            entropy_scan_rows.append(sampled_table)
+
+            max_partition = int(sampled_table["subsystem_size"].max())
+            half_partition_row = sampled_table.loc[sampled_table["subsystem_size"] == max_partition].iloc[0]
+            trial_rows.append(
+                {
+                    "model": model_name,
+                    "seed": seed,
+                    "parameter_count": parameter_count,
+                    "max_subsystem_size": max_partition,
+                    "half_partition_exact_renyi2": float(half_partition_row["exact_renyi2"]),
+                    "half_partition_sampled_renyi2": float(half_partition_row["renyi2"]),
+                    "half_partition_sampled_std": float(half_partition_row["renyi2_std"]),
+                    "sampled_minus_exact": float(half_partition_row["renyi2"] - half_partition_row["exact_renyi2"]),
+                }
+            )
+            trial_results.append(
+                {
+                    "model_name": model_name,
+                    "model_kwargs": dict(model_kwargs),
+                    "seed": seed,
+                    "parameter_count": parameter_count,
+                    "system": system,
+                    "exact_entropy_scan_table": exact_entropy_scan["entropy_table"],
+                    "sampled_entropy_scan_table": sampled_entropy_scan["entropy_table"],
+                    "sampled_entropy_scan_samples": sampled_entropy_scan["entropy_samples"],
+                    "real_amplitude_only": real_amplitude_only,
+                }
+            )
+
+    trial_table = pd.DataFrame(trial_rows).sort_values(["model", "seed"]).reset_index(drop=True)
+    entropy_scan_table = cast(
+        Any,
+        pd.concat(entropy_scan_rows, ignore_index=True)
+        .groupby(["model", "subsystem_size"], as_index=False)
+        .agg(
+            parameter_count=("parameter_count", "first"),
+            n_trials=("seed", "nunique"),
+            exact_renyi2=("exact_renyi2", "mean"),
+            sampled_renyi2=("renyi2", "mean"),
+            sampled_renyi2_std=("renyi2", "std"),
+            estimator_std=("renyi2_std", "mean"),
+        )
+        .fillna({"sampled_renyi2_std": 0.0, "estimator_std": 0.0})
+    ).sort_values(by=["model", "subsystem_size"]).reset_index(drop=True)
+    summary_table = cast(
+        Any,
+        trial_table.groupby("model", as_index=False)
+        .agg(
+            parameter_count=("parameter_count", "first"),
+            n_trials=("seed", "nunique"),
+            half_partition_exact_renyi2=("half_partition_exact_renyi2", "mean"),
+            half_partition_sampled_renyi2=("half_partition_sampled_renyi2", "mean"),
+            half_partition_sampled_std=("half_partition_sampled_renyi2", "std"),
+            estimator_std=("half_partition_sampled_std", "mean"),
+            sampled_minus_exact=("sampled_minus_exact", "mean"),
+        )
+        .fillna({"half_partition_sampled_std": 0.0, "estimator_std": 0.0})
+    ).sort_values(by="model").reset_index(drop=True)
+    return {
+        "system": system,
+        "trial_table": trial_table,
+        "summary_table": summary_table,
+        "entropy_scan_table": entropy_scan_table,
+        "trial_results": trial_results,
+        "entropy_n_independent_runs": entropy_n_independent_runs,
+        "real_amplitude_only": real_amplitude_only,
     }
 
 
@@ -643,7 +950,7 @@ def run_hamiltonian_system_size_sweep(
     }
 
 
-def ghz_statevector(n_sites: int) -> np.ndarray:
+def _ghz_statevector(n_sites: int) -> np.ndarray:
     if n_sites <= 0:
         raise ValueError("n_sites must be positive.")
     state = np.zeros(1 << n_sites, dtype=np.complex128)
@@ -652,7 +959,7 @@ def ghz_statevector(n_sites: int) -> np.ndarray:
     return state
 
 
-def ghz_state_metrics(
+def _ghz_state_metrics(
     statevector: np.ndarray | Sequence[complex],
     subsystem: tuple[int, ...] | None = None,
 ) -> dict[str, float]:
@@ -665,7 +972,7 @@ def ghz_state_metrics(
         raise ValueError("statevector must have non-zero norm.")
 
     normalized_state = flat_state / norm
-    target = ghz_statevector(n_sites)
+    target = _ghz_statevector(n_sites)
     subsystem_sites = half_subsystem(n_sites) if subsystem is None else subsystem
     return {
         "ghz_fidelity": float(np.abs(np.vdot(target, normalized_state)) ** 2),
@@ -699,16 +1006,17 @@ def run_ghz_bonus_workflow(
         h=0.0,
     )
     hilbert = system["hilbert"]
-    model = make_model(model_name, lattice_shape, **model_kwargs)
-    variational_state, vmc_driver = build_vmc_driver(
-        model=model,
+    model, variational_state, vmc_driver = build_vmc_experiment(
         hilbert=hilbert,
-        operator=system["netket_operator"],
+        operator=system["operator"],
         learning_rate=learning_rate,
         seed=seed,
         n_samples=n_samples,
         n_discard_per_chain=n_discard_per_chain,
         n_chains=n_chains,
+        model_name=model_name,
+        model_kwargs=model_kwargs,
+        lattice_shape=lattice_shape,
     )
     entropy_logger = observables.entropy_callback(subsystem=half_subsystem(hilbert.size))
     history = vmc_driver.run(
@@ -718,13 +1026,13 @@ def run_ghz_bonus_workflow(
     )
     history_df = history_table(history)
     final_statevector = np.asarray(variational_state.exact_statevector(), dtype=np.complex128)
-    metrics = ghz_state_metrics(final_statevector)
+    metrics = _ghz_state_metrics(final_statevector)
     return {
         "system": system,
         "history": history,
         "history_df": history_df,
-        "final_energy": float(np.asarray(variational_state.energy(system["netket_operator"]))),
-        "target_statevector": ghz_statevector(hilbert.size),
+        "final_energy": float(np.asarray(variational_state.energy(system["operator"]))),
+        "target_statevector": _ghz_statevector(hilbert.size),
         "final_statevector": final_statevector,
         "ghz_metrics": metrics,
     }

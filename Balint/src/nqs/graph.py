@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Iterator
 from dataclasses import dataclass
+
+
+NodePair = tuple[int, int]
 
 
 @dataclass(frozen=True, order=True)
@@ -34,8 +37,8 @@ class Graph(ABC):
     def adjacency(self, n: int = 1) -> dict[int, tuple[int, ...]]:
         return {node: self.get_neighbors(node, n) for node in range(self.n_nodes)}
 
-    def iter_neighbor_pairs(self, n: int = 1) -> Iterable[tuple[int, int]]:
-        seen: set[tuple[int, int]] = set()
+    def iter_neighbor_pairs(self, n: int = 1) -> Iterator[NodePair]:
+        seen: set[NodePair] = set()
         for node in range(self.n_nodes):
             for neighbor in self.get_neighbors(node, n):
                 pair = (min(node, neighbor), max(node, neighbor))
@@ -44,7 +47,7 @@ class Graph(ABC):
                 seen.add(pair)
                 yield pair
 
-    def iter_edges(self, color: str, n: int = 1) -> Iterable[Edge]:
+    def iter_edges(self, color: str, n: int = 1) -> Iterator[Edge]:
         for i, j in self.iter_neighbor_pairs(n):
             yield Edge(i=i, j=j, color=color)
 

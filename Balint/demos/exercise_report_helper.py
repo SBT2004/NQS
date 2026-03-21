@@ -1,4 +1,4 @@
-"""Reusable plotting and export helpers for the integrated final-exam notebook."""
+"""Reusable plotting and export helpers for the split exercise notebooks."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import pandas as pd
 from matplotlib.figure import Figure
 
 
-def ensure_report_output_dir(name: str = "final_exam") -> Path:
+def ensure_report_output_dir(name: str = "notebook_reports") -> Path:
     output_dir = Path(__file__).resolve().parent / "report_outputs" / name
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir

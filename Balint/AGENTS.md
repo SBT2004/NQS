@@ -18,8 +18,11 @@
 - Prefer reusable logic in `.py` modules. Use notebooks for experiments, demos,
   plots, and exploratory validation.
 - Demos must be notebook-first:
-  use `demo.ipynb` for the user-facing demo and `demo_helper.py` for reusable
-  support code in the same `demos/` folder.
+  keep the user-facing workflows in the retained top-level `demos/` notebooks
+  (`netket_benchmark.ipynb`, `exercise_1.ipynb`, `exercise_2.ipynb`,
+  `exercise_3.ipynb`), keep reusable scientific workflow code under
+  `src/nqs/workflows/`, and keep notebook-only bootstrap/report helpers under
+  `demos/`.
 - Do not leave important shared logic only in notebooks if it belongs in a
   module.
 - Keep subsystem boundaries clean:
@@ -65,6 +68,13 @@
 - Treat Gemini findings as advisory, not authoritative.
 - If Gemini is unavailable or returns invalid output, continue with your own
   review and mention the tool issue briefly.
+
+## Skill Use
+
+- Use a skill only when the task description explicitly names that skill.
+- Do not infer skill usage from general similarity or applicability alone.
+- If a task wants a specific review workflow or skill, the task text must say
+  so explicitly.
 
 ## Search
 

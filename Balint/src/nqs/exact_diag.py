@@ -24,9 +24,8 @@ def operator_matrix(operator: Operator) -> np.ndarray:
     hilbert = operator.hilbert
     dimension = hilbert.n_states
     matrix = np.zeros((dimension, dimension), dtype=np.complex128)
-    for column_index, state in enumerate(hilbert.all_states()):
-        for connected_state, value in operator.connected_elements(state):
-            row_index = hilbert.state_to_index(connected_state)
+    for column_index in range(dimension):
+        for row_index, value in operator.connected_elements_bits(column_index):
             matrix[row_index, column_index] += value
     return matrix
 

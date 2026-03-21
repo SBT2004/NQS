@@ -4,19 +4,22 @@ from . import expectation as expectation
 from . import graph as graph
 from . import hilbert as hilbert
 from . import models as models
+from . import observables as observables
 from . import operator as operator
 from . import optimizer as optimizer
 from . import sampler as sampler
 from . import vmc_setup as vmc_setup
 from . import vqs as vqs
+from . import workflows as workflows
 from .driver import VMC
 from .exact_diag import exact_ground_state_energy
 from .graph import Chain1D, Edge, Graph, SquareLattice
 from .hilbert import SpinHilbert
 from .loss import energy_loss
 from .models import CNN, FFNN, RBM
-from .netket_adapter import NetKetSampler, states_from_netket, states_to_netket
 from .optimizer import Adam
+from .sampler import MetropolisLocal
+from .runtime_types import states_from_signed_spins, states_to_signed_spins
 from .operator import (
     LocalTerm,
     Operator,
@@ -37,7 +40,7 @@ from .operator import (
     tfim,
     szsz_term,
 )
-from .vmc_setup import build_variational_state, build_vmc_driver
+from .vmc_setup import build_model, build_variational_state, build_vmc_driver, build_vmc_experiment
 from .vqs import VariationalState
 
 __all__ = [
@@ -51,9 +54,11 @@ __all__ = [
     "collect_terms",
     "build_variational_state",
     "build_vmc_driver",
+    "build_model",
+    "build_vmc_experiment",
     "heisenberg_term",
     "LocalTerm",
-    "NetKetSampler",
+    "MetropolisLocal",
     "Operator",
     "RBM",
     "SpinHilbert",
@@ -72,9 +77,10 @@ __all__ = [
     "sigmaz",
     "sx_term",
     "sxsx_term",
-    "states_from_netket",
-    "states_to_netket",
+    "states_from_signed_spins",
+    "states_to_signed_spins",
     "sysy_term",
     "tfim",
+    "workflows",
     "szsz_term",
 ]
