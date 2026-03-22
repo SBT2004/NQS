@@ -385,13 +385,18 @@ class NotebookWorkflowTests(unittest.TestCase):
         self.assertEqual(summary["n_sites"].tolist(), [16])
         self.assertTrue((summary["parameter_count"] > 0).all())
         self.assertTrue(np.isfinite(summary["final_energy"]).all())
-        self.assertIn("runtime_seconds", summary.columns)
+        self.assertIn("benchmark_mode", summary.columns)
+        self.assertIn("training_runtime_seconds", summary.columns)
         self.assertIn("callback_runtime_seconds", summary.columns)
+        self.assertIn("postprocessing_runtime_seconds", summary.columns)
+        self.assertIn("entropy_scan_runtime_seconds", summary.columns)
+        self.assertIn("report_runtime_seconds", summary.columns)
         self.assertIn("total_runtime_seconds", summary.columns)
         self.assertIn("tail_window_energy_std", summary.columns)
         self.assertIn("final_half_partition_renyi2", summary.columns)
         self.assertIn("final_nn_correlation", summary.columns)
         self.assertIn("valid_entropy_points", summary.columns)
+        self.assertEqual(summary["benchmark_mode"].tolist(), ["sampled"])
         self.assertEqual(
             result["training_history_table"]["system_label"].tolist(),
             ["tfim_4x4_non_ed"] * 3,
@@ -405,7 +410,25 @@ class NotebookWorkflowTests(unittest.TestCase):
         )
         self.assertTrue((summary["valid_entropy_points"] >= 0).all())
         self.assertTrue((summary["valid_entropy_points"] <= 2).all())
-        self.assertTrue((summary["total_runtime_seconds"] >= summary["runtime_seconds"]).all())
+        self.assertTrue((summary["training_runtime_seconds"] > 0.0).all())
+        self.assertTrue((summary["callback_runtime_seconds"] >= 0.0).all())
+        self.assertTrue((summary["postprocessing_runtime_seconds"] >= 0.0).all())
+        self.assertTrue((summary["entropy_scan_runtime_seconds"] >= 0.0).all())
+        self.assertTrue((summary["report_runtime_seconds"] >= summary["callback_runtime_seconds"]).all())
+        self.assertTrue(
+            np.allclose(
+                summary["report_runtime_seconds"],
+                summary["callback_runtime_seconds"]
+                + summary["postprocessing_runtime_seconds"]
+                + summary["entropy_scan_runtime_seconds"],
+            )
+        )
+        self.assertTrue(
+            np.allclose(
+                summary["total_runtime_seconds"],
+                summary["training_runtime_seconds"] + summary["report_runtime_seconds"],
+            )
+        )
         history = result["training_history_table"]
         post_update_rows = history.loc[history["is_post_update"]]
         self.assertEqual(post_update_rows["step"].tolist(), [2])

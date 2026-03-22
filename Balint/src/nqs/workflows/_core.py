@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Sequence, cast
 
@@ -19,6 +20,16 @@ from ..vmc_setup import build_model, build_variational_state, build_vmc_experime
 
 if TYPE_CHECKING:
     from ..observables import SupportsSamplingAndLogValue
+
+
+@dataclass
+class _TFIM5x5VMCBenchmarkContext:
+    system: dict[str, Any]
+    model: Any
+    variational_state: Any
+    vmc_driver: Any
+    benchmark_states: jax.Array | None = None
+    benchmark_sample_batch: Any | None = None
 
 
 def half_subsystem(n_sites: int) -> tuple[int, ...]:
@@ -229,6 +240,334 @@ def run_incremental_exercise_1_ed_benchmark(
         )
 
     return pd.DataFrame(rows)
+
+
+def _block_until_ready(value: Any) -> None:
+    leaves = jax.tree_util.tree_leaves(value)
+    if not leaves and hasattr(value, "block_until_ready"):
+        value.block_until_ready()
+        return
+    for leaf in leaves:
+        if hasattr(leaf, "block_until_ready"):
+            leaf.block_until_ready()
+
+
+def _timed_ms(fn: Any) -> tuple[Any, float]:
+    start = perf_counter()
+    result = fn()
+    _block_until_ready(result)
+    return result, (perf_counter() - start) * 1_000.0
+
+
+def _build_tfim_5x5_vmc_benchmark_context(
+    *,
+    seed: int,
+    model_kwargs: dict[str, Any],
+    learning_rate: float,
+    n_samples: int,
+    n_discard_per_chain: int,
+    n_chains: int,
+    h: float,
+) -> _TFIM5x5VMCBenchmarkContext:
+    system = build_system(
+        lattice_shape=(5, 5),
+        pbc=False,
+        hamiltonian="tfim",
+        h=h,
+    )
+    model, variational_state, vmc_driver = build_vmc_experiment(
+        hilbert=system["hilbert"],
+        operator=system["operator"],
+        learning_rate=learning_rate,
+        seed=seed,
+        n_samples=n_samples,
+        n_discard_per_chain=n_discard_per_chain,
+        n_chains=n_chains,
+        model_name="RBM",
+        model_kwargs=model_kwargs,
+        lattice_shape=(5, 5),
+        exact_backend_max_states=0,
+    )
+    return _TFIM5x5VMCBenchmarkContext(
+        system=system,
+        model=model,
+        variational_state=variational_state,
+        vmc_driver=vmc_driver,
+    )
+
+
+def _prepare_model_eval_states(
+    context: _TFIM5x5VMCBenchmarkContext,
+    *,
+    seed: int,
+    n_states: int,
+) -> None:
+    if context.benchmark_states is not None:
+        return
+    key = jax.random.PRNGKey(seed)
+    context.benchmark_states = jax.random.bernoulli(
+        key,
+        p=0.5,
+        shape=(n_states, context.system["hilbert"].size),
+    ).astype(jnp.uint8)
+
+
+def _prepare_fixed_sample_batch(
+    context: _TFIM5x5VMCBenchmarkContext,
+    *,
+    seed_offset: int,
+) -> None:
+    if context.benchmark_sample_batch is not None:
+        return
+    # Use an independent batch so local-energy diagnostics can be timed
+    # without mutating the stateful sampler benchmark path.
+    context.benchmark_sample_batch = context.variational_state.independent_sample_with_log_values(
+        seed_offset=seed_offset
+    )
+
+
+def _fixed_batch_local_energy_gradient(
+    context: _TFIM5x5VMCBenchmarkContext,
+) -> dict[str, Any]:
+    backend = cast(Any, context.variational_state)._expectation_backend
+    sample_batch = context.benchmark_sample_batch
+    params = context.variational_state.parameters
+    operator = context.system["operator"]
+    if sample_batch is None:
+        raise ValueError("benchmark_sample_batch must be prepared before gradient timing.")
+
+    local_energies = jax.lax.stop_gradient(
+        backend._local_energies(
+            operator,
+            params,
+            sample_batch.states,
+            sample_log_values=sample_batch.log_values,
+        )
+    )
+
+    def surrogate_loss(current_params: Any) -> jax.Array:
+        log_values = jnp.asarray(context.model.log_psi(current_params, sample_batch.states))
+        centered_local_energies = local_energies - jnp.mean(local_energies)
+        return 2.0 * jnp.real(jnp.mean(jnp.conj(log_values) * centered_local_energies))
+
+    grads = jax.grad(surrogate_loss)(params)
+    return {"local_energies": local_energies, "grads": grads}
+
+
+def _measure_tfim_5x5_vmc_stage(
+    *,
+    stage: str,
+    scope: str,
+    prepare_context: Any,
+    run_stage: Any,
+    build_context: Any,
+    warmed_repeats: int,
+) -> dict[str, Any]:
+    context = build_context()
+    prepare_context(context)
+    _, cold_start_ms = _timed_ms(lambda: run_stage(context))
+
+    warmed_runs_ms: list[float] = []
+    for _ in range(warmed_repeats):
+        _, warmed_ms = _timed_ms(lambda: run_stage(context))
+        warmed_runs_ms.append(warmed_ms)
+
+    warmed_mean_ms = float(np.mean(warmed_runs_ms))
+    warmed_min_ms = float(np.min(warmed_runs_ms))
+    return {
+        "stage": stage,
+        "scope": scope,
+        "cold_start_ms": float(cold_start_ms),
+        "warmed_mean_ms": warmed_mean_ms,
+        "warmed_min_ms": warmed_min_ms,
+        "cold_to_warm_ratio": float(cold_start_ms / warmed_mean_ms) if warmed_mean_ms > 0.0 else np.nan,
+        "warmed_repeats": warmed_repeats,
+        "regression_metric": "warmed_mean_ms",
+        "suggested_max_regression_ratio": 1.25,
+    }
+
+
+def run_tfim_5x5_vmc_performance_benchmark(
+    *,
+    rbm_alpha: int = 2,
+    learning_rate: float = 1e-2,
+    n_samples: int = 256,
+    n_discard_per_chain: int = 16,
+    n_chains: int = 8,
+    h: float = 1.0,
+    seed: int = 0,
+    warmed_repeats: int = 3,
+    model_eval_batch_size: int = 256,
+) -> dict[str, Any]:
+    if warmed_repeats <= 0:
+        raise ValueError("warmed_repeats must be positive.")
+    if model_eval_batch_size <= 0:
+        raise ValueError("model_eval_batch_size must be positive.")
+
+    model_kwargs = {"alpha": int(rbm_alpha)}
+
+    def build_context() -> _TFIM5x5VMCBenchmarkContext:
+        return _build_tfim_5x5_vmc_benchmark_context(
+            seed=seed,
+            model_kwargs=model_kwargs,
+            learning_rate=learning_rate,
+            n_samples=n_samples,
+            n_discard_per_chain=n_discard_per_chain,
+            n_chains=n_chains,
+            h=h,
+        )
+
+    stage_rows = [
+        _measure_tfim_5x5_vmc_stage(
+            stage="model_log_psi",
+            scope="fixed state batch",
+            build_context=build_context,
+            prepare_context=lambda context: _prepare_model_eval_states(
+                context,
+                seed=seed + 1_001,
+                n_states=model_eval_batch_size,
+            ),
+            run_stage=lambda context: context.model.log_psi(
+                context.variational_state.parameters,
+                context.benchmark_states,
+            ),
+            warmed_repeats=warmed_repeats,
+        ),
+        _measure_tfim_5x5_vmc_stage(
+            stage="sampler_draw",
+            scope="stateful sampled batch",
+            build_context=build_context,
+            prepare_context=lambda context: None,
+            run_stage=lambda context: context.variational_state.sample_with_log_values(),
+            warmed_repeats=warmed_repeats,
+        ),
+        _measure_tfim_5x5_vmc_stage(
+            stage="local_energy",
+            scope="fixed independent sample batch",
+            build_context=build_context,
+            prepare_context=lambda context: _prepare_fixed_sample_batch(
+                context,
+                seed_offset=30_000,
+            ),
+            run_stage=lambda context: cast(Any, context.variational_state)._expectation_backend._local_energies(
+                context.system["operator"],
+                context.variational_state.parameters,
+                context.benchmark_sample_batch.states,
+                sample_log_values=context.benchmark_sample_batch.log_values,
+            ),
+            warmed_repeats=warmed_repeats,
+        ),
+        _measure_tfim_5x5_vmc_stage(
+            stage="local_energy_gradient",
+            scope="fixed independent sample batch",
+            build_context=build_context,
+            prepare_context=lambda context: _prepare_fixed_sample_batch(
+                context,
+                seed_offset=30_000,
+            ),
+            run_stage=_fixed_batch_local_energy_gradient,
+            warmed_repeats=warmed_repeats,
+        ),
+        _measure_tfim_5x5_vmc_stage(
+            stage="vmc_step",
+            scope="stateful end-to-end sampled step",
+            build_context=build_context,
+            prepare_context=lambda context: None,
+            run_stage=lambda context: context.vmc_driver.step(),
+            warmed_repeats=warmed_repeats,
+        ),
+    ]
+
+    timing_table = pd.DataFrame(stage_rows)
+    regression_gate_table = timing_table[
+        [
+            "stage",
+            "scope",
+            "cold_start_ms",
+            "warmed_mean_ms",
+            "regression_metric",
+            "suggested_max_regression_ratio",
+        ]
+    ].copy()
+    regression_gate_table["gate_description"] = regression_gate_table.apply(
+        lambda row: (
+            f"Flag regressions when future {row['regression_metric']} exceeds "
+            f"{float(row['warmed_mean_ms']):.3f} ms by more than "
+            f"{float(row['suggested_max_regression_ratio']):.2f}x; "
+            "track cold_start_ms separately for compile/tracing drift."
+        ),
+        axis=1,
+    )
+
+    return {
+        "benchmark_label": "tfim_5x5_open_rbm_vmc",
+        "system_label": "tfim_5x5_open",
+        "model_name": "RBM",
+        "model_kwargs": model_kwargs,
+        "lattice_shape": (5, 5),
+        "hamiltonian": "tfim",
+        "pbc": False,
+        "seed": seed,
+        "n_sites": 25,
+        "n_samples": n_samples,
+        "n_discard_per_chain": n_discard_per_chain,
+        "n_chains": n_chains,
+        "learning_rate": learning_rate,
+        "h": h,
+        "model_eval_batch_size": model_eval_batch_size,
+        "warmed_repeats": warmed_repeats,
+        "timing_table": timing_table,
+        "regression_gate_table": regression_gate_table,
+        "notes": [
+            "cold_start_ms is measured on a fresh benchmark context and includes first-call tracing/compilation for that stage.",
+            "warmed_mean_ms and warmed_min_ms are measured by rerunning the same stage on the warmed context.",
+            "local_energy and local_energy_gradient use a fixed independently sampled batch so expectation cost can be compared separately from sampler cost.",
+            "vmc_step measures the full sampled driver.step() path, including sampling, local-energy evaluation, gradient construction, and parameter update.",
+        ],
+    }
+
+
+def format_tfim_5x5_vmc_performance_report(benchmark: dict[str, Any]) -> str:
+    timing_table = cast(pd.DataFrame, benchmark["timing_table"])
+    regression_gate_table = cast(pd.DataFrame, benchmark["regression_gate_table"])
+    timing_lines = timing_table.to_string(
+        index=False,
+        formatters={
+            "cold_start_ms": lambda value: f"{float(value):.3f}",
+            "warmed_mean_ms": lambda value: f"{float(value):.3f}",
+            "warmed_min_ms": lambda value: f"{float(value):.3f}",
+            "cold_to_warm_ratio": lambda value: f"{float(value):.2f}",
+            "suggested_max_regression_ratio": lambda value: f"{float(value):.2f}",
+        },
+    )
+    gate_lines = regression_gate_table.to_string(
+        index=False,
+        formatters={
+            "cold_start_ms": lambda value: f"{float(value):.3f}",
+            "warmed_mean_ms": lambda value: f"{float(value):.3f}",
+            "suggested_max_regression_ratio": lambda value: f"{float(value):.2f}",
+        },
+    )
+    notes = "\n".join(f"- {note}" for note in benchmark["notes"])
+    return "\n".join(
+        [
+            (
+                f"Benchmark: {benchmark['benchmark_label']} "
+                f"(system={benchmark['system_label']}, model={benchmark['model_name']}, "
+                f"alpha={benchmark['model_kwargs']['alpha']}, samples={benchmark['n_samples']}, "
+                f"chains={benchmark['n_chains']}, warmed_repeats={benchmark['warmed_repeats']})"
+            ),
+            "",
+            "Stage timings (ms):",
+            timing_lines,
+            "",
+            "Regression gates:",
+            gate_lines,
+            "",
+            "Notes:",
+            notes,
+        ]
+    )
 
 
 def history_table(history: list[dict[str, Any]]) -> pd.DataFrame:
@@ -1080,7 +1419,6 @@ def run_non_ed_vmc_benchmark(
                 callback_runtime_seconds += perf_counter() - callback_start
                 return result
 
-            benchmark_start = perf_counter()
             run_start = perf_counter()
             history = vmc_driver.run(
                 n_iter,
@@ -1088,8 +1426,9 @@ def run_non_ed_vmc_benchmark(
                 callback_every=callback_every,
             )
             run_runtime_seconds = perf_counter() - run_start
-            runtime_seconds = max(0.0, run_runtime_seconds - callback_runtime_seconds)
+            training_runtime_seconds = max(0.0, run_runtime_seconds - callback_runtime_seconds)
             history_df = history_table(history)
+            postprocessing_start = perf_counter()
             final_energy = float(np.asarray(variational_state.energy(system["operator"])))
             final_row: dict[str, Any] = {
                 column: np.nan
@@ -1117,12 +1456,14 @@ def run_non_ed_vmc_benchmark(
             history_df["seed"] = seed
             history_frames.append(history_df)
 
+            entropy_scan_start = perf_counter()
             entropy_scan = sampled_entropy_scaling_summary(
                 variational_state,
                 hilbert.size,
                 max_subsystem_size=max_entropy_subsystem_size,
                 n_independent_runs=entropy_n_independent_runs,
             )
+            entropy_scan_runtime_seconds = perf_counter() - entropy_scan_start
             entropy_table = entropy_scan["entropy_table"].copy()
             entropy_table["benchmark_label"] = benchmark_label
             entropy_table["model"] = model_name
@@ -1139,11 +1480,21 @@ def run_non_ed_vmc_benchmark(
                 system["graph"],
                 entropy_n_independent_runs=entropy_n_independent_runs,
             )
-            total_runtime_seconds = perf_counter() - benchmark_start
+            postprocessing_runtime_seconds = max(
+                0.0,
+                perf_counter() - postprocessing_start - entropy_scan_runtime_seconds,
+            )
+            report_runtime_seconds = (
+                callback_runtime_seconds
+                + postprocessing_runtime_seconds
+                + entropy_scan_runtime_seconds
+            )
+            total_runtime_seconds = training_runtime_seconds + report_runtime_seconds
 
             summary_rows.append(
                 {
                     "benchmark_label": benchmark_label,
+                    "benchmark_mode": "sampled",
                     "model": model_name,
                     "model_kwargs": model_kwargs,
                     "system_label": system_label,
@@ -1154,9 +1505,12 @@ def run_non_ed_vmc_benchmark(
                     "parameter_count": parameter_count,
                     "final_energy": final_energy,
                     "final_energy_per_site": final_energy / hilbert.size,
-                    "runtime_seconds": runtime_seconds,
-                    "mean_step_time_seconds": runtime_seconds / max(1, n_iter),
+                    "training_runtime_seconds": training_runtime_seconds,
+                    "mean_training_step_time_seconds": training_runtime_seconds / max(1, n_iter),
                     "callback_runtime_seconds": callback_runtime_seconds,
+                    "postprocessing_runtime_seconds": postprocessing_runtime_seconds,
+                    "entropy_scan_runtime_seconds": entropy_scan_runtime_seconds,
+                    "report_runtime_seconds": report_runtime_seconds,
                     "total_runtime_seconds": total_runtime_seconds,
                     "history_points": len(history_df),
                     "valid_entropy_points": valid_entropy_points,
@@ -1167,6 +1521,7 @@ def run_non_ed_vmc_benchmark(
             benchmark_results.append(
                 {
                     "benchmark_label": benchmark_label,
+                    "benchmark_mode": "sampled",
                     "model_name": model_name,
                     "model_kwargs": model_kwargs,
                     "system_label": system_label,
@@ -1178,7 +1533,12 @@ def run_non_ed_vmc_benchmark(
                     "entropy_scan_table": entropy_table,
                     "parameter_count": parameter_count,
                     "final_energy": final_energy,
-                    "runtime_seconds": runtime_seconds,
+                    "training_runtime_seconds": training_runtime_seconds,
+                    "callback_runtime_seconds": callback_runtime_seconds,
+                    "postprocessing_runtime_seconds": postprocessing_runtime_seconds,
+                    "entropy_scan_runtime_seconds": entropy_scan_runtime_seconds,
+                    "report_runtime_seconds": report_runtime_seconds,
+                    "total_runtime_seconds": total_runtime_seconds,
                     "trend_metrics": trend_metrics,
                     "observable_metrics": observable_metrics,
                 }
