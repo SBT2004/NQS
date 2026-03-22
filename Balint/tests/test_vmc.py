@@ -101,6 +101,13 @@ class VMCTests(unittest.TestCase):
     def _make_sampler(self, hilbert: SpinHilbert, seed: int) -> MetropolisLocal:
         return MetropolisLocal(hilbert=hilbert, n_samples=16, n_discard_per_chain=2, n_chains=4, seed=seed)
 
+    def _architecture_cases(self) -> tuple[tuple[str, RBM | FFNN | CNN, SpinHilbert], ...]:
+        return (
+            ("RBM", RBM(alpha=1), SpinHilbert(4)),
+            ("FFNN", FFNN(hidden_dims=(8, 4)), SpinHilbert(4)),
+            ("CNN", CNN(spatial_shape=(2, 2), channels=(4,), kernel_size=(2, 2)), SpinHilbert(4)),
+        )
+
     def _make_driver(self, hilbert: SpinHilbert, seed: int) -> VMC:
         operator = _chain_tfim_operator(hilbert, h=1.0)
         _, _, driver = build_vmc_experiment(
@@ -162,6 +169,55 @@ class VMCTests(unittest.TestCase):
         expected = _reference_local_energies(operator, model, params, samples)
 
         np.testing.assert_allclose(actual, expected)
+
+    def test_sampler_sample_with_params_matches_sample_contract_across_architectures(self) -> None:
+        for label, model, hilbert in self._architecture_cases():
+            with self.subTest(model=label):
+                params = model.init(jax.random.PRNGKey(0), hilbert)
+                reference_sampler = self._make_sampler(hilbert, seed=21)
+                compiled_sampler = self._make_sampler(hilbert, seed=21)
+
+                def log_psi_fn(states: jax.Array) -> jax.Array:
+                    return model.log_psi(params, states)
+
+                reference_first = np.asarray(reference_sampler.sample(log_psi_fn))
+                compiled_first = np.asarray(compiled_sampler.sample_with_params(model.log_psi, params))
+                np.testing.assert_array_equal(compiled_first, reference_first)
+
+                reference_second = np.asarray(reference_sampler.sample(log_psi_fn))
+                compiled_second = np.asarray(compiled_sampler.sample_with_params(model.log_psi, params))
+                np.testing.assert_array_equal(compiled_second, reference_second)
+
+                np.testing.assert_array_equal(
+                    np.asarray(compiled_sampler._chain_states),
+                    np.asarray(reference_sampler._chain_states),
+                )
+
+    def test_sampler_independent_sample_with_params_matches_sample_contract_across_architectures(self) -> None:
+        for label, model, hilbert in self._architecture_cases():
+            with self.subTest(model=label):
+                params = model.init(jax.random.PRNGKey(1), hilbert)
+                reference_sampler = self._make_sampler(hilbert, seed=22)
+                compiled_sampler = self._make_sampler(hilbert, seed=22)
+
+                def log_psi_fn(states: jax.Array) -> jax.Array:
+                    return model.log_psi(params, states)
+
+                for seed_offset in (0, 3):
+                    reference_samples = np.asarray(
+                        reference_sampler.independent_sample(log_psi_fn, seed_offset=seed_offset)
+                    )
+                    compiled_samples = np.asarray(
+                        compiled_sampler.independent_sample_with_params(
+                            model.log_psi,
+                            params,
+                            seed_offset=seed_offset,
+                        )
+                    )
+                    np.testing.assert_array_equal(compiled_samples, reference_samples)
+
+                self.assertIsNone(reference_sampler._chain_states)
+                self.assertIsNone(compiled_sampler._chain_states)
 
     def test_variational_state_and_driver_update_parameters(self) -> None:
         hilbert = SpinHilbert(4)

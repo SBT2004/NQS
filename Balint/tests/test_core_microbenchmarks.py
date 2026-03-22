@@ -13,7 +13,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from nqs.exact_diag import solve_sparse_ground_state, sparse_operator_matrix
+from nqs.exact_diag import ExactGroundStateResult, solve_sparse_ground_state, sparse_operator_matrix
 from nqs.graph import Chain1D
 from nqs.hilbert import SpinHilbert
 from nqs.operator import Operator, collect_terms, sx_term, szsz_term
@@ -103,7 +103,7 @@ def _validate_sparse_operator_matrix(operator: Operator, matrix) -> None:
     assert np.isclose(dense_matrix[1, 0], -0.8)
 
 
-def _validate_sparse_ground_state(_context, result: dict[str, np.ndarray | float]) -> None:
+def _validate_sparse_ground_state(_context: object, result: ExactGroundStateResult) -> None:
     assert np.isfinite(result["ground_energy"])
     assert np.isclose(np.linalg.norm(np.asarray(result["ground_state"], dtype=np.complex128)), 1.0)
 
@@ -197,6 +197,20 @@ class CoreMicrobenchmarkTests(unittest.TestCase):
         self.assertTrue((result["runtime_seconds"] > 0.0).all())
         self.assertTrue((result["failure_type"] == "").all())
         self.assertTrue(np.isfinite(result["ground_energy"]).all())
+
+    def test_incremental_exercise_1_ed_benchmark_reaches_sixteen_spins_under_one_minute(self) -> None:
+        lengths = [6, 8, 10, 12, 14, 16]
+        result = run_incremental_exercise_1_ed_benchmark(lengths, h=1.0, pbc=False)
+
+        self.assertEqual(result["length"].tolist(), lengths)
+        self.assertTrue(result["completed"].all())
+        self.assertTrue((result["assembly_seconds"] > 0.0).all())
+        self.assertTrue((result["solve_seconds"] > 0.0).all())
+        self.assertTrue((result["runtime_seconds"] > 0.0).all())
+        self.assertTrue((result["failure_type"] == "").all())
+        self.assertTrue((result["failure_message"] == "").all())
+        self.assertTrue(np.isfinite(result["ground_energy"]).all())
+        self.assertLess(float(result.loc[result["length"] == 16, "runtime_seconds"].iloc[0]), 60.0)
 
 
 if __name__ == "__main__":

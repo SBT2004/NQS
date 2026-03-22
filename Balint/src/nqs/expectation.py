@@ -11,7 +11,7 @@ from jax.experimental import sparse as jsparse
 from .exact_diag import sparse_operator_matrix
 from .operator import Operator
 from .runtime_types import SupportsLogPsi
-from .sampler import MetropolisLocal
+from .sampler import LogPsiApplyFn, MetropolisLocal
 
 ParamTree = Any
 
@@ -59,23 +59,23 @@ class ProjectExpectationBackend:
     _all_states: jax.Array | None = field(default=None, init=False, repr=False)
     _exact_operator_cache_operator: Operator | None = field(default=None, init=False, repr=False)
     _exact_operator_cache_value: jsparse.BCOO | None = field(default=None, init=False, repr=False)
+    _sampler_log_psi_apply: LogPsiApplyFn = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self._sampler_log_psi_apply = self.model.log_psi
         if self.sampler.hilbert.n_states <= self.exact_backend_max_states:
             self._all_states = jnp.asarray(self.sampler.hilbert.all_states(), dtype=jnp.uint8)
 
     def set_parameters(self, params: ParamTree) -> None:
         self.params = params
 
-    def _log_value_fn(self, params: ParamTree):
-        return lambda states: self.model.log_psi(params, states)
-
     def sample(self) -> jax.Array:
-        return self.sampler.sample(self._log_value_fn(self.params))
+        return self.sampler.sample_with_params(self._sampler_log_psi_apply, self.params)
 
     def independent_sample(self, seed_offset: int = 0) -> jax.Array:
-        return self.sampler.independent_sample(
-            self._log_value_fn(self.params),
+        return self.sampler.independent_sample_with_params(
+            self._sampler_log_psi_apply,
+            self.params,
             seed_offset=seed_offset,
         )
 
@@ -186,8 +186,9 @@ class ProjectExpectationBackend:
         if self._all_states is not None:
             return ExpectationResult(mean=self._exact_expectation_mean(project_operator, params))
 
-        samples = self.sampler.independent_sample(
-            self._log_value_fn(params),
+        samples = self.sampler.independent_sample_with_params(
+            self._sampler_log_psi_apply,
+            params,
             seed_offset=0,
         )
         local_energies = self._local_energies(project_operator, params, samples)
