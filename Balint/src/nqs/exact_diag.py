@@ -3,45 +3,60 @@ from __future__ import annotations
 from typing import TypedDict
 
 import numpy as np
+from scipy.sparse import coo_array, csr_array
+from scipy.sparse.linalg import eigsh
 
 from .operator import Operator
 
 
 class ExactDiagResult(TypedDict):
-    matrix: np.ndarray
-    eigenvalues: np.ndarray
     ground_state: np.ndarray
     ground_energy: float
 
 
-def operator_matrix(operator: Operator) -> np.ndarray:
-    """Build the dense matrix for a small project-owned operator.
-
-    This scales exponentially with Hilbert-space size, so it is only suitable
-    for small-system exact-diagonalization checks.
-    """
+def sparse_operator_matrix(operator: Operator) -> csr_array:
+    """Build a sparse CSR matrix for a project-owned operator."""
 
     hilbert = operator.hilbert
     dimension = hilbert.n_states
-    matrix = np.zeros((dimension, dimension), dtype=np.complex128)
-    for column_index in range(dimension):
-        for row_index, value in operator.connected_elements_bits(column_index):
-            matrix[row_index, column_index] += value
+    rows: list[int] = []
+    columns: list[int] = []
+    values: list[complex] = []
+
+    for row_index, column_index, value in operator.iter_matrix_elements():
+        rows.append(row_index)
+        columns.append(column_index)
+        values.append(value)
+
+    matrix = coo_array(
+        (np.asarray(values, dtype=np.complex128), (rows, columns)),
+        shape=(dimension, dimension),
+        dtype=np.complex128,
+    ).tocsr()
+    matrix.sum_duplicates()
     return matrix
 
 
+def operator_matrix(operator: Operator) -> np.ndarray:
+    """Debug/demo-only dense matrix helper for small exact checks.
+
+    The production ED path uses :func:`sparse_operator_matrix` instead.
+    """
+
+    return np.asarray(sparse_operator_matrix(operator).toarray(), dtype=np.complex128)
+
+
 def exact_ground_state(operator: Operator) -> ExactDiagResult:
-    matrix = operator_matrix(operator)
-    eigenvalues, eigenvectors = np.linalg.eigh(matrix)
-    order = np.argsort(eigenvalues.real)
-    ordered_values = eigenvalues[order]
-    ordered_vectors = eigenvectors[:, order]
-    ground_state = ordered_vectors[:, 0]
+    sparse_matrix = sparse_operator_matrix(operator)
+    eigenvalues, eigenvectors = eigsh(sparse_matrix, k=1, which="SA")
+    ground_energy = float(eigenvalues[0].real)
+    ground_state = np.asarray(eigenvectors[:, 0], dtype=np.complex128)
+    dominant_amplitude = ground_state[np.argmax(np.abs(ground_state))]
+    if dominant_amplitude != 0:
+        ground_state *= np.exp(-1j * np.angle(dominant_amplitude))
     return {
-        "matrix": matrix,
-        "eigenvalues": ordered_values.real,
         "ground_state": ground_state,
-        "ground_energy": float(ordered_values[0].real),
+        "ground_energy": ground_energy,
     }
 
 

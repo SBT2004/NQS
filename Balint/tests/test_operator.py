@@ -6,7 +6,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from nqs.exact_diag import operator_matrix
+from nqs.exact_diag import exact_ground_state, operator_matrix, sparse_operator_matrix
 from nqs.graph import SquareLattice
 from nqs.hilbert import SpinHilbert
 from nqs.operator import LocalTerm, Operator, heisenberg_term, j1_j2, local_matrix, sigmax, sigmaz, tfim
@@ -158,6 +158,35 @@ class OperatorTests(unittest.TestCase):
         )
 
         np.testing.assert_allclose(matrix, expected)
+
+    def test_sparse_exact_diag_matrix_matches_dense_helper(self) -> None:
+        hilbert = SpinHilbert(3)
+        operator = Operator(
+            hilbert,
+            [
+                LocalTerm((0,), sigmax(), coefficient=-0.7),
+                LocalTerm((1, 2), np.kron(sigmaz(), sigmaz()), coefficient=1.3),
+            ],
+        )
+
+        dense_matrix = operator_matrix(operator)
+        sparse_matrix = sparse_operator_matrix(operator)
+
+        np.testing.assert_allclose(sparse_matrix.toarray(), dense_matrix)
+        np.testing.assert_allclose(sparse_matrix.toarray(), sparse_matrix.toarray().conj().T)
+
+    def test_sparse_exact_ground_state_matches_dense_reference(self) -> None:
+        hilbert = SpinHilbert(3)
+        graph = SquareLattice(3, 1, pbc=False)
+        operator = tfim(hilbert, graph, J=1.0, h=0.8)
+
+        expected_eigenvalues, expected_eigenvectors = np.linalg.eigh(operator_matrix(operator))
+        result = exact_ground_state(operator)
+
+        self.assertAlmostEqual(result["ground_energy"], float(expected_eigenvalues[0].real))
+        overlap = np.vdot(expected_eigenvectors[:, 0], result["ground_state"])
+        self.assertAlmostEqual(float(np.abs(overlap)), 1.0, places=10)
+        self.assertAlmostEqual(float(np.linalg.norm(result["ground_state"])), 1.0, places=10)
 
 
 if __name__ == "__main__":

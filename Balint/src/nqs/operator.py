@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from numbers import Number
 from typing import TYPE_CHECKING, Iterable, Protocol, TypeAlias, cast
@@ -175,6 +175,13 @@ class Operator:
             for index, value in sorted(contributions.items(), key=lambda item: item[0])
             if value != 0
         ]
+
+    def iter_matrix_elements(self) -> Iterator[tuple[int, int, complex]]:
+        """Yield nonzero matrix elements as ``(row, column, value)`` triples."""
+
+        for column_index in range(self.hilbert.n_states):
+            for row_index, value in self.connected_elements_bits(column_index):
+                yield row_index, column_index, value
 
     def _validate_terms(self) -> None:
         for term in self.terms:

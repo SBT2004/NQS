@@ -132,8 +132,8 @@ def exact_observables_summary(
 
     spectrum_table = pd.DataFrame(
         {
-            "level": np.arange(min(8, hilbert.n_states)),
-            "energy": exact["eigenvalues"][: min(8, hilbert.n_states)],
+            "level": np.array([0], dtype=np.int64),
+            "energy": np.array([exact["ground_energy"]], dtype=np.float64),
         }
     )
 
