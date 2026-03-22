@@ -1,8 +1,15 @@
 __pycache__/
+*.py[cod]
 .pytest_cache/
 .ruff_cache/
 .ipynb_checkpoints/
 *.prof
+evaluation_harness/
 demos/jax_profile_*/
-demos/profiling_results/*
-!demos/profiling_results/README.md
+demos/report_outputs/
+demos/profiling/results/*
+!demos/profiling/results/README.md
+!demos/profiling/results/*/
+demos/profiling/results/*/**
+!demos/profiling/results/**/summary.md
+!demos/profiling/results/**/summary.json

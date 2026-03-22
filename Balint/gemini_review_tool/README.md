@@ -23,19 +23,19 @@ Optional:
 From this workspace, register the MCP server as a local command:
 
 ```powershell
-codex mcp add gemini-review -- python C:\Users\balin\PycharmProjects\NQS\Balint\gemini_review_server.py
+codex mcp add gemini-review -- python C:\Users\balin\PycharmProjects\NQS\Balint\gemini_review_tool\gemini_review_server.py
 ```
 
 If you want a fixed model override:
 
 ```powershell
-codex mcp add gemini-review --env GEMINI_MODEL=gemini-2.5-flash -- python C:\Users\balin\PycharmProjects\NQS\Balint\gemini_review_server.py
+codex mcp add gemini-review --env GEMINI_MODEL=gemini-2.5-flash -- python C:\Users\balin\PycharmProjects\NQS\Balint\gemini_review_tool\gemini_review_server.py
 ```
 
 If Gemini CLI is not on `PATH`, register the full CLI path too:
 
 ```powershell
-codex mcp add gemini-review --env GEMINI_CLI_COMMAND=C:\Users\balin\AppData\Roaming\npm\gemini.cmd -- python C:\Users\balin\PycharmProjects\NQS\Balint\gemini_review_server.py
+codex mcp add gemini-review --env GEMINI_CLI_COMMAND=C:\Users\balin\AppData\Roaming\npm\gemini.cmd -- python C:\Users\balin\PycharmProjects\NQS\Balint\gemini_review_tool\gemini_review_server.py
 ```
 
 ## Expected workflow

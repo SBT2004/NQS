@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import jax
 import jax.numpy as jnp
-import netket as nk
 
+from .expectation import ExpectationResult
 from .loss import energy_loss
 
 ParamTree = Any
+Callback = Callable[[int, Any], dict[str, object]]
 
 
 class SupportsOptimizer(Protocol):
@@ -42,7 +44,7 @@ class SupportsVariationalState(Protocol):
     def replace_parameters(self, new_params: ParamTree) -> None:
         ...
 
-    def expect_and_grad(self, operator: nk.operator.AbstractOperator) -> tuple[nk.stats.Stats, Any]:
+    def expect_and_grad(self, operator: Any) -> tuple[ExpectationResult, Any]:
         ...
 
 
@@ -50,7 +52,7 @@ class SupportsVariationalState(Protocol):
 class VMC:
     """Minimal project-owned VMC driver."""
 
-    operator: nk.operator.AbstractOperator
+    operator: Any
     variational_state: SupportsVariationalState
     optimizer: SupportsOptimizer
     opt_state: object = field(init=False)
@@ -65,8 +67,8 @@ class VMC:
         # provide it directly. This keeps the demo on an actual Monte Carlo
         # training path instead of rebuilding backend objects inside autodiff.
         if hasattr(self.variational_state, "expect_and_grad"):
-            stats, grads = self.variational_state.expect_and_grad(self.operator)
-            energy = jnp.real(stats.mean)
+            result, grads = self.variational_state.expect_and_grad(self.operator)
+            energy = jnp.real(result.mean)
         else:
             def loss_fn(params):
                 # This nested function captures the fixed operator and
@@ -86,10 +88,20 @@ class VMC:
         self.variational_state.replace_parameters(new_params)
         return {"energy": energy, "grads": grads}
 
-    def run(self, n_iter: int) -> list[dict[str, object]]:
-        # We return a simple history list so demos can inspect energies without
-        # needing a separate logger abstraction yet.
+    def run(
+        self,
+        n_iter: int,
+        callback: Callback | None = None,
+        callback_every: int = 1,
+    ) -> list[dict[str, object]]:
+        if callback_every <= 0:
+            raise ValueError("callback_every must be positive.")
+
         history: list[dict[str, object]] = []
-        for _ in range(n_iter):
-            history.append(self.step())
+        for step in range(n_iter):
+            step_result = dict(self.step())
+            step_result["step"] = step
+            if callback is not None and step % callback_every == 0:
+                step_result["observables"] = dict(callback(step, self))
+            history.append(step_result)
         return history

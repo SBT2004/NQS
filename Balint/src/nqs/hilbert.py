@@ -3,6 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import numpy.typing as npt
+
+
+SpinState = npt.NDArray[np.uint8]
+SpinStateBatch = npt.NDArray[np.uint8]
+BitmapBatch = npt.NDArray[np.object_]
+StateInput = npt.ArrayLike
+StateBatchInput = npt.ArrayLike
+BitmapInput = int | npt.ArrayLike
 
 
 @dataclass(frozen=True)
@@ -27,7 +36,7 @@ class SpinHilbert:
     def n_states(self) -> int:
         return 1 << self.N
 
-    def validate_state(self, state: np.ndarray | list[int] | tuple[int, ...]) -> np.ndarray:
+    def validate_state(self, state: StateInput) -> SpinState:
         arr = np.asarray(state, dtype=np.uint8)
         if arr.shape != (self.N,):
             raise ValueError(f"Expected shape ({self.N},), got {arr.shape}.")
@@ -35,18 +44,18 @@ class SpinHilbert:
             raise ValueError("Spin states must only contain 0 or 1.")
         return arr
 
-    def state_to_index(self, state: np.ndarray | list[int] | tuple[int, ...]) -> int:
+    def state_to_index(self, state: StateInput) -> int:
         arr = self.validate_state(state)
         return int(sum(int(bit) << i for i, bit in enumerate(arr.tolist())))
 
-    def index_to_state(self, index: int) -> np.ndarray:
+    def index_to_state(self, index: int) -> SpinState:
         if not isinstance(index, int):
             raise TypeError("index must be an integer.")
         if index < 0 or index >= self.n_states:
             raise ValueError(f"index must lie in [0, {self.n_states}).")
         return np.array([(index >> i) & 1 for i in range(self.N)], dtype=np.uint8)
 
-    def states_to_bits(self, states: np.ndarray | list[list[int]]) -> np.ndarray:
+    def states_to_bits(self, states: StateBatchInput) -> BitmapBatch:
         arr = np.asarray(states, dtype=np.uint8)
         if arr.ndim == 1:
             return np.array([self.state_to_index(arr)], dtype=object)
@@ -54,7 +63,7 @@ class SpinHilbert:
             raise ValueError(f"Expected shape (batch, {self.N}), got {arr.shape}.")
         return np.array([self.state_to_index(row) for row in arr], dtype=object)
 
-    def bits_to_states(self, bits: int | list[int] | np.ndarray, N: int | None = None) -> np.ndarray:
+    def bits_to_states(self, bits: BitmapInput, N: int | None = None) -> SpinState | SpinStateBatch:
         if N is not None and N != self.N:
             raise ValueError("bits_to_states only supports the Hilbert-space size of this instance.")
         if isinstance(bits, (int, np.integer)):
@@ -63,13 +72,18 @@ class SpinHilbert:
         bit_list = np.asarray(bits, dtype=object).reshape(-1)
         return np.stack([self.index_to_state(int(bit)) for bit in bit_list], axis=0)
 
-    def all_states(self) -> np.ndarray:
+    def all_states(self) -> SpinStateBatch:
+        if self.N <= 64:
+            indices = np.arange(self.n_states, dtype=np.uint64)[:, None]
+            bit_positions = np.arange(self.N, dtype=np.uint64)
+            return ((indices >> bit_positions) & 1).astype(np.uint8, copy=False)
+
         states = np.zeros((self.n_states, self.N), dtype=np.uint8)
         for index in range(self.n_states):
             states[index] = self.index_to_state(index)
         return states
 
-    def states_to_pm1(self, states: np.ndarray | list[list[int]]) -> np.ndarray:
+    def states_to_pm1(self, states: StateBatchInput) -> npt.NDArray[np.int8]:
         arr = np.asarray(states, dtype=np.int8)
         if np.any((arr != 0) & (arr != 1)):
             raise ValueError("Spin states must only contain 0 or 1.")

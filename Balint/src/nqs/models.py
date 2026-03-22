@@ -22,6 +22,17 @@ def _states_to_pm1(states: jax.Array) -> jax.Array:
     return 2.0 * states.astype(jnp.float32) - 1.0
 
 
+def _complex_log_output(log_amplitude: jax.Array, raw_phase: jax.Array) -> jax.Array:
+    phase = jnp.pi * jnp.tanh(raw_phase)
+    return log_amplitude + 1j * phase
+
+
+def _dense_complex_head(output: jax.Array) -> jax.Array:
+    """Assume `output[..., 0]` is log amplitude and `output[..., 1]` is raw phase."""
+
+    return _complex_log_output(output[..., 0], output[..., 1])
+
+
 class _RBMModule(nn.Module):
     hidden_features: int
 
@@ -35,11 +46,15 @@ class _RBMModule(nn.Module):
         # returned value behaves like an array, but it is tracked in the
         # parameter pytree so JAX can differentiate with respect to it.
         visible_bias = self.param("visible_bias", nn.initializers.zeros, (x.shape[-1],))
+        phase_bias = self.param("phase_bias", nn.initializers.zeros, (x.shape[-1],))
         # nn.Dense is a standard linear layer: x @ W + b.
         hidden = nn.Dense(self.hidden_features)(x)
+        phase_hidden = nn.Dense(self.hidden_features, name="phase_hidden")(x)
         # This is the usual RBM log-amplitude formula for a visible
         # configuration after summing out hidden spins analytically.
-        return jnp.dot(x, visible_bias) + jnp.sum(jnp.log(jnp.cosh(hidden)), axis=-1)
+        log_amplitude = jnp.dot(x, visible_bias) + jnp.sum(jnp.log(jnp.cosh(hidden)), axis=-1)
+        raw_phase = jnp.dot(x, phase_bias) + jnp.sum(phase_hidden, axis=-1)
+        return _complex_log_output(log_amplitude, raw_phase)
 
 
 class _FFNNModule(nn.Module):
@@ -56,7 +71,8 @@ class _FFNNModule(nn.Module):
             x = self.activation(x)
         # We return one scalar per configuration because the wavefunction model
         # needs one log-amplitude per sampled spin state.
-        return nn.Dense(1)(x).squeeze(-1)
+        output = nn.Dense(2)(x)
+        return _dense_complex_head(output)
 
 
 class _CNNModule(nn.Module):
@@ -79,7 +95,8 @@ class _CNNModule(nn.Module):
         # After the convolution stack we flatten back to a vector so a final
         # dense layer can produce the scalar log-amplitude.
         x = x.reshape((batch, -1))
-        return nn.Dense(1)(x).squeeze(-1)
+        output = nn.Dense(2)(x)
+        return _dense_complex_head(output)
 
 
 @dataclass

@@ -3,14 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 import jax.numpy as jnp
-import netket as nk
 
 ParamTree = Any
 
 
 def energy_loss(
     variational_state,
-    operator: nk.operator.AbstractOperator,
+    operator: Any,
     params: ParamTree,
 ) -> jnp.ndarray:
     # The loss function is deliberately tiny: one place that says "for these
