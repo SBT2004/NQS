@@ -69,8 +69,14 @@ class VariationalState:
     ):
         return self._expectation_backend.expect_with_params(operator, params)
 
+    def expect_on_sample_batch(self, operator: Any, sample_batch: SampleBatch):
+        return self._expectation_backend.expect_on_sample_batch(operator, sample_batch)
+
     def energy(self, operator: Any) -> jax.Array:
         return jnp.real(self.expect(operator).mean)
+
+    def energy_on_sample_batch(self, operator: Any, sample_batch: SampleBatch) -> jax.Array:
+        return jnp.real(self.expect_on_sample_batch(operator, sample_batch).mean)
 
     def energy_with_params(
         self,

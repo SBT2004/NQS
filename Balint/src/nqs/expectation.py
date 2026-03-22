@@ -53,6 +53,9 @@ class SupportsExpectationBackend(Protocol):
     def expect_with_params(self, operator: Any, params: ParamTree) -> ExpectationResult:
         ...
 
+    def expect_on_sample_batch(self, operator: Any, sample_batch: SampleBatch) -> ExpectationResult:
+        ...
+
 
 @dataclass
 class ProjectExpectationBackend:
@@ -148,23 +151,51 @@ class ProjectExpectationBackend:
         if batched_connected.sample_indices.size == 0:
             return jnp.asarray(local_energies)
 
+        same_state_mask = np.all(
+            batched_connected.connected_states
+            == sample_array[batched_connected.sample_indices],
+            axis=1,
+        )
+        if np.any(same_state_mask):
+            diagonal_coefficients = batched_connected.coefficients[same_state_mask]
+            diagonal_sample_indices = batched_connected.sample_indices[same_state_mask]
+            local_energies += np.bincount(
+                diagonal_sample_indices,
+                weights=np.real(diagonal_coefficients),
+                minlength=sample_array.shape[0],
+            )
+            local_energies += 1j * np.bincount(
+                diagonal_sample_indices,
+                weights=np.imag(diagonal_coefficients),
+                minlength=sample_array.shape[0],
+            )
+
+        offdiagonal_mask = ~same_state_mask
+        if not np.any(offdiagonal_mask):
+            return jnp.asarray(local_energies)
+
+        offdiagonal_sample_indices = batched_connected.sample_indices[offdiagonal_mask]
+        offdiagonal_coefficients = batched_connected.coefficients[offdiagonal_mask]
         connected_log_values = np.asarray(
-            self.model.log_psi(params, jnp.asarray(batched_connected.connected_states, dtype=jnp.uint8)),
+            self.model.log_psi(
+                params,
+                jnp.asarray(batched_connected.connected_states[offdiagonal_mask], dtype=jnp.uint8),
+            ),
             dtype=np.complex128,
         ).reshape(-1)
-        weighted_contributions = batched_connected.coefficients * np.exp(
-            connected_log_values - original_log_values[batched_connected.sample_indices]
+        weighted_contributions = offdiagonal_coefficients * np.exp(
+            connected_log_values - original_log_values[offdiagonal_sample_indices]
         )
         # np.bincount gives a compact grouped sum from connected-state rows back
         # to the original sample index; it only accepts real weights, so the
         # complex accumulation is split into real and imaginary parts.
         local_energies += np.bincount(
-            batched_connected.sample_indices,
+            offdiagonal_sample_indices,
             weights=np.real(weighted_contributions),
             minlength=sample_array.shape[0],
         )
         local_energies += 1j * np.bincount(
-            batched_connected.sample_indices,
+            offdiagonal_sample_indices,
             weights=np.imag(weighted_contributions),
             minlength=sample_array.shape[0],
         )
@@ -175,6 +206,10 @@ class ProjectExpectationBackend:
         if self._all_states is not None:
             return ExpectationResult(mean=self._exact_expectation_mean(project_operator, self.params))
         sample_batch = self.sample_with_log_values()
+        return self.expect_on_sample_batch(project_operator, sample_batch)
+
+    def expect_on_sample_batch(self, operator: Any, sample_batch: SampleBatch) -> ExpectationResult:
+        project_operator = self._require_project_operator(operator)
         local_energies = self._local_energies(
             project_operator,
             self.params,

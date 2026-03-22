@@ -589,42 +589,167 @@ def history_table(history: list[dict[str, Any]]) -> pd.DataFrame:
     return frame
 
 
+def _independent_sample_batches_with_log_values(
+    variational_state: SupportsSamplingAndLogValue,
+    *,
+    n_independent_runs: int,
+) -> list[Any]:
+    if n_independent_runs <= 0:
+        raise ValueError("n_independent_runs must be positive.")
+    sampling_state = cast(Any, variational_state)
+    if hasattr(sampling_state, "independent_sample_with_log_values"):
+        return [
+            sampling_state.independent_sample_with_log_values(seed_offset=run_index)
+            for run_index in range(n_independent_runs)
+        ]
+    return [
+        np.asarray(variational_state.independent_sample(seed_offset=run_index), dtype=np.uint8)
+        for run_index in range(n_independent_runs)
+    ]
+
+
+def _renyi2_entropy_statistics_from_sample_batches(
+    variational_state: SupportsSamplingAndLogValue,
+    *,
+    subsystem: tuple[int, ...],
+    sample_batches: Sequence[Any],
+    cutoff: float = 1e-12,
+) -> dict[str, float]:
+    if not sample_batches:
+        raise ValueError("sample_batches must not be empty.")
+
+    estimates: list[float] = []
+    for sample_batch in sample_batches:
+        if hasattr(sample_batch, "states") and hasattr(sample_batch, "log_values"):
+            states = sample_batch.states
+            original_log_values = np.asarray(sample_batch.log_values, dtype=np.complex128)
+        else:
+            states = sample_batch
+            original_log_values = None
+        estimates.append(
+            observables._renyi2_entropy_from_samples(
+                variational_state.log_value,
+                np.asarray(states, dtype=np.uint8),
+                subsystem=subsystem,
+                cutoff=cutoff,
+                original_log_values=original_log_values,
+            )
+        )
+
+    estimate_array = np.asarray(estimates, dtype=np.float64)
+    return {
+        "mean": float(np.mean(estimate_array)),
+        "std": float(np.std(estimate_array, ddof=0)),
+        "n_repeats": float(len(estimates)),
+    }
+
+
+def _renyi2_entropy_scaling_from_sample_batch(
+    variational_state: SupportsSamplingAndLogValue,
+    *,
+    sample_batch: np.ndarray,
+    subsystem_limit: int,
+    original_log_values: np.ndarray | None = None,
+    cutoff: float = 1e-12,
+) -> list[float]:
+    flattened_samples = np.asarray(sample_batch, dtype=np.uint8).reshape(-1, sample_batch.shape[-1])
+    if flattened_samples.shape[0] < 2:
+        raise ValueError("at least two samples are required for the SWAP estimator.")
+
+    pair_count = flattened_samples.shape[0] // 2
+    paired_samples = flattened_samples[: 2 * pair_count].reshape(pair_count, 2, flattened_samples.shape[1])
+    original_left = paired_samples[:, 0, :]
+    original_right = paired_samples[:, 1, :]
+    if original_log_values is None:
+        original_log = np.asarray(
+            variational_state.log_value(flattened_samples),
+            dtype=np.complex128,
+        ).reshape(-1)
+    else:
+        original_log = np.asarray(original_log_values, dtype=np.complex128).reshape(-1)
+
+    swapped_batches: list[np.ndarray] = []
+    for subsystem_size in range(1, subsystem_limit + 1):
+        subsystem_sites = np.arange(subsystem_size, dtype=np.intp)
+        swapped_left = original_left.copy()
+        swapped_right = original_right.copy()
+        swapped_left[:, subsystem_sites] = original_right[:, subsystem_sites]
+        swapped_right[:, subsystem_sites] = original_left[:, subsystem_sites]
+        swapped_batches.append(np.concatenate([swapped_left, swapped_right], axis=0))
+
+    swapped_log_values = np.asarray(
+        variational_state.log_value(np.concatenate(swapped_batches, axis=0)),
+        dtype=np.complex128,
+    ).reshape(subsystem_limit, 2 * pair_count)
+    left_log = original_log[0 : 2 * pair_count : 2]
+    right_log = original_log[1 : 2 * pair_count : 2]
+
+    entropies: list[float] = []
+    for subsystem_index in range(subsystem_limit):
+        swapped_log = swapped_log_values[subsystem_index]
+        swapped_left_log = swapped_log[:pair_count]
+        swapped_right_log = swapped_log[pair_count:]
+        estimator = np.exp(swapped_left_log + swapped_right_log - left_log - right_log)
+        swap_value = np.real_if_close(np.mean(estimator))
+        if np.iscomplexobj(swap_value):
+            if abs(np.imag(swap_value)) > cutoff:
+                raise ValueError(
+                    "SWAP expectation must be real-valued within tolerance to compute Renyi-2 entropy."
+                )
+            swap_real = float(np.real(swap_value))
+        else:
+            swap_real = float(swap_value)
+        if swap_real <= 0:
+            raise ValueError("SWAP expectation must be strictly positive to compute Renyi-2 entropy.")
+        entropies.append(float(-np.log(swap_real)))
+    return entropies
+
+
 def sampled_entropy_scaling_summary(
     variational_state: SupportsSamplingAndLogValue,
     n_sites: int,
     max_subsystem_size: int | None = None,
     n_independent_runs: int = 1,
+    sample_batches: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     if n_independent_runs <= 0:
         raise ValueError("n_independent_runs must be positive.")
+    if sample_batches is not None and len(sample_batches) < n_independent_runs:
+        raise ValueError("sample_batches must provide at least n_independent_runs entries.")
     subsystem_limit = max(1, n_sites // 2) if max_subsystem_size is None else max_subsystem_size
     run_tables: list[pd.DataFrame] = []
     sampling_state = cast(Any, variational_state)
     for run_index in range(n_independent_runs):
         original_log_values: np.ndarray | None = None
-        if hasattr(sampling_state, "independent_sample_with_log_values"):
+        if sample_batches is not None:
+            sample_with_values = sample_batches[run_index]
+            if hasattr(sample_with_values, "states") and hasattr(sample_with_values, "log_values"):
+                sample_batch = np.asarray(sample_with_values.states, dtype=np.uint8)
+                original_log_values = np.asarray(sample_with_values.log_values, dtype=np.complex128)
+            else:
+                sample_batch = np.asarray(sample_with_values, dtype=np.uint8)
+        elif hasattr(sampling_state, "independent_sample_with_log_values"):
             sample_with_values = sampling_state.independent_sample_with_log_values(seed_offset=run_index)
             sample_batch = np.asarray(sample_with_values.states, dtype=np.uint8)
             original_log_values = np.asarray(sample_with_values.log_values, dtype=np.complex128)
         else:
             sample_batch = np.asarray(variational_state.independent_sample(seed_offset=run_index))
+        try:
+            renyi2_by_size = _renyi2_entropy_scaling_from_sample_batch(
+                variational_state,
+                sample_batch=sample_batch,
+                subsystem_limit=subsystem_limit,
+                original_log_values=original_log_values,
+            )
+        except ValueError:
+            renyi2_by_size = [np.nan] * subsystem_limit
         entropy_rows: list[dict[str, Any]] = []
         for subsystem_size in range(1, subsystem_limit + 1):
-            subsystem = tuple(range(subsystem_size))
-            try:
-                renyi2 = observables._renyi2_entropy_from_samples(
-                    variational_state.log_value,
-                    sample_batch,
-                    subsystem=subsystem,
-                    original_log_values=original_log_values,
-                )
-            except ValueError:
-                renyi2 = np.nan
             entropy_rows.append(
                 {
                     "subsystem_size": subsystem_size,
                     "run_index": run_index,
-                    "renyi2": renyi2,
+                    "renyi2": renyi2_by_size[subsystem_size - 1],
                 }
             )
         run_tables.append(pd.DataFrame(entropy_rows))
@@ -695,18 +820,30 @@ def _sampled_final_observable_summary(
     *,
     entropy_n_independent_runs: int,
     observable_n_independent_runs: int = 3,
+    sample_batches: Sequence[Any] | None = None,
 ) -> dict[str, float]:
     if observable_n_independent_runs <= 0:
         raise ValueError("observable_n_independent_runs must be positive.")
+    if sample_batches is not None:
+        required_batches = max(observable_n_independent_runs, entropy_n_independent_runs)
+        if len(sample_batches) < required_batches:
+            raise ValueError("sample_batches must cover both observable and entropy runs.")
 
     abs_magnetization_values: list[float] = []
     nn_correlation_values: list[float] = []
     nn_edges = np.asarray(tuple(graph.iter_neighbor_pairs(1)), dtype=np.intp)
     for run_index in range(observable_n_independent_runs):
-        sample_batch = np.asarray(
-            variational_state.independent_sample(seed_offset=1_000 + run_index),
-            dtype=np.uint8,
-        )
+        if sample_batches is not None:
+            current_sample_batch = sample_batches[run_index]
+            if hasattr(current_sample_batch, "states"):
+                sample_batch = np.asarray(current_sample_batch.states, dtype=np.uint8)
+            else:
+                sample_batch = np.asarray(current_sample_batch, dtype=np.uint8)
+        else:
+            sample_batch = np.asarray(
+                variational_state.independent_sample(seed_offset=1_000 + run_index),
+                dtype=np.uint8,
+            )
         spins_pm1 = 2.0 * sample_batch.astype(np.float64) - 1.0
         per_sample_magnetization = np.mean(spins_pm1, axis=1)
         abs_magnetization_values.append(float(np.mean(np.abs(per_sample_magnetization))))
@@ -714,12 +851,19 @@ def _sampled_final_observable_summary(
 
     subsystem = half_subsystem(graph.n_nodes)
     try:
-        entropy_stats = observables.renyi2_entropy_statistics(
-            variational_state,
-            subsystem=subsystem,
-            n_repeats=entropy_n_independent_runs,
-            force_sampled=True,
-        )
+        if sample_batches is not None:
+            entropy_stats = _renyi2_entropy_statistics_from_sample_batches(
+                variational_state,
+                subsystem=subsystem,
+                sample_batches=sample_batches[:entropy_n_independent_runs],
+            )
+        else:
+            entropy_stats = observables.renyi2_entropy_statistics(
+                variational_state,
+                subsystem=subsystem,
+                n_repeats=entropy_n_independent_runs,
+                force_sampled=True,
+            )
         half_partition_renyi2 = float(entropy_stats["mean"])
         half_partition_renyi2_std = float(entropy_stats["std"])
         entropy_success = 1.0
@@ -1429,7 +1573,22 @@ def run_non_ed_vmc_benchmark(
             training_runtime_seconds = max(0.0, run_runtime_seconds - callback_runtime_seconds)
             history_df = history_table(history)
             postprocessing_start = perf_counter()
-            final_energy = float(np.asarray(variational_state.energy(system["operator"])))
+            observable_summary_runs = 3
+            shared_diagnostic_samples = _independent_sample_batches_with_log_values(
+                variational_state,
+                n_independent_runs=max(observable_summary_runs, entropy_n_independent_runs),
+            )
+            if hasattr(variational_state, "energy_on_sample_batch"):
+                final_energy = float(
+                    np.asarray(
+                        cast(Any, variational_state).energy_on_sample_batch(
+                            system["operator"],
+                            shared_diagnostic_samples[0],
+                        )
+                    )
+                )
+            else:
+                final_energy = float(np.asarray(variational_state.energy(system["operator"])))
             final_row: dict[str, Any] = {
                 column: np.nan
                 for column in history_df.columns
@@ -1462,6 +1621,7 @@ def run_non_ed_vmc_benchmark(
                 hilbert.size,
                 max_subsystem_size=max_entropy_subsystem_size,
                 n_independent_runs=entropy_n_independent_runs,
+                sample_batches=shared_diagnostic_samples[:entropy_n_independent_runs],
             )
             entropy_scan_runtime_seconds = perf_counter() - entropy_scan_start
             entropy_table = entropy_scan["entropy_table"].copy()
@@ -1479,6 +1639,8 @@ def run_non_ed_vmc_benchmark(
                 variational_state,
                 system["graph"],
                 entropy_n_independent_runs=entropy_n_independent_runs,
+                observable_n_independent_runs=observable_summary_runs,
+                sample_batches=shared_diagnostic_samples,
             )
             postprocessing_runtime_seconds = max(
                 0.0,

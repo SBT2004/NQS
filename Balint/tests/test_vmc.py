@@ -170,6 +170,43 @@ class VMCTests(unittest.TestCase):
 
         np.testing.assert_allclose(actual, expected)
 
+    def test_bitmap_local_energies_skips_diagonal_connected_log_psi_queries(self) -> None:
+        hilbert = SpinHilbert(4)
+        model = RBM(alpha=1)
+        params = model.init(jax.random.PRNGKey(0), hilbert)
+        backend = ProjectExpectationBackend(
+            model=model,
+            sampler=self._make_sampler(hilbert, seed=16),
+            params=params,
+            exact_backend_max_states=0,
+        )
+        operator = _chain_tfim_operator(hilbert, h=1.0)
+        samples = np.array(
+            [
+                [0, 0, 0, 0],
+                [0, 0, 0, 0],
+                [1, 0, 1, 0],
+            ],
+            dtype=np.uint8,
+        )
+        batched_connected = operator.connected_elements_batched(samples)
+
+        with mock.patch.object(model, "log_psi", wraps=model.log_psi) as log_psi:
+            backend._local_energies(operator, params, jax.numpy.asarray(samples, dtype=jax.numpy.uint8))
+
+        self.assertEqual(log_psi.call_count, 2)
+        original_query_states = np.asarray(log_psi.call_args_list[0].args[1])
+        connected_query_states = np.asarray(log_psi.call_args_list[1].args[1])
+        diagonal_mask = np.all(
+            batched_connected.connected_states == samples[batched_connected.sample_indices],
+            axis=1,
+        )
+        self.assertEqual(original_query_states.shape[0], samples.shape[0])
+        self.assertEqual(
+            connected_query_states.shape[0],
+            int(np.count_nonzero(~diagonal_mask)),
+        )
+
     def test_sampled_expect_and_grad_matches_reference_fixed_sample_estimator(self) -> None:
         hilbert = SpinHilbert(4)
         model = RBM(alpha=1)
@@ -220,6 +257,36 @@ class VMCTests(unittest.TestCase):
         self.assertEqual(len(actual_leaves), len(expected_leaves))
         for expected_leaf, actual_leaf in zip(expected_leaves, actual_leaves):
             np.testing.assert_allclose(np.asarray(actual_leaf), np.asarray(expected_leaf))
+
+    def test_expect_on_sample_batch_matches_reference_fixed_sample_energy(self) -> None:
+        hilbert = SpinHilbert(4)
+        model = RBM(alpha=1)
+        params = model.init(jax.random.PRNGKey(0), hilbert)
+        backend = ProjectExpectationBackend(
+            model=model,
+            sampler=self._make_sampler(hilbert, seed=18),
+            params=params,
+            exact_backend_max_states=0,
+        )
+        operator = _chain_tfim_operator(hilbert, h=1.0)
+        samples = np.array(
+            [
+                [0, 0, 0, 0],
+                [1, 0, 1, 0],
+                [1, 1, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=np.uint8,
+        )
+        sample_batch = SampleBatch(
+            states=jax.numpy.asarray(samples, dtype=jax.numpy.uint8),
+            log_values=jax.numpy.asarray(model.log_psi(params, samples)),
+        )
+
+        actual = backend.expect_on_sample_batch(operator, sample_batch)
+        expected = np.mean(_reference_local_energies(operator, model, params, samples))
+
+        np.testing.assert_allclose(np.asarray(actual.mean), expected)
 
     def test_sampler_sample_with_params_matches_sample_contract_across_architectures(self) -> None:
         for label, model, hilbert in self._architecture_cases():

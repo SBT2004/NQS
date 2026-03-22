@@ -202,6 +202,52 @@ class NotebookWorkflowTests(unittest.TestCase):
         self.assertEqual(state.calls, [0, 1])
         self.assertAlmostEqual(float(summary["entropy_table"]["renyi2"].iloc[0]), np.log(2.0))
 
+    def test_sampled_entropy_scaling_summary_uses_provided_sample_batches_without_resampling(self) -> None:
+        controlled_samples = np.array(
+            [
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [1, 1],
+            ],
+            dtype=np.uint8,
+        )
+        provided_batches = [
+            SampleBatch(
+                states=jax.numpy.asarray(controlled_samples),
+                log_values=jax.numpy.asarray(_bell_log_amplitude(controlled_samples)),
+            )
+            for _ in range(2)
+        ]
+
+        class FakeState:
+            def sample(self) -> np.ndarray:
+                raise AssertionError("provided sample batches should bypass sample")
+
+            def independent_sample(self, seed_offset: int = 0) -> np.ndarray:
+                raise AssertionError("provided sample batches should bypass independent_sample")
+
+            def independent_sample_with_log_values(self, seed_offset: int = 0) -> SampleBatch:
+                raise AssertionError("provided sample batches should bypass independent_sample_with_log_values")
+
+            def log_value(self, states: np.ndarray) -> np.ndarray:
+                sample_array = np.asarray(states, dtype=np.uint8)
+                if np.array_equal(sample_array, controlled_samples):
+                    raise AssertionError("provided original log values should be reused for original samples")
+                return _bell_log_amplitude(sample_array)
+
+            def exact_statevector(self) -> np.ndarray:
+                return np.array([1.0 / np.sqrt(2.0), 0.0, 0.0, 1.0 / np.sqrt(2.0)], dtype=np.complex128)
+
+        summary = sampled_entropy_scaling_summary(
+            FakeState(),
+            n_sites=2,
+            n_independent_runs=2,
+            sample_batches=provided_batches,
+        )
+
+        self.assertAlmostEqual(float(summary["entropy_table"]["renyi2"].iloc[0]), np.log(2.0))
+
     def test_tfim_helpers_return_notebook_ready_configurations(self) -> None:
         config = tfim_config(lattice_shape=(4, 1), h=1.0, pbc=False)
         sweep_points = tfim_proxy_sweep_points([4, 6], h=1.0, pbc=False)
