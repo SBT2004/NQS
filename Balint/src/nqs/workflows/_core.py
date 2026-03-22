@@ -1006,6 +1006,7 @@ def run_non_ed_vmc_benchmark(
                 model_name=model_name,
                 model_kwargs=model_kwargs,
                 lattice_shape=lattice_shape,
+                exact_backend_max_states=0,
             )
             parameter_count = _count_model_parameters(variational_state.parameters)
             callback_runtime_seconds = 0.0
@@ -1021,14 +1022,15 @@ def run_non_ed_vmc_benchmark(
                 callback_runtime_seconds += perf_counter() - callback_start
                 return result
 
-            start = perf_counter()
+            benchmark_start = perf_counter()
+            run_start = perf_counter()
             history = vmc_driver.run(
                 n_iter,
                 callback=benchmark_callback,
                 callback_every=callback_every,
             )
-            total_runtime_seconds = perf_counter() - start
-            runtime_seconds = max(0.0, total_runtime_seconds - callback_runtime_seconds)
+            run_runtime_seconds = perf_counter() - run_start
+            runtime_seconds = max(0.0, run_runtime_seconds - callback_runtime_seconds)
             history_df = history_table(history)
             final_energy = float(np.asarray(variational_state.energy(system["operator"])))
             final_row: dict[str, Any] = {
@@ -1079,6 +1081,7 @@ def run_non_ed_vmc_benchmark(
                 system["graph"],
                 entropy_n_independent_runs=entropy_n_independent_runs,
             )
+            total_runtime_seconds = perf_counter() - benchmark_start
 
             summary_rows.append(
                 {

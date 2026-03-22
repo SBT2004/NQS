@@ -265,12 +265,17 @@ class NotebookWorkflowTests(unittest.TestCase):
         self.assertTrue((summary["valid_entropy_points"] >= 0).all())
         self.assertTrue((summary["valid_entropy_points"] <= 2).all())
         self.assertTrue((summary["total_runtime_seconds"] >= summary["runtime_seconds"]).all())
-        self.assertTrue((summary["energy_drop"] >= 0.0).all())
         history = result["training_history_table"]
         post_update_rows = history.loc[history["is_post_update"]]
         self.assertEqual(post_update_rows["step"].tolist(), [2])
         self.assertTrue(np.isclose(post_update_rows["energy"].iloc[0], summary["final_energy"].iloc[0]))
         self.assertTrue(np.isclose(summary["best_energy"].iloc[0], np.min(history["energy"])))
+        self.assertTrue(
+            np.isclose(
+                summary["energy_drop"].iloc[0],
+                history["energy"].iloc[0] - summary["final_energy"].iloc[0],
+            )
+        )
 
     def test_run_ghz_bonus_workflow_returns_training_outputs(self) -> None:
         result = run_ghz_bonus_workflow(

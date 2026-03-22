@@ -41,6 +41,7 @@ def build_variational_state(
     n_discard_per_chain: int,
     n_chains: int,
     params: Any | None = None,
+    exact_backend_max_states: int = 4096,
 ) -> VariationalState:
     model_params = params if params is not None else model.init(jax.random.PRNGKey(seed), hilbert)
     sampler = MetropolisLocal(
@@ -50,7 +51,12 @@ def build_variational_state(
         n_chains=n_chains,
         seed=seed,
     )
-    return VariationalState(model=model, params=model_params, sampler=sampler)
+    return VariationalState(
+        model=model,
+        params=model_params,
+        sampler=sampler,
+        exact_backend_max_states=exact_backend_max_states,
+    )
 
 
 def build_vmc_driver(
@@ -64,6 +70,7 @@ def build_vmc_driver(
     n_discard_per_chain: int,
     n_chains: int,
     params: Any | None = None,
+    exact_backend_max_states: int = 4096,
 ) -> tuple[VariationalState, VMC]:
     state = build_variational_state(
         model=model,
@@ -73,6 +80,7 @@ def build_vmc_driver(
         n_discard_per_chain=n_discard_per_chain,
         n_chains=n_chains,
         params=params,
+        exact_backend_max_states=exact_backend_max_states,
     )
     driver = VMC(
         operator=operator,
@@ -96,6 +104,7 @@ def build_vmc_experiment(
     model_name: str | None = None,
     model_kwargs: Mapping[str, Any] | None = None,
     lattice_shape: tuple[int, int] | None = None,
+    exact_backend_max_states: int = 4096,
 ) -> tuple[Any, VariationalState, VMC]:
     experiment_model = model
     if experiment_model is None:
@@ -117,5 +126,6 @@ def build_vmc_experiment(
         n_discard_per_chain=n_discard_per_chain,
         n_chains=n_chains,
         params=params,
+        exact_backend_max_states=exact_backend_max_states,
     )
     return experiment_model, state, driver

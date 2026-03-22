@@ -1,118 +1,159 @@
-## T001 - Finalize `demos/exercise_1.ipynb` as a report-quality Problem 1 submission
+## T001 - Replace dense ED with a sparse ground-state solver
 
 ### Goal
-Make `demos/exercise_1.ipynb` fully satisfy Problem 1 of the exam brief as a polished, professor-facing report section that showcases the backend cleanly without expanding scope beyond small exact benchmarks and tiny justified additions.
+Replace the current dense exact-diagonalization path with a sparse, ground-state-focused implementation that never builds a dense Hamiltonian in the main ED flow.
 
 ### Scope
-- keep the notebook centered on exact diagonalization, subsystem partitions, and exact entanglement probes
-- keep the benchmark model as the 1D TFIM with open boundaries, small enough for clean exact results
-- extend the current comparison from two TFIM points to three:
-  - ferromagnetic `g = 0.5`
-  - critical `g = 1.0`
-  - paramagnetic `g = 1.5`
-- preserve the current shared helpers where possible instead of introducing notebook-specific infrastructure
-- keep the notebook suitable for direct inclusion in a scientific report
+- focus on `src/nqs/exact_diag.py` and the operator-side support it needs
+- optimize for ground-state energy and ground-state vector only
+- use sparse matrices and iterative Hermitian eigensolvers
+- do not introduce symmetry sectors, momentum blocks, or any other symmetry reduction
+- keep any dense Hamiltonian utilities separate from the production ED path
 
 ### Required changes
-- add the ferromagnetic TFIM case at `g = 0.5` to all Exercise 1 comparisons and outputs
-- replace internal-facing regime labels with report-quality labels in visible tables, figures, and prose
-- expand `1/a` so it explicitly explains:
-  - the spin-1/2 exact-diagonalization basis
-  - the Hilbert-space size
-  - how product states map to basis indices
-  - what the `A|B` partition means for reshaping the statevector
-- expand `1/b` so it explicitly answers:
-  - what the eigenvalues of `rho_A` mean in Schmidt / MPS language
-  - what entanglement scaling is expected as `|A|` changes
-  - whether von Neumann entropy can be evaluated efficiently from a neural quantum state, and why not in general
-- expand `1/c` so it includes:
-  - the extremal purity limits
-  - a formal derivation of the SWAP identity
-  - a plain-language explanation of what the SWAP estimator checks
-  - the `alpha > 2` replica generalization
-  - why direct access to full `rho_A` or all of its eigenvalues is problematic for NQS
-- sharpen `1/d` so it directly distinguishes:
-  - area law
-  - volume law
-  - long-range entanglement
-  - the different sensitivity of `S1` and `S2` to small Schmidt values
-- add caption-style interpretation text after each visible table and figure
-- add a short final conclusions cell that answers the exam prompts directly in polished prose
-- fix broken LaTeX / control-character issues in markdown cells so all equations render correctly
-- remove dev-oriented phrasing that reads like internal notes rather than report text
-- keep exports limited to clean, relevant report artifacts
+- add a project-owned sparse Hamiltonian construction path for `nqs.operator.Operator`
+- assemble the Hamiltonian as a SciPy sparse Hermitian matrix, preferably CSR after COO-style accumulation
+- implement the main ED solver with a sparse Hermitian eigensolver such as `scipy.sparse.linalg.eigsh`
+- return only the lowest eigenpair on the main ED path
+- remove dense-matrix construction from the default ED implementation
+- keep any dense matrix helper explicitly demo/debug-only rather than part of the main solver path
+- ensure the returned ground-state vector remains suitable for downstream exact observables such as reduced density matrices and von Neumann entropy
 
 ### Success criteria
-- each subproblem `1/a` through `1/d` contains both numerical evidence and a direct prose answer
-- the notebook compares ferromagnetic, critical, and paramagnetic TFIM regimes on the same footing
-- all markdown renders correctly in notebook form and in exported report material
-- the notebook reads as a polished report section rather than an exploratory analysis notebook
-- the resulting code path remains compact, backend-driven, and clearly within exam scope
+- the main ED path no longer allocates a dense Hamiltonian
+- exact ground-state energy and ground-state vector remain available through the project-owned ED API
+- small-system ground-state energies match the current dense or reference results within numerical tolerance
+- the ED path scales past the current dense-memory failure mode without relying on symmetries
 
 ### Status
-Completed.
+Not complete.
 
 Verification notes:
-- Verified against the current repo state: `demos/exercise_1.ipynb` now covers all four subproblems with direct prose answers plus numerical tables/figures, compares the ferromagnetic (`g = 0.5`), critical (`g = 1.0`), and paramagnetic (`g = 1.5`) TFIM points on the same footing, includes caption-style interpretation text after each visible output, and ends with a polished conclusions cell.
-- Verified the current notebook text for the required report-facing content: `1/a` explains the spin-1/2 basis, Hilbert-space size, basis-index mapping, and the `A|B` reshape; `1/b` explains Schmidt/MPS meaning, expected scaling, and why exact von Neumann entropy is not generally efficient for NQS; `1/c` covers purity limits, the SWAP derivation, the estimator interpretation, the replica generalization, and why reconstructing full `rho_A` is problematic; `1/d` distinguishes area law, volume law, long-range entanglement, and the different sensitivity of `S_1` versus `S_2`.
-- Verified the available automated checks for this surface: `pytest tests/test_observables.py tests/test_notebook_workflows.py tests/test_notebook_surface.py`, `ruff check src/nqs/observables.py src/nqs/workflows/__init__.py src/nqs/workflows/_core.py tests/test_observables.py tests/test_notebook_workflows.py tests/test_notebook_surface.py`, and `pyright src/nqs/observables.py src/nqs/workflows/__init__.py src/nqs/workflows/_core.py` all pass.
+- The current repo state still uses dense ED in `src/nqs/exact_diag.py`: `operator_matrix(...)` allocates a full dense Hamiltonian and `exact_ground_state(...)` calls `np.linalg.eigh(...)`.
+- No project-owned sparse Hamiltonian construction path or `eigsh`-based ground-state solver is present yet.
 
 
-## T002 - Keep Exercise 1 backend support minimal, reusable, and demonstrative
+## T002 - Decouple exact expectations from dense Hamiltonian materialization
 
 ### Goal
-Support the Exercise 1 notebook with only tiny, justified backend-facing improvements so the final result showcases the project architecture without drifting into refactoring for its own sake.
+Stop using dense Hamiltonian materialization for exact small-system expectation values so the exact expectation backend no longer shares the same memory bottleneck as dense ED.
 
 ### Scope
-- prefer reusing existing helpers in `src/nqs/observables.py` and `src/nqs/workflows/_core.py`
-- allow only small helper additions if they remove obvious repetition or improve report-facing clarity
-- avoid broad abstractions, notebook-specific machinery, or speculative cleanup outside Exercise 1 needs
+- focus on `src/nqs/expectation.py`
+- keep the current exact statevector logic where it is still appropriate
+- replace only the dense operator application path
+- do not change the sampled expectation path
 
 ### Required changes
-- check whether any repeated Exercise 1 notebook logic should be moved into a tiny shared helper
-- keep helper additions narrow and directly tied to Problem 1 deliverables
-- ensure notebook code demonstrates the backend through clean use of shared APIs rather than verbose inline logic
-- avoid introducing new architecture that is not needed for the final report-quality notebook
+- remove the dependency on dense `operator_matrix(...)` from the exact expectation branch
+- compute exact energies via sparse operator application to a dense statevector
+- preserve the current exact/sampled backend selection behavior
+- keep the exact expectation result numerically consistent with the previous implementation on small systems
 
 ### Success criteria
-- Exercise 1 notebook code stays concise and readable
-- backend capabilities are visible through usage, not through excessive explanation
-- any helper changes are minimal, justified, and directly useful to Exercise 1
-- no broad refactor is introduced under the cover of notebook cleanup
+- exact expectation evaluation no longer builds a dense Hamiltonian
+- exact energy values agree with the previous small-system implementation within tolerance
+- the exact expectation backend remains compatible with the current variational-state and driver code
 
 ### Status
-Completed.
+Not complete.
 
 Verification notes:
-- Verified against the current repo state: the Exercise 1 backend support is limited to small, reusable additions in `src/nqs/observables.py`, `src/nqs/workflows/_core.py`, and `src/nqs/workflows/__init__.py`, with the notebook using shared APIs such as `build_system`, `exact_observables_summary`, `half_subsystem`, `entanglement_spectrum`, `reduced_density_matrix`, and entropy helpers instead of embedding one-off report logic inline.
-- Verified the helper scope remains narrow and Exercise-1-driven: the added workflow helpers expose exact-observable summaries and entropy-scan/report utilities without introducing a parallel architecture or notebook-specific subsystem beyond lightweight report support.
-- Verified the available automated checks for the touched backend surface: `pytest tests/test_observables.py tests/test_notebook_workflows.py tests/test_notebook_surface.py`, `ruff check src/nqs/observables.py src/nqs/workflows/__init__.py src/nqs/workflows/_core.py tests/test_observables.py tests/test_notebook_workflows.py tests/test_notebook_surface.py`, and `pyright src/nqs/observables.py src/nqs/workflows/__init__.py src/nqs/workflows/_core.py` all pass.
+- The exact expectation branch in `src/nqs/expectation.py` still calls `operator_matrix(...)` and multiplies by a dense Hamiltonian inside `_exact_expectation_mean(...)`.
+- The sampled expectation path is separate, but the exact path has not been migrated to sparse operator application.
 
 
-## T003 - Clean and normalize Exercise 1 report artifacts
+## T003 - Split production ED APIs from dense demo/debug helpers
 
 ### Goal
-Make the Exercise 1 output set consistent, report-ready, and easy to inspect.
+Make the exact-diagonalization API sparse-first and ground-state-focused, while isolating any dense matrix helpers as explicit demo/debug utilities rather than part of the production runtime path.
 
 ### Scope
-- focus only on `demos/report_outputs/exercise_1`
-- keep artifact names, labels, and contents aligned with the final notebook narrative
-- remove stale, misleading, or unrelated Exercise 1 artifacts
+- focus on the public-facing ED helpers and their immediate callers
+- preserve support for dense-statevector-based exact observables
+- do not keep full-spectrum dense return data on the main ED path
+- limit dense helpers to explicit demo/debug use
 
 ### Required changes
-- audit the current Exercise 1 output directory for stale or unrelated files
-- ensure exported filenames match the final terminology used in the notebook
-- keep only report-relevant tables and figures
-- ensure the final output set corresponds to the final three-regime comparison and polished report structure
+- redefine the main ED result contract around `ground_energy` and `ground_state`
+- remove assumptions that the main ED API returns a dense Hamiltonian or full eigenvalue list
+- update project-owned callers to consume the sparse-first ground-state result shape
+- keep any dense helper naming and placement explicit enough that it is not confused with the production ED path
 
 ### Success criteria
-- the Exercise 1 output directory contains only artifacts that support the final notebook
-- artifact names are consistent with the notebook’s visible terminology
-- no stale training-related or mismatched files remain associated with Exercise 1
-- a reviewer can inspect the output directory and immediately understand what belongs to the final report
- 
+- the main ED API no longer implies dense Hamiltonian ownership
+- downstream workflows continue to work with the sparse-first result shape
+- dense helpers, if retained, are clearly separated from the production ED path
+
 ### Status
-Completed.
+Not complete.
 
 Verification notes:
-- Verified against the current repo state: `demos/report_outputs/exercise_1` now contains only the five final report artifacts (`exercise_1_exact_summary`, `exercise_1_entanglement_spectrum`, `exercise_1_swap_identity`, `exercise_1_scaling_summary`, `exercise_1_entropy_scaling`), and the notebook export cell uses the same report-facing names.
+- The production ED API is still dense-oriented: `ExactDiagResult` includes `matrix` and `eigenvalues`, and `exact_ground_state(...)` returns both.
+- Dense helpers have not been separated from the main ED runtime path yet.
+
+
+## T004 - Preserve exact-observable workflows on top of sparse ED ground states
+
+### Goal
+Keep exact report and analysis workflows working after the sparse ED refactor by ensuring they consume the sparse-solver ground-state vector rather than any dense Hamiltonian artifacts.
+
+### Scope
+- focus on exact-observable and workflow code that depends on `exact_ground_state(...)`
+- preserve current reduced-density-matrix, entropy, and entanglement-spectrum behavior
+- do not expand scope into new observables or new physics functionality
+
+### Required changes
+- update exact workflow helpers to rely only on `ground_energy` and `ground_state`
+- preserve reduced density matrix, von Neumann entropy, Renyi-from-statevector, and entanglement spectrum calculations
+- confirm no workflow still depends on dense ED outputs such as full matrices or full spectra
+- keep notebook-facing exact benchmark helpers report-friendly after the refactor
+
+### Success criteria
+- exact-observable workflows continue to produce the same report-facing results on small systems
+- downstream exact entropy calculations still operate from the returned dense ground-state vector
+- no production exact workflow path depends on dense Hamiltonian materialization
+
+### Status
+Not complete.
+
+Verification notes:
+- The exact-observable workflows still rely on the current dense ED result shape because the sparse ground-state API refactor has not happened yet.
+- Reduced-density-matrix and entropy code still works on the returned dense statevector, but no workflow migration to a sparse-first ED contract has been implemented.
+
+
+## T005 - Add verification and microbenchmarks for sparse ED performance and correctness
+
+### Goal
+Add focused verification and benchmark coverage that proves the sparse ED refactor is correct and removes the dominant dense-memory bottleneck.
+
+### Scope
+- focus on tests and microbenchmarks for ED, sparse operator assembly, and exact expectation evaluation
+- validate against small-system dense/reference results where comparison is feasible
+- avoid broad benchmarking outside the ED-related surfaces changed here
+
+### Required changes
+- add correctness tests comparing sparse ED ground energies against current dense or NetKet-backed references on small systems
+- add tests that compare sparse exact expectations against the previous dense expectation results on small systems
+- add tests that confirm exact observable outputs derived from the sparse ED ground-state vector remain correct
+- extend the core microbenchmarks to include sparse matrix assembly and sparse ground-state solve timings
+- include at least one benchmark or validation case that demonstrates the main ED path no longer performs dense Hamiltonian allocation
+- benchmark the open-chain TFIM Exercise 1 ED path incrementally at chain lengths `6, 8, 10, 12, 14, 16, 18, 20`, changing the code, running, increasing the size, and running again rather than implementing a full notebook sweep upfront
+- record per-size runtime and whether each run completes without memory or solver failure
+- use the 20-spin case as the practical optimization gate for the intended machine
+
+### Success criteria
+- sparse ED correctness is covered by automated tests
+- sparse exact expectation correctness is covered by automated tests
+- benchmark coverage distinguishes sparse assembly cost from sparse solve cost
+- verification provides evidence that the dense-memory bottleneck has been removed from the main ED path
+- the incremental Exercise 1 ED benchmark reaches the 20-spin open-chain TFIM case without memory or solver issues
+- the 20-spin Exercise 1 ED case completes in under one minute; if it does, the optimization is considered successful
+
+### Status
+Not complete.
+
+Verification notes:
+- Existing tests and microbenchmarks still target the dense ED path; `tests/test_core_microbenchmarks.py` benchmarks `exact_diag.operator_matrix` rather than sparse assembly or sparse ground-state solves.
+- The incremental `6, 8, 10, 12, 14, 16, 18, 20` Exercise 1 benchmark gate has not been implemented or verified, and there is no evidence yet that the 20-spin case completes under one minute without issues.
+
