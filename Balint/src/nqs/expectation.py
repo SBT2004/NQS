@@ -6,8 +6,9 @@ from typing import Any, Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import sparse as jsparse
 
-from .exact_diag import operator_matrix
+from .exact_diag import sparse_operator_matrix
 from .operator import Operator
 from .runtime_types import SupportsLogPsi
 from .sampler import MetropolisLocal
@@ -56,6 +57,8 @@ class ProjectExpectationBackend:
     params: ParamTree
     exact_backend_max_states: int = 4096
     _all_states: jax.Array | None = field(default=None, init=False, repr=False)
+    _exact_operator_cache_operator: Operator | None = field(default=None, init=False, repr=False)
+    _exact_operator_cache_value: jsparse.BCOO | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.sampler.hilbert.n_states <= self.exact_backend_max_states:
@@ -98,10 +101,17 @@ class ProjectExpectationBackend:
             )
         return operator
 
+    def _exact_sparse_operator(self, operator: Operator) -> jsparse.BCOO:
+        if self._exact_operator_cache_operator is not operator or self._exact_operator_cache_value is None:
+            self._exact_operator_cache_operator = operator
+            self._exact_operator_cache_value = jsparse.BCOO.from_scipy_sparse(
+                sparse_operator_matrix(operator)
+            )
+        return self._exact_operator_cache_value
+
     def _exact_expectation_mean(self, operator: Operator, params: ParamTree) -> jax.Array:
-        dense_matrix = jnp.asarray(operator_matrix(operator), dtype=_jax_complex_dtype())
         psi = self._exact_statevector_for_params(params)
-        return jnp.vdot(psi, dense_matrix @ psi)
+        return jnp.vdot(psi, self._exact_sparse_operator(operator) @ psi)
 
     def _local_energies(
         self,

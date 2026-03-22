@@ -3,6 +3,7 @@ import unittest
 import warnings
 from pathlib import Path
 from typing import cast
+from unittest import mock
 
 import jax
 import numpy as np
@@ -10,8 +11,9 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from nqs.driver import VMC
+import nqs.expectation as expectation_module
 from nqs.expectation import ProjectExpectationBackend
-from nqs.exact_diag import exact_ground_state_energy
+from nqs.exact_diag import exact_ground_state_energy, operator_matrix, sparse_operator_matrix
 from nqs.graph import Chain1D, SquareLattice
 from nqs.hilbert import SpinHilbert
 from nqs.loss import energy_loss
@@ -242,6 +244,30 @@ class VMCTests(unittest.TestCase):
         self.assertFalse(
             any("Explicitly requested dtype <class 'jax.numpy.complex128'>" in str(warning.message) for warning in caught)
         )
+
+    def test_exact_backend_expectation_matches_dense_reference_without_dense_runtime_path(self) -> None:
+        hilbert = SpinHilbert(4)
+        operator = _chain_tfim_operator(hilbert, h=1.0)
+        model = RBM(alpha=1)
+        params = model.init(jax.random.PRNGKey(0), hilbert)
+        backend = ProjectExpectationBackend(
+            model=model,
+            sampler=self._make_sampler(hilbert, seed=13),
+            params=params,
+        )
+
+        psi = np.asarray(backend.exact_statevector(), dtype=np.complex128)
+        expected = np.vdot(psi, operator_matrix(operator) @ psi)
+
+        with mock.patch.object(
+            expectation_module,
+            "sparse_operator_matrix",
+            wraps=sparse_operator_matrix,
+        ) as sparse_builder:
+            actual = np.asarray(backend.expect(operator).mean)
+
+        np.testing.assert_allclose(actual, expected)
+        self.assertGreaterEqual(sparse_builder.call_count, 1)
 
     def test_j1j2_architectures_match_ed_with_phase_capable_ansatze(self) -> None:
         hilbert = SpinHilbert(4)
