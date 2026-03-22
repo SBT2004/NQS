@@ -16,6 +16,7 @@ from nqs.workflows import (  # noqa: E402
     build_system,
     exact_observables_summary,
     history_table,
+    initialize_random_parameters,
     run_architecture_benchmark,
     run_architecture_comparison,
     run_ghz_bonus_workflow,
@@ -24,6 +25,7 @@ from nqs.workflows import (  # noqa: E402
     run_non_ed_vmc_benchmark,
     run_random_architecture_study,
     run_vmc_experiment,
+    sampler_acceptance_diagnostics,
     sampled_entropy_scaling_summary,
     tfim_config,
     tfim_proxy_sweep_points,
@@ -31,6 +33,7 @@ from nqs.workflows import (  # noqa: E402
 import nqs.observables as observables  # noqa: E402
 from nqs.exact_diag_debug import dense_debug_operator_matrix  # noqa: E402
 from nqs.sampler import SampleBatch  # noqa: E402
+from nqs.vmc_setup import build_model, build_variational_state  # noqa: E402
 
 
 def _bell_log_amplitude(states: np.ndarray) -> np.ndarray:
@@ -363,6 +366,99 @@ class NotebookWorkflowTests(unittest.TestCase):
         )
         self.assertTrue(np.isfinite(result["entropy_scan_table"]["exact_renyi2"]).all())
         self.assertTrue(np.isfinite(result["entropy_scan_table"]["sampled_renyi2"]).all())
+
+    def test_run_random_architecture_study_supports_labeled_init_variants_without_exact_backend(self) -> None:
+        result = run_random_architecture_study(
+            architecture_configs={
+                "rbm_default": {
+                    "model_name": "RBM",
+                    "model_kwargs": {"alpha": 1},
+                },
+                "rbm_real_scaled": {
+                    "model_name": "RBM",
+                    "model_kwargs": {"alpha": 1},
+                    "initialization": {
+                        "parameter_scale": 0.25,
+                        "phase_scale": 0.0,
+                        "label": "scale=0.25, real-amplitude",
+                    },
+                },
+            },
+            seeds=(0,),
+            lattice_shape=(4, 4),
+            hamiltonian="tfim",
+            pbc=False,
+            h=2.5,
+            n_samples=32,
+            n_discard_per_chain=2,
+            n_chains=4,
+            entropy_n_independent_runs=1,
+        )
+
+        summary = result["summary_table"]
+        self.assertEqual(summary["model"].tolist(), ["rbm_default", "rbm_real_scaled"])
+        self.assertEqual(summary["architecture_family"].tolist(), ["RBM", "RBM"])
+        self.assertEqual(summary["exact_available"].tolist(), [False, False])
+        self.assertTrue(np.isnan(summary["half_partition_exact_renyi2"]).all())
+        self.assertEqual(summary["initialization_label"].tolist(), ["default", "scale=0.25, real-amplitude"])
+        self.assertTrue((summary["valid_entropy_points"] >= 0).all())
+        self.assertTrue((summary["valid_entropy_fraction"] >= 0.0).all())
+        self.assertTrue((summary["valid_entropy_fraction"] <= 1.0).all())
+        self.assertEqual(
+            result["entropy_scan_table"]["initialization_label"].drop_duplicates().tolist(),
+            ["default", "scale=0.25, real-amplitude"],
+        )
+        self.assertIsNone(result["trial_results"][0]["exact_entropy_scan_table"])
+
+    def test_initialize_random_parameters_can_zero_phase_and_rescale(self) -> None:
+        system = build_system(lattice_shape=(2, 2), pbc=False, hamiltonian="tfim", h=1.0)
+        model = build_model(model_name="RBM", model_kwargs={"alpha": 1}, lattice_shape=(2, 2))
+
+        default_params = initialize_random_parameters(model, system["hilbert"], seed=0)
+        scaled_real_params = initialize_random_parameters(
+            model,
+            system["hilbert"],
+            seed=0,
+            parameter_scale=0.5,
+            phase_scale=0.0,
+        )
+
+        np.testing.assert_allclose(
+            np.asarray(scaled_real_params["visible_bias"]),
+            0.5 * np.asarray(default_params["visible_bias"]),
+        )
+        np.testing.assert_allclose(
+            np.asarray(scaled_real_params["phase_bias"]),
+            np.zeros_like(np.asarray(default_params["phase_bias"])),
+        )
+
+    def test_sampler_acceptance_diagnostics_reports_burn_in_and_sampling_phases(self) -> None:
+        system = build_system(lattice_shape=(2, 2), pbc=False, hamiltonian="tfim", h=1.0)
+        model = build_model(model_name="FFNN", model_kwargs={"hidden_dims": (4,)}, lattice_shape=(2, 2))
+        params = initialize_random_parameters(
+            model,
+            system["hilbert"],
+            seed=0,
+            phase_scale=0.0,
+        )
+        variational_state = build_variational_state(
+            model=model,
+            hilbert=system["hilbert"],
+            seed=0,
+            n_samples=8,
+            n_discard_per_chain=2,
+            n_chains=4,
+            params=params,
+        )
+
+        diagnostics = sampler_acceptance_diagnostics(variational_state)
+
+        self.assertEqual(diagnostics["summary_table"]["phase"].tolist(), ["burn_in", "sampling"])
+        self.assertTrue((diagnostics["summary_table"]["mean_acceptance"] >= 0.0).all())
+        self.assertTrue((diagnostics["summary_table"]["mean_acceptance"] <= 1.0).all())
+        self.assertIn("steps_per_chain", diagnostics["config_table"]["parameter"].tolist())
+        self.assertGreaterEqual(diagnostics["overall_acceptance"], 0.0)
+        self.assertLessEqual(diagnostics["overall_acceptance"], 1.0)
 
     def test_run_hamiltonian_system_size_sweep_tracks_training_entropy(self) -> None:
         result = run_hamiltonian_system_size_sweep(

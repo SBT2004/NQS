@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Sequence, cast
@@ -16,6 +17,7 @@ from ..exact_diag import exact_ground_state, solve_sparse_ground_state, sparse_o
 from ..graph import SquareLattice
 from ..hilbert import SpinHilbert
 from ..operator import j1_j2, tfim
+from ..sampler import MetropolisLocal, _metropolis_step
 from ..vmc_setup import build_model, build_variational_state, build_vmc_experiment
 
 if TYPE_CHECKING:
@@ -1021,29 +1023,209 @@ def _count_model_parameters(params: Any) -> int:
     return int(sum(np.asarray(leaf).size for leaf in jax.tree_util.tree_leaves(params)))
 
 
-def _zero_phase_parameters(params: Any) -> Any:
-    if isinstance(params, dict):
+def _scale_parameter_tree(tree: Any, factor: float) -> Any:
+    return jax.tree_util.tree_map(lambda leaf: jnp.asarray(leaf) * factor, tree)
+
+
+def _transform_initial_parameters(
+    params: Any,
+    *,
+    parameter_scale: float = 1.0,
+    phase_scale: float = 1.0,
+) -> Any:
+    if isinstance(params, Mapping):
         updated: dict[str, Any] = {}
         for key, value in params.items():
             lower_key = key.lower()
             if "phase" in lower_key:
-                updated[key] = jax.tree_util.tree_map(lambda leaf: jnp.zeros_like(leaf), value)
+                updated[key] = _scale_parameter_tree(value, float(parameter_scale) * float(phase_scale))
                 continue
             if key.startswith("Dense_") and isinstance(value, dict):
                 dense_update: dict[str, Any] = {}
                 for leaf_name, leaf in value.items():
                     leaf_array = jnp.asarray(leaf)
                     if leaf_name == "bias" and leaf_array.shape == (2,):
-                        dense_update[leaf_name] = leaf_array.at[1].set(0)
+                        scaled_leaf = leaf_array * float(parameter_scale)
+                        dense_update[leaf_name] = scaled_leaf.at[1].set(
+                            leaf_array[1] * float(parameter_scale) * float(phase_scale)
+                        )
                     elif leaf_name == "kernel" and leaf_array.shape[-1] == 2:
-                        dense_update[leaf_name] = leaf_array.at[..., 1].set(0)
+                        scaled_leaf = leaf_array * float(parameter_scale)
+                        dense_update[leaf_name] = scaled_leaf.at[..., 1].set(
+                            leaf_array[..., 1] * float(parameter_scale) * float(phase_scale)
+                        )
                     else:
-                        dense_update[leaf_name] = _zero_phase_parameters(leaf)
+                        dense_update[leaf_name] = _transform_initial_parameters(
+                            leaf,
+                            parameter_scale=parameter_scale,
+                            phase_scale=phase_scale,
+                        )
                 updated[key] = dense_update
                 continue
-            updated[key] = _zero_phase_parameters(value)
+            updated[key] = _transform_initial_parameters(
+                value,
+                parameter_scale=parameter_scale,
+                phase_scale=phase_scale,
+            )
         return updated
-    return params
+    return jnp.asarray(params) * float(parameter_scale)
+
+
+def _zero_phase_parameters(params: Any) -> Any:
+    return _transform_initial_parameters(params, phase_scale=0.0)
+
+
+def initialize_random_parameters(
+    model: Any,
+    hilbert: SpinHilbert,
+    *,
+    seed: int,
+    parameter_scale: float = 1.0,
+    phase_scale: float = 1.0,
+) -> Any:
+    base_params = model.init(jax.random.PRNGKey(seed), hilbert)
+    return _transform_initial_parameters(
+        base_params,
+        parameter_scale=parameter_scale,
+        phase_scale=phase_scale,
+    )
+
+
+def _initialization_label(
+    *,
+    parameter_scale: float,
+    phase_scale: float,
+    explicit_label: str | None = None,
+) -> str:
+    if explicit_label is not None:
+        return explicit_label
+    labels: list[str] = []
+    if not np.isclose(parameter_scale, 1.0):
+        labels.append(f"scale={parameter_scale:g}")
+    if np.isclose(phase_scale, 0.0):
+        labels.append("real-amplitude")
+    elif not np.isclose(phase_scale, 1.0):
+        labels.append(f"phase_scale={phase_scale:g}")
+    if not labels:
+        return "default"
+    return ", ".join(labels)
+
+
+def _normalize_random_architecture_entry(
+    model_label: str,
+    config: Mapping[str, Any],
+    *,
+    real_amplitude_only: bool,
+) -> dict[str, Any]:
+    if "model_name" in config:
+        model_name = str(config["model_name"])
+        model_kwargs = dict(config.get("model_kwargs", {}))
+        init_config = dict(config.get("initialization", {}))
+        normalized_label = str(config.get("label", model_label))
+    else:
+        model_name = model_label
+        model_kwargs = dict(config)
+        init_config = {}
+        normalized_label = model_label
+
+    if bool(init_config.pop("real_amplitude_only", False)):
+        init_config.setdefault("phase_scale", 0.0)
+    if real_amplitude_only and "phase_scale" not in init_config:
+        init_config["phase_scale"] = 0.0
+
+    parameter_scale = float(init_config.get("parameter_scale", 1.0))
+    phase_scale = float(init_config.get("phase_scale", 1.0))
+    initialization_label = _initialization_label(
+        parameter_scale=parameter_scale,
+        phase_scale=phase_scale,
+        explicit_label=cast(str | None, init_config.get("label")),
+    )
+    return {
+        "model": normalized_label,
+        "architecture_family": model_name,
+        "model_kwargs": model_kwargs,
+        "parameter_scale": parameter_scale,
+        "phase_scale": phase_scale,
+        "initialization_label": initialization_label,
+    }
+
+
+def sampler_acceptance_diagnostics(
+    variational_state: SupportsSamplingAndLogValue,
+    *,
+    n_steps: int | None = None,
+    seed_offset: int = 0,
+) -> dict[str, Any]:
+    sampling_state = cast(Any, variational_state)
+    if not hasattr(sampling_state, "sampler") or not hasattr(sampling_state, "model") or not hasattr(
+        sampling_state,
+        "parameters",
+    ):
+        raise TypeError("variational_state must expose sampler, model, and parameters for diagnostics.")
+    sampler = sampling_state.sampler
+    if not isinstance(sampler, MetropolisLocal):
+        raise TypeError("sampler diagnostics require a MetropolisLocal sampler.")
+
+    total_steps = sampler.n_discard_per_chain + sampler._steps_per_chain() if n_steps is None else int(n_steps)
+    if total_steps <= 0:
+        raise ValueError("n_steps must be positive.")
+
+    rng_key = jax.random.PRNGKey(sampler.seed + seed_offset + 1)
+    init_key, step_key = jax.random.split(rng_key)
+    states = sampler._random_states(init_key)
+    log_values = jnp.asarray(sampling_state.model.log_psi(sampling_state.parameters, states))
+
+    rows: list[dict[str, Any]] = []
+    for step_index in range(total_steps):
+        previous_states = states
+        states, log_values, step_key = _metropolis_step(
+            sampling_state.model.log_psi,
+            sampling_state.parameters,
+            states=states,
+            log_values=log_values,
+            rng_key=step_key,
+            n_chains=sampler.n_chains,
+            n_sites=sampler.hilbert.size,
+        )
+        accepted = np.any(np.asarray(states) != np.asarray(previous_states), axis=1)
+        rows.append(
+            {
+                "step": step_index + 1,
+                "phase": "burn_in" if step_index < sampler.n_discard_per_chain else "sampling",
+                "acceptance_rate": float(np.mean(accepted)),
+            }
+        )
+
+    acceptance_table = pd.DataFrame(rows)
+    summary_table = cast(
+        pd.DataFrame,
+        cast(Any, acceptance_table)
+        .groupby("phase", as_index=False)
+        .agg(
+            steps=("step", "count"),
+            mean_acceptance=("acceptance_rate", "mean"),
+            min_acceptance=("acceptance_rate", "min"),
+            max_acceptance=("acceptance_rate", "max"),
+        )
+        .sort_values(by="phase")
+        .reset_index(drop=True),
+    )
+    config_table = pd.DataFrame(
+        [
+            {"parameter": "n_sites", "value": sampler.hilbert.size},
+            {"parameter": "n_chains", "value": sampler.n_chains},
+            {"parameter": "n_samples", "value": sampler.n_samples},
+            {"parameter": "n_discard_per_chain", "value": sampler.n_discard_per_chain},
+            {"parameter": "steps_per_chain", "value": sampler._steps_per_chain()},
+            {"parameter": "diagnostic_steps", "value": total_steps},
+        ]
+    )
+    return {
+        "config_table": config_table,
+        "acceptance_table": acceptance_table,
+        "summary_table": summary_table,
+        "overall_acceptance": float(acceptance_table["acceptance_rate"].mean()),
+    }
 
 
 def renyi2_subsystem_scan_summary(
@@ -1359,16 +1541,28 @@ def run_random_architecture_study(
     trial_rows: list[dict[str, Any]] = []
     entropy_scan_rows: list[pd.DataFrame] = []
     trial_results: list[dict[str, Any]] = []
-    for model_name, model_kwargs in architecture_configs.items():
+    for raw_model_label, raw_config in architecture_configs.items():
+        entry = _normalize_random_architecture_entry(
+            raw_model_label,
+            raw_config,
+            real_amplitude_only=real_amplitude_only,
+        )
+        model_name = str(entry["architecture_family"])
+        model_label = str(entry["model"])
+        model_kwargs = dict(cast(dict[str, Any], entry["model_kwargs"]))
         model = build_model(
             model_name=model_name,
             model_kwargs=model_kwargs,
             lattice_shape=lattice_shape,
         )
         for seed in seed_values:
-            params = model.init(jax.random.PRNGKey(seed), hilbert)
-            if real_amplitude_only:
-                params = _zero_phase_parameters(params)
+            params = initialize_random_parameters(
+                model,
+                hilbert,
+                seed=seed,
+                parameter_scale=float(entry["parameter_scale"]),
+                phase_scale=float(entry["phase_scale"]),
+            )
             variational_state = build_variational_state(
                 model=model,
                 hilbert=hilbert,
@@ -1378,13 +1572,19 @@ def run_random_architecture_study(
                 n_chains=n_chains,
                 params=params,
             )
-            exact_entropy_scan = renyi2_subsystem_scan_summary(
-                variational_state,
-                hilbert.size,
-                max_subsystem_size=subsystem_limit,
-                n_independent_runs=1,
-                force_sampled=False,
-            )
+            exact_entropy_scan: dict[str, Any] | None
+            try:
+                exact_entropy_scan = renyi2_subsystem_scan_summary(
+                    variational_state,
+                    hilbert.size,
+                    max_subsystem_size=subsystem_limit,
+                    n_independent_runs=1,
+                    force_sampled=False,
+                )
+                exact_available = True
+            except ValueError:
+                exact_entropy_scan = None
+                exact_available = False
             sampled_entropy_scan = sampled_entropy_scaling_summary(
                 variational_state,
                 hilbert.size,
@@ -1394,12 +1594,26 @@ def run_random_architecture_study(
             parameter_count = _count_model_parameters(variational_state.parameters)
 
             sampled_table = sampled_entropy_scan["entropy_table"].copy()
-            sampled_table["model"] = model_name
+            sampled_table["model"] = model_label
+            sampled_table["architecture_family"] = model_name
             sampled_table["seed"] = seed
             sampled_table["parameter_count"] = parameter_count
-            exact_table = exact_entropy_scan["entropy_table"].copy().rename(
-                columns={"renyi2": "exact_renyi2", "renyi2_std": "exact_renyi2_std"}
-            )
+            sampled_table["parameter_scale"] = float(entry["parameter_scale"])
+            sampled_table["phase_scale"] = float(entry["phase_scale"])
+            sampled_table["initialization_label"] = str(entry["initialization_label"])
+            sampled_table["exact_available"] = exact_available
+            if exact_entropy_scan is None:
+                exact_table = pd.DataFrame(
+                    {
+                        "subsystem_size": sampled_table["subsystem_size"].to_numpy(),
+                        "exact_renyi2": np.full(len(sampled_table), np.nan, dtype=np.float64),
+                        "exact_renyi2_std": np.full(len(sampled_table), np.nan, dtype=np.float64),
+                    }
+                )
+            else:
+                exact_table = exact_entropy_scan["entropy_table"].copy().rename(
+                    columns={"renyi2": "exact_renyi2", "renyi2_std": "exact_renyi2_std"}
+                )
             sampled_table = sampled_table.merge(
                 exact_table[["subsystem_size", "exact_renyi2", "exact_renyi2_std"]],
                 on="subsystem_size",
@@ -1409,12 +1623,20 @@ def run_random_architecture_study(
 
             max_partition = int(sampled_table["subsystem_size"].max())
             half_partition_row = sampled_table.loc[sampled_table["subsystem_size"] == max_partition].iloc[0]
+            valid_entropy_points = int(np.count_nonzero(np.isfinite(sampled_table["renyi2"])))
             trial_rows.append(
                 {
-                    "model": model_name,
+                    "model": model_label,
+                    "architecture_family": model_name,
                     "seed": seed,
                     "parameter_count": parameter_count,
+                    "parameter_scale": float(entry["parameter_scale"]),
+                    "phase_scale": float(entry["phase_scale"]),
+                    "initialization_label": str(entry["initialization_label"]),
+                    "exact_available": exact_available,
                     "max_subsystem_size": max_partition,
+                    "valid_entropy_points": valid_entropy_points,
+                    "valid_entropy_fraction": valid_entropy_points / max_partition if max_partition > 0 else np.nan,
                     "half_partition_exact_renyi2": float(half_partition_row["exact_renyi2"]),
                     "half_partition_sampled_renyi2": float(half_partition_row["renyi2"]),
                     "half_partition_sampled_std": float(half_partition_row["renyi2_std"]),
@@ -1424,11 +1646,16 @@ def run_random_architecture_study(
             trial_results.append(
                 {
                     "model_name": model_name,
+                    "model_label": model_label,
                     "model_kwargs": dict(model_kwargs),
                     "seed": seed,
                     "parameter_count": parameter_count,
+                    "parameter_scale": float(entry["parameter_scale"]),
+                    "phase_scale": float(entry["phase_scale"]),
+                    "initialization_label": str(entry["initialization_label"]),
                     "system": system,
-                    "exact_entropy_scan_table": exact_entropy_scan["entropy_table"],
+                    "exact_available": exact_available,
+                    "exact_entropy_scan_table": None if exact_entropy_scan is None else exact_entropy_scan["entropy_table"],
                     "sampled_entropy_scan_table": sampled_entropy_scan["entropy_table"],
                     "sampled_entropy_scan_samples": sampled_entropy_scan["entropy_samples"],
                     "real_amplitude_only": real_amplitude_only,
@@ -1439,9 +1666,12 @@ def run_random_architecture_study(
     entropy_scan_table = cast(
         Any,
         pd.concat(entropy_scan_rows, ignore_index=True)
-        .groupby(["model", "subsystem_size"], as_index=False)
+        .groupby(["model", "architecture_family", "initialization_label", "subsystem_size"], as_index=False)
         .agg(
             parameter_count=("parameter_count", "first"),
+            parameter_scale=("parameter_scale", "first"),
+            phase_scale=("phase_scale", "first"),
+            exact_available=("exact_available", "max"),
             n_trials=("seed", "nunique"),
             exact_renyi2=("exact_renyi2", "mean"),
             sampled_renyi2=("renyi2", "mean"),
@@ -1452,10 +1682,15 @@ def run_random_architecture_study(
     ).sort_values(by=["model", "subsystem_size"]).reset_index(drop=True)
     summary_table = cast(
         Any,
-        trial_table.groupby("model", as_index=False)
+        trial_table.groupby(["model", "architecture_family", "initialization_label"], as_index=False)
         .agg(
             parameter_count=("parameter_count", "first"),
+            parameter_scale=("parameter_scale", "first"),
+            phase_scale=("phase_scale", "first"),
+            exact_available=("exact_available", "max"),
             n_trials=("seed", "nunique"),
+            valid_entropy_points=("valid_entropy_points", "mean"),
+            valid_entropy_fraction=("valid_entropy_fraction", "mean"),
             half_partition_exact_renyi2=("half_partition_exact_renyi2", "mean"),
             half_partition_sampled_renyi2=("half_partition_sampled_renyi2", "mean"),
             half_partition_sampled_std=("half_partition_sampled_renyi2", "std"),
