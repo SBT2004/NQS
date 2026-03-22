@@ -6,12 +6,13 @@ Replace the current dense exact-diagonalization path with a sparse, ground-state
 ### Scope
 - focus on `src/nqs/exact_diag.py` and the operator-side support it needs
 - optimize for ground-state energy and ground-state vector only
-- use sparse matrices and iterative Hermitian eigensolvers
+- use sparse matrices and iterative Hermitian eigensolvers (Lanczos)
 - do not introduce symmetry sectors, momentum blocks, or any other symmetry reduction
 - keep any dense Hamiltonian utilities separate from the production ED path
 
 ### Required changes
 - add a project-owned sparse Hamiltonian construction path for `nqs.operator.Operator`
+- The construction should go as follows: the operator module outputs all nonzero matrix elements for going from one sigma to another, that is one row of the matrix
 - assemble the Hamiltonian as a SciPy sparse Hermitian matrix, preferably CSR after COO-style accumulation
 - implement the main ED solver with a sparse Hermitian eigensolver such as `scipy.sparse.linalg.eigsh`
 - return only the lowest eigenpair on the main ED path
@@ -156,4 +157,147 @@ Not complete.
 Verification notes:
 - Existing tests and microbenchmarks still target the dense ED path; `tests/test_core_microbenchmarks.py` benchmarks `exact_diag.operator_matrix` rather than sparse assembly or sparse ground-state solves.
 - The incremental `6, 8, 10, 12, 14, 16, 18, 20` Exercise 1 benchmark gate has not been implemented or verified, and there is no evidence yet that the 20-spin case completes under one minute without issues.
+## T006 - JIT the local Metropolis sampler loop for larger TFIM VMC runs
 
+### Goal
+Remove Python-step overhead from the local Metropolis sampler so warmed `5x5` TFIM VMC runs spend materially less time in per-step control flow and repeated dispatch.
+
+### Scope
+- focus on `src/nqs/sampler.py` and the narrow workflow/tests it needs
+- keep the public sampler configuration and notebook-facing API stable
+- preserve the current local single-spin-flip proposal semantics
+- do not broaden scope into new sampler families such as exchange or cluster updates
+
+### Required changes
+- replace the Python loops in sampler draw/thermalization paths with JAX-friendly control flow such as `lax.scan`
+- keep chain persistence behavior compatible with the current `sample(...)` and `independent_sample(...)` contract
+- preserve batched chain updates and proposal acceptance semantics
+- ensure the refactor works for the current RBM, FFNN, and CNN interfaces without sampler-side model special cases
+
+### Success criteria
+- warmed sampling no longer spends the dominant control-flow cost in Python loops for the current local Metropolis path
+- `sample(...)` and `independent_sample(...)` remain numerically compatible with the current sampler semantics
+- the notebook-facing VMC workflow continues to run unchanged on the refactored sampler
+
+### Status
+Not complete.
+
+Verification notes:
+- Recent profiler evidence on the `5x5` TFIM non-ED benchmark still shows `src/nqs/sampler.py` `_draw_samples` and `_metropolis_step` among the dominant warmed-path costs.
+- The current sampler implementation still performs thermalization and collection in explicit Python loops.
+
+
+## T007 - Vectorize local-energy assembly for sampled VMC expectations
+
+### Goal
+Reduce the Python and host-side overhead in sampled VMC expectation evaluation by replacing per-sample local-energy assembly loops with batched project-owned logic.
+
+### Scope
+- focus on `src/nqs/expectation.py` and any narrow operator-side support it needs
+- keep the existing VMC gradient estimator contract intact
+- optimize only the sampled local-energy path, not the exact-state branch targeted by earlier sparse-ED tasks
+
+### Required changes
+- remove or substantially reduce the Python loop over samples in `_local_energies(...)`
+- batch connected-state evaluation and model log-amplitude queries where feasible
+- preserve compatibility with the current operator connected-elements contract
+- keep the resulting energy and gradient estimates numerically consistent with the current sampled implementation within Monte Carlo tolerance
+
+### Success criteria
+- warmed profiler runs show materially less time in sampled local-energy assembly on the `5x5` TFIM benchmark path
+- sampled VMC energies and gradients remain consistent with the current implementation on controlled small-system checks
+- the public variational-state and driver APIs remain unchanged
+
+### Status
+Not complete.
+
+Verification notes:
+- Recent profiler evidence on the `5x5` TFIM non-ED benchmark still shows `src/nqs/expectation.py` `expect_and_grad(...)` and `_local_energies(...)` as major warmed-path costs.
+- The current local-energy path still loops over samples and connected states in Python while repeatedly re-entering model evaluation.
+
+
+## T008 - Eliminate repeated `log_psi` evaluation across VMC hot paths
+
+### Goal
+Lower the dominant model-evaluation cost in larger-system VMC by reusing or fusing repeated `log_psi` work across sampling, gradient, and benchmark-diagnostic paths.
+
+### Scope
+- focus on `src/nqs/models.py`, `src/nqs/expectation.py`, `src/nqs/sampler.py`, and narrowly related workflow code
+- keep the shared model interface stable for RBM, FFNN, and CNN
+- avoid introducing architecture-specific caches in shared infrastructure unless the reuse is interface-driven
+
+### Required changes
+- identify repeated `log_psi` evaluations within the current VMC step and benchmark callbacks
+- reuse already-available model evaluations where the same states are queried multiple times
+- avoid recomputing identical batches across sampler acceptance, local-energy evaluation, and benchmark diagnostics when a safe shared value is available
+- keep parameter/state invalidation rules explicit so reused values cannot silently become stale
+
+### Success criteria
+- warmed profiler runs show a measurable reduction in cumulative time under model `log_psi/apply` during the `5x5` TFIM benchmark path
+- reuse does not change the notebook-facing VMC workflow or require ansatz-specific special cases
+- any new cache or fused path remains correct under parameter updates and sampler-state updates
+
+### Status
+Not complete.
+
+Verification notes:
+- Recent warmed `5x5` TFIM profiles still show `src/nqs/models.py` `log_psi(...)` and `apply(...)` as the dominant cumulative cost.
+- The current implementation still evaluates model log-amplitudes repeatedly across sampler, gradient, and diagnostic code paths.
+
+
+## T009 - Split training-time and report-time cost metrics for non-ED benchmarks
+
+### Goal
+Make the larger-system non-ED benchmark outputs distinguish optimizer cost from diagnostic/report generation cost so architecture tradeoffs remain interpretable on `5x5` TFIM runs.
+
+### Scope
+- focus on `src/nqs/workflows/_core.py`, `demos/exercise_2.ipynb`, and narrow tests
+- keep the current non-ED benchmark workflow notebook-facing
+- do not broaden scope into new benchmarking frameworks outside the existing workflow helper surface
+
+### Required changes
+- define explicit benchmark metrics for at least training runtime and full report/runtime cost
+- keep callback, post-processing, and optional entropy-scan costs visible rather than folding them into one ambiguous column
+- update the Exercise 2 notebook narrative and plots to use the clearer runtime split
+- ensure the benchmark remains sampled/non-ED in semantics for all reported rows
+
+### Success criteria
+- the Exercise 2 non-ED benchmark clearly distinguishes optimizer cost from diagnostic/reporting cost
+- notebook plots and tables no longer imply that a partial timing column represents the full benchmark cost
+- the resulting runtime comparison remains aligned with the actual reported outputs for each benchmark row
+
+### Status
+Not complete.
+
+Verification notes:
+- The current non-ED benchmark helper now reports `runtime_seconds`, `callback_runtime_seconds`, and `total_runtime_seconds`, but the notebook/report surface has not yet been reworked into a clearly separated training-vs-report benchmark analysis.
+- The current per-step history still mixes pre-update energy with callback observables, which is acceptable for the present task but leaves the benchmark timing/reporting surface worth tightening further.
+
+
+## T010 - Add a dedicated `5x5` TFIM VMC performance regression benchmark
+
+### Goal
+Turn the current profiler-guided `5x5` TFIM VMC investigation into a repeatable benchmark/regression surface so future sampler and expectation changes can be evaluated against a concrete larger-system target.
+
+### Scope
+- focus on tests, microbenchmarks, and lightweight profiling hooks for the `5x5` TFIM VMC path
+- keep the benchmark narrow and project-owned
+- avoid broad notebook execution sweeps as the primary regression signal
+
+### Required changes
+- add a dedicated benchmark or profiling harness for the warmed `5x5` TFIM VMC path
+- record at minimum model-evaluation cost, sampler cost, local-energy/gradient cost, and end-to-end benchmark timing
+- separate cold-start compile/tracing effects from warmed execution measurements
+- define a practical regression gate or reporting format that can be rerun after performance-oriented refactors
+
+### Success criteria
+- the repo contains a repeatable `5x5` TFIM VMC performance benchmark rather than only one-off profiler notes
+- the benchmark distinguishes cold-start and warmed behavior
+- future optimization work on sampler, expectation, or model evaluation can be judged against a stable measured target
+
+### Status
+Not complete.
+
+Verification notes:
+- The previous report identified `5x5` TFIM as the practical optimization target, but there is not yet a dedicated repeatable benchmark artifact or regression gate for that path.
+- Existing workflow tests validate behavior, not sustained larger-system performance characteristics.
