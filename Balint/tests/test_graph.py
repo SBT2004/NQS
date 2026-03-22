@@ -2,7 +2,11 @@ import sys
 import unittest
 from pathlib import Path
 
+import matplotlib
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+matplotlib.use("Agg")
 
 from nqs.graph import Chain1D, Graph, SquareLattice
 
@@ -59,6 +63,33 @@ class SquareLatticeTests(unittest.TestCase):
         graph = SquareLattice(3, 3, pbc=False)
         self.assertEqual(graph.get_neighbors(4, 1), (1, 3, 5, 7))
         self.assertEqual(graph.adjacency(2)[4], (0, 2, 6, 8))
+
+    def test_to_networkx_keeps_neighbor_metadata(self) -> None:
+        graph = SquareLattice(2, 2, pbc=False)
+        nx_graph = graph.to_networkx({1: "blue", 2: "red"})
+
+        self.assertEqual(nx_graph.number_of_nodes(), 4)
+        self.assertEqual(nx_graph.number_of_edges(), 6)
+        nn_orders = sorted(
+            metadata["neighbor_order"]
+            for _, _, metadata in nx_graph.edges(data=True)
+            if metadata["color"] == "blue"
+        )
+        diag_orders = sorted(
+            metadata["neighbor_order"]
+            for _, _, metadata in nx_graph.edges(data=True)
+            if metadata["color"] == "red"
+        )
+        self.assertEqual(nn_orders, [1, 1, 1, 1])
+        self.assertEqual(diag_orders, [2, 2])
+
+    def test_draw_returns_a_matplotlib_figure(self) -> None:
+        graph = SquareLattice(4, 4, pbc=True)
+        figure, axis = graph.draw(edge_specs={1: "blue", 2: "red"}, title="J1-J2")
+
+        self.assertEqual(axis.get_title(), "J1-J2")
+        self.assertGreater(len(axis.collections), 0)
+        figure.clf()
 
 
 if __name__ == "__main__":
