@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -11,6 +12,8 @@ if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from nqs.workflows import (  # noqa: E402
+    build_system,
+    exact_observables_summary,
     history_table,
     run_architecture_benchmark,
     run_architecture_comparison,
@@ -23,6 +26,7 @@ from nqs.workflows import (  # noqa: E402
     tfim_config,
     tfim_proxy_sweep_points,
 )
+import nqs.observables as observables  # noqa: E402
 
 
 def _bell_log_amplitude(states: np.ndarray) -> np.ndarray:
@@ -37,6 +41,37 @@ def _bell_log_amplitude(states: np.ndarray) -> np.ndarray:
 
 
 class NotebookWorkflowTests(unittest.TestCase):
+    def test_exact_observables_summary_preserves_statevector_observables_from_sparse_ground_state(self) -> None:
+        class SparseGroundStateResult(dict[str, object]):
+            def __getitem__(self, key: str) -> object:
+                if key not in {"ground_energy", "ground_state"}:
+                    raise AssertionError(f"unexpected dense ED dependency: {key}")
+                return super().__getitem__(key)
+
+        bell = np.array([1.0 / np.sqrt(2.0), 0.0, 0.0, 1.0 / np.sqrt(2.0)], dtype=np.complex128)
+        system = build_system(lattice_shape=(2, 1), pbc=False, hamiltonian="tfim", h=1.0)
+
+        with patch(
+            "nqs.workflows._core.exact_ground_state",
+            return_value=SparseGroundStateResult(
+                ground_energy=-1.25,
+                ground_state=bell,
+            ),
+        ) as exact_ground_state_mock:
+            summary = exact_observables_summary(system["operator"], subsystem=(0,))
+
+        exact_ground_state_mock.assert_called_once_with(system["operator"])
+        self.assertAlmostEqual(summary["ground_energy"], -1.25)
+        np.testing.assert_allclose(summary["ground_state"], bell)
+        np.testing.assert_allclose(summary["spectrum_table"]["energy"].to_numpy(), np.array([-1.25]))
+        self.assertAlmostEqual(summary["half_partition_von_neumann"], np.log(2.0))
+        self.assertAlmostEqual(summary["half_partition_renyi2"], np.log(2.0))
+        np.testing.assert_allclose(
+            observables.entanglement_spectrum(summary["ground_state"], subsystem=(0,), n_levels=2),
+            np.array([0.5, 0.5]),
+        )
+        np.testing.assert_allclose(summary["correlation_matrix"].to_numpy(), np.ones((2, 2)))
+
     def test_sampled_entropy_scaling_summary_averages_independent_runs(self) -> None:
         class FakeState:
             def __init__(self) -> None:

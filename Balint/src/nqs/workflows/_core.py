@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 def half_subsystem(n_sites: int) -> tuple[int, ...]:
     return tuple(range(max(1, n_sites // 2)))
 
+
 def build_system(
     lattice_shape: tuple[int, int] = (2, 2),
     *,
@@ -108,11 +109,13 @@ def exact_observables_summary(
     operator: Any,
     subsystem: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
-    exact = exact_ground_state(operator)
     hilbert = operator.hilbert
     subsystem_sites = half_subsystem(hilbert.size) if subsystem is None else subsystem
+    exact = exact_ground_state(operator)
+    ground_energy = float(exact["ground_energy"])
+    ground_state = np.asarray(exact["ground_state"], dtype=np.complex128)
     states = hilbert.all_states()
-    probabilities = np.abs(exact["ground_state"]) ** 2
+    probabilities = np.abs(ground_state) ** 2
 
     correlation_rows: list[dict[str, Any]] = []
     for site_i in range(hilbert.size):
@@ -133,7 +136,7 @@ def exact_observables_summary(
     spectrum_table = pd.DataFrame(
         {
             "level": np.array([0], dtype=np.int64),
-            "energy": np.array([exact["ground_energy"]], dtype=np.float64),
+            "energy": np.array([ground_energy], dtype=np.float64),
         }
     )
 
@@ -143,9 +146,9 @@ def exact_observables_summary(
         entropy_rows.append(
             {
                 "subsystem_size": subsystem_size,
-                "von_neumann": observables.von_neumann_entropy(exact["ground_state"], current_subsystem),
+                "von_neumann": observables.von_neumann_entropy(ground_state, current_subsystem),
                 "renyi2": observables.renyi_entropy_from_statevector(
-                    exact["ground_state"],
+                    ground_state,
                     current_subsystem,
                     alpha=2.0,
                 ),
@@ -162,14 +165,14 @@ def exact_observables_summary(
     )
 
     return {
-        "ground_energy": exact["ground_energy"],
-        "ground_state": exact["ground_state"],
+        "ground_energy": ground_energy,
+        "ground_state": ground_state,
         "spectrum_table": spectrum_table,
         "entropy_table": entropy_table,
         "scaling_fit": scaling_fit,
-        "half_partition_von_neumann": observables.von_neumann_entropy(exact["ground_state"], subsystem_sites),
+        "half_partition_von_neumann": observables.von_neumann_entropy(ground_state, subsystem_sites),
         "half_partition_renyi2": observables.renyi_entropy_from_statevector(
-            exact["ground_state"],
+            ground_state,
             subsystem_sites,
             alpha=2.0,
         ),
