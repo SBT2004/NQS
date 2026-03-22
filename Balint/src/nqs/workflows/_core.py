@@ -23,6 +23,8 @@ from ..vmc_setup import build_model, build_variational_state, build_vmc_experime
 if TYPE_CHECKING:
     from ..observables import SupportsSamplingAndLogValue
 
+_EXACT_STATEVECTOR_UNAVAILABLE_MESSAGE = "exact_statevector is only available for small full-summation states."
+
 
 @dataclass
 class _TFIM5x5VMCBenchmarkContext:
@@ -695,14 +697,14 @@ def _renyi2_entropy_scaling_from_sample_batch(
         swap_value = np.real_if_close(np.mean(estimator))
         if np.iscomplexobj(swap_value):
             if abs(np.imag(swap_value)) > cutoff:
-                raise ValueError(
-                    "SWAP expectation must be real-valued within tolerance to compute Renyi-2 entropy."
-                )
+                entropies.append(np.nan)
+                continue
             swap_real = float(np.real(swap_value))
         else:
             swap_real = float(swap_value)
         if swap_real <= 0:
-            raise ValueError("SWAP expectation must be strictly positive to compute Renyi-2 entropy.")
+            entropies.append(np.nan)
+            continue
         entropies.append(float(-np.log(swap_real)))
     return entropies
 
@@ -736,15 +738,12 @@ def sampled_entropy_scaling_summary(
             original_log_values = np.asarray(sample_with_values.log_values, dtype=np.complex128)
         else:
             sample_batch = np.asarray(variational_state.independent_sample(seed_offset=run_index))
-        try:
-            renyi2_by_size = _renyi2_entropy_scaling_from_sample_batch(
-                variational_state,
-                sample_batch=sample_batch,
-                subsystem_limit=subsystem_limit,
-                original_log_values=original_log_values,
-            )
-        except ValueError:
-            renyi2_by_size = [np.nan] * subsystem_limit
+        renyi2_by_size = _renyi2_entropy_scaling_from_sample_batch(
+            variational_state,
+            sample_batch=sample_batch,
+            subsystem_limit=subsystem_limit,
+            original_log_values=original_log_values,
+        )
         entropy_rows: list[dict[str, Any]] = []
         for subsystem_size in range(1, subsystem_limit + 1):
             entropy_rows.append(
@@ -1148,6 +1147,10 @@ def _normalize_random_architecture_entry(
         "phase_scale": phase_scale,
         "initialization_label": initialization_label,
     }
+
+
+def _is_exact_entropy_unavailable_error(exc: ValueError) -> bool:
+    return str(exc) == _EXACT_STATEVECTOR_UNAVAILABLE_MESSAGE
 
 
 def sampler_acceptance_diagnostics(
@@ -1582,7 +1585,9 @@ def run_random_architecture_study(
                     force_sampled=False,
                 )
                 exact_available = True
-            except ValueError:
+            except ValueError as exc:
+                if not _is_exact_entropy_unavailable_error(exc):
+                    raise
                 exact_entropy_scan = None
                 exact_available = False
             sampled_entropy_scan = sampled_entropy_scaling_summary(

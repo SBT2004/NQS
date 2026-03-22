@@ -251,6 +251,57 @@ class NotebookWorkflowTests(unittest.TestCase):
 
         self.assertAlmostEqual(float(summary["entropy_table"]["renyi2"].iloc[0]), np.log(2.0))
 
+    def test_sampled_entropy_scaling_summary_keeps_valid_subsystems_when_one_swap_estimate_fails(self) -> None:
+        controlled_samples = np.array(
+            [
+                [0, 0, 0, 0],
+                [1, 1, 1, 1],
+            ],
+            dtype=np.uint8,
+        )
+        provided_batches = [
+            SampleBatch(
+                states=jax.numpy.asarray(controlled_samples),
+                log_values=jax.numpy.asarray(np.zeros(controlled_samples.shape[0], dtype=np.complex128)),
+            )
+        ]
+
+        class FakeState:
+            def sample(self) -> np.ndarray:
+                raise AssertionError("sample should not be used when sample_batches are provided")
+
+            def independent_sample(self, seed_offset: int = 0) -> np.ndarray:
+                raise AssertionError("independent_sample should not be used when sample_batches are provided")
+
+            def log_value(self, states: np.ndarray) -> np.ndarray:
+                lookup: dict[tuple[int, ...], complex] = {
+                    (1, 0, 0, 0): 0.0j,
+                    (0, 1, 1, 1): 0.0j,
+                    (1, 1, 0, 0): 0.5j * np.pi,
+                    (0, 0, 1, 1): 0.5j * np.pi,
+                }
+                result = []
+                for state in np.asarray(states, dtype=np.uint8).reshape(-1, 4):
+                    key = tuple(int(value) for value in state.tolist())
+                    if key not in lookup:
+                        raise AssertionError(f"unexpected state queried: {key}")
+                    result.append(lookup[key])
+                return np.asarray(result, dtype=np.complex128)
+
+            def exact_statevector(self) -> np.ndarray:
+                raise AssertionError("exact_statevector should not be used on the sampled path")
+
+        summary = sampled_entropy_scaling_summary(
+            FakeState(),
+            n_sites=4,
+            n_independent_runs=1,
+            sample_batches=provided_batches,
+        )
+
+        self.assertEqual(summary["entropy_table"]["subsystem_size"].tolist(), [1, 2])
+        self.assertAlmostEqual(float(summary["entropy_table"]["renyi2"].iloc[0]), 0.0)
+        self.assertTrue(np.isnan(float(summary["entropy_table"]["renyi2"].iloc[1])))
+
     def test_tfim_helpers_return_notebook_ready_configurations(self) -> None:
         config = tfim_config(lattice_shape=(4, 1), h=1.0, pbc=False)
         sweep_points = tfim_proxy_sweep_points([4, 6], h=1.0, pbc=False)
@@ -409,6 +460,24 @@ class NotebookWorkflowTests(unittest.TestCase):
             ["default", "scale=0.25, real-amplitude"],
         )
         self.assertIsNone(result["trial_results"][0]["exact_entropy_scan_table"])
+
+    def test_run_random_architecture_study_propagates_unexpected_exact_entropy_errors(self) -> None:
+        with patch(
+            "nqs.workflows._core.renyi2_subsystem_scan_summary",
+            side_effect=ValueError("unexpected exact failure"),
+        ):
+            with self.assertRaisesRegex(ValueError, "unexpected exact failure"):
+                run_random_architecture_study(
+                    architecture_configs={"RBM": {"alpha": 1}},
+                    seeds=(0,),
+                    lattice_shape=(2, 2),
+                    hamiltonian="tfim",
+                    n_samples=16,
+                    n_discard_per_chain=2,
+                    n_chains=4,
+                    entropy_n_independent_runs=1,
+                    real_amplitude_only=True,
+                )
 
     def test_initialize_random_parameters_can_zero_phase_and_rescale(self) -> None:
         system = build_system(lattice_shape=(2, 2), pbc=False, hamiltonian="tfim", h=1.0)
