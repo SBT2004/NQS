@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import numpy as np
 
@@ -171,10 +171,12 @@ def entanglement_spectrum(
     return ordered[:n_levels]
 
 
-def renyi2_swap_expectation(
+def _renyi2_swap_expectation(
     log_amplitude_fn,
     samples: np.ndarray | Sequence[Sequence[int]],
     subsystem: Sequence[int] | str,
+    *,
+    original_log_values: np.ndarray | Sequence[complex] | None = None,
 ) -> complex:
     sample_batch = _flatten_samples(samples)
     if sample_batch.shape[0] < 2:
@@ -194,7 +196,12 @@ def renyi2_swap_expectation(
     swapped_left[:, subsystem_sites] = original_right[:, subsystem_sites]
     swapped_right[:, subsystem_sites] = original_left[:, subsystem_sites]
 
-    original_log = np.asarray(log_amplitude_fn(sample_batch), dtype=np.complex128).reshape(-1)
+    if original_log_values is None:
+        original_log = np.asarray(log_amplitude_fn(sample_batch), dtype=np.complex128).reshape(-1)
+    else:
+        original_log = np.asarray(original_log_values, dtype=np.complex128).reshape(-1)
+        if original_log.shape[0] != sample_batch.shape[0]:
+            raise ValueError("original_log_values must have one entry per sample.")
     swapped_log = np.asarray(
         log_amplitude_fn(np.concatenate([swapped_left, swapped_right], axis=0)),
         dtype=np.complex128,
@@ -208,16 +215,31 @@ def renyi2_swap_expectation(
     return complex(np.mean(estimator))
 
 
-def renyi2_entropy_from_samples(
+def renyi2_swap_expectation(
     log_amplitude_fn,
     samples: np.ndarray | Sequence[Sequence[int]],
     subsystem: Sequence[int] | str,
-    cutoff: float = 1e-12,
-) -> float:
-    swap_expectation = renyi2_swap_expectation(
+) -> complex:
+    return _renyi2_swap_expectation(
         log_amplitude_fn=log_amplitude_fn,
         samples=samples,
         subsystem=subsystem,
+    )
+
+
+def _renyi2_entropy_from_samples(
+    log_amplitude_fn,
+    samples: np.ndarray | Sequence[Sequence[int]],
+    subsystem: Sequence[int] | str,
+    *,
+    cutoff: float = 1e-12,
+    original_log_values: np.ndarray | Sequence[complex] | None = None,
+) -> float:
+    swap_expectation = _renyi2_swap_expectation(
+        log_amplitude_fn=log_amplitude_fn,
+        samples=samples,
+        subsystem=subsystem,
+        original_log_values=original_log_values,
     )
     swap_value = np.real_if_close(swap_expectation)
     if np.iscomplexobj(swap_value):
@@ -229,6 +251,20 @@ def renyi2_entropy_from_samples(
     if swap_real <= 0:
         raise ValueError("SWAP expectation must be strictly positive to compute Renyi-2 entropy.")
     return float(-np.log(swap_real))
+
+
+def renyi2_entropy_from_samples(
+    log_amplitude_fn,
+    samples: np.ndarray | Sequence[Sequence[int]],
+    subsystem: Sequence[int] | str,
+    cutoff: float = 1e-12,
+) -> float:
+    return _renyi2_entropy_from_samples(
+        log_amplitude_fn=log_amplitude_fn,
+        samples=samples,
+        subsystem=subsystem,
+        cutoff=cutoff,
+    )
 
 
 def renyi2_entropy(
@@ -289,7 +325,7 @@ def renyi2_entropy_statistics(
 
     if samples is not None:
         estimates = [
-            renyi2_entropy_from_samples(
+            _renyi2_entropy_from_samples(
                 log_amplitude_fn=state.log_value,
                 samples=samples,
                 subsystem=subsystem,
@@ -298,18 +334,28 @@ def renyi2_entropy_statistics(
         ]
     else:
         estimates = []
+        sampling_state = cast(Any, state)
         for repeat_index in range(n_repeats):
-            sample_batch = (
-                state.independent_sample(seed_offset=repeat_index)
-                if hasattr(state, "independent_sample")
-                else state.sample()
-            )
+            batch_log_values: np.ndarray | None = None
+            if hasattr(sampling_state, "independent_sample_with_log_values"):
+                sample_with_values = sampling_state.independent_sample_with_log_values(seed_offset=repeat_index)
+                sample_batch = sample_with_values.states
+                batch_log_values = np.asarray(sample_with_values.log_values, dtype=np.complex128)
+            elif hasattr(sampling_state, "independent_sample"):
+                sample_batch = sampling_state.independent_sample(seed_offset=repeat_index)
+            elif hasattr(sampling_state, "sample_with_log_values"):
+                sample_with_values = sampling_state.sample_with_log_values()
+                sample_batch = sample_with_values.states
+                batch_log_values = np.asarray(sample_with_values.log_values, dtype=np.complex128)
+            else:
+                sample_batch = sampling_state.sample()
             estimates.append(
-                renyi2_entropy_from_samples(
+                _renyi2_entropy_from_samples(
                     log_amplitude_fn=state.log_value,
                     samples=sample_batch,
                     subsystem=subsystem,
                     cutoff=cutoff,
+                    original_log_values=batch_log_values,
                 )
             )
 

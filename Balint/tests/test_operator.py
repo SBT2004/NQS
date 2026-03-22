@@ -92,6 +92,40 @@ class OperatorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             op.connected_elements_bits(8)
 
+    def test_batched_connected_elements_match_per_sample_contract(self) -> None:
+        hilbert = SpinHilbert(4)
+        op = Operator(
+            hilbert,
+            [
+                LocalTerm((0,), sigmax(), coefficient=2.0),
+                LocalTerm((1, 3), local_matrix([[1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 1]])),
+            ],
+        )
+        samples = np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=np.uint8,
+        )
+
+        batched = op.connected_elements_batched(samples)
+        actual = [
+            (int(sample_index), tuple(state.tolist()), complex(value))
+            for sample_index, state, value in zip(
+                batched.sample_indices,
+                batched.connected_states,
+                batched.coefficients,
+            )
+        ]
+        expected = [
+            (sample_index, tuple(connected_state.tolist()), complex(value))
+            for sample_index, sample in enumerate(samples)
+            for connected_state, value in op.connected_elements(sample)
+        ]
+
+        self.assertCountEqual(actual, expected)
+
     def test_reject_repeated_sites(self) -> None:
         with self.assertRaises(ValueError):
             LocalTerm((1, 1), np.eye(4, dtype=np.complex128))

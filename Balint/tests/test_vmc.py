@@ -22,7 +22,7 @@ from nqs.models import CNN, FFNN, RBM
 from nqs.operator import Operator, collect_terms, j1_j2, sx_term, szsz_term
 from nqs.optimizer import Adam
 from nqs.runtime_types import states_from_signed_spins, states_to_signed_spins
-from nqs.sampler import MetropolisLocal
+from nqs.sampler import MetropolisLocal, SampleBatch
 from nqs.vmc_setup import build_variational_state, build_vmc_experiment
 
 
@@ -169,6 +169,57 @@ class VMCTests(unittest.TestCase):
         expected = _reference_local_energies(operator, model, params, samples)
 
         np.testing.assert_allclose(actual, expected)
+
+    def test_sampled_expect_and_grad_matches_reference_fixed_sample_estimator(self) -> None:
+        hilbert = SpinHilbert(4)
+        model = RBM(alpha=1)
+        params = model.init(jax.random.PRNGKey(0), hilbert)
+        backend = ProjectExpectationBackend(
+            model=model,
+            sampler=self._make_sampler(hilbert, seed=15),
+            params=params,
+            exact_backend_max_states=0,
+        )
+        operator = _chain_tfim_operator(hilbert, h=1.0)
+        samples = jax.numpy.asarray(
+            np.array(
+                [
+                    [0, 0, 0, 0],
+                    [1, 0, 1, 0],
+                    [1, 1, 0, 1],
+                    [0, 1, 1, 0],
+                ],
+                dtype=np.uint8,
+            ),
+            dtype=jax.numpy.uint8,
+        )
+        reference_local_energies = jax.numpy.asarray(
+            _reference_local_energies(operator, model, params, np.asarray(samples))
+        )
+
+        def reference_surrogate_loss(current_params: dict[str, object]) -> jax.Array:
+            log_values = jax.numpy.asarray(model.log_psi(current_params, samples))
+            centered_local_energies = reference_local_energies - jax.numpy.mean(reference_local_energies)
+            return 2.0 * jax.numpy.real(
+                jax.numpy.mean(jax.numpy.conj(log_values) * centered_local_energies)
+            )
+
+        expected_energy = np.real(np.asarray(jax.numpy.mean(reference_local_energies)))
+        expected_grads = jax.grad(reference_surrogate_loss)(params)
+
+        sample_batch = SampleBatch(
+            states=samples,
+            log_values=jax.numpy.asarray(model.log_psi(params, samples)),
+        )
+        with mock.patch.object(backend, "sample_with_log_values", return_value=sample_batch):
+            result, actual_grads = backend.expect_and_grad(operator)
+
+        np.testing.assert_allclose(np.asarray(result.mean), expected_energy)
+        expected_leaves = jax.tree_util.tree_leaves(expected_grads)
+        actual_leaves = jax.tree_util.tree_leaves(actual_grads)
+        self.assertEqual(len(actual_leaves), len(expected_leaves))
+        for expected_leaf, actual_leaf in zip(expected_leaves, actual_leaves):
+            np.testing.assert_allclose(np.asarray(actual_leaf), np.asarray(expected_leaf))
 
     def test_sampler_sample_with_params_matches_sample_contract_across_architectures(self) -> None:
         for label, model, hilbert in self._architecture_cases():

@@ -9,7 +9,7 @@ import numpy as np
 import numpy.typing as npt
 
 from .graph import Graph, SquareLattice
-from .hilbert import SpinHilbert, SpinState, StateInput
+from .hilbert import SpinHilbert, SpinState, SpinStateBatch, StateInput
 
 if TYPE_CHECKING:
     import netket as nk
@@ -21,6 +21,13 @@ else:
 LocalMatrix: TypeAlias = npt.NDArray[np.complex128]
 ConnectedElement: TypeAlias = tuple[SpinState, complex]
 ConnectedElementBits: TypeAlias = tuple[int, complex]
+
+
+@dataclass(frozen=True)
+class BatchedConnectedElements:
+    sample_indices: npt.NDArray[np.int64]
+    connected_states: SpinStateBatch
+    coefficients: npt.NDArray[np.complex128]
 
 
 class SupportsConnectedElements(Protocol):
@@ -175,6 +182,68 @@ class Operator:
             for index, value in sorted(contributions.items(), key=lambda item: item[0])
             if value != 0
         ]
+
+    def connected_elements_batched(
+        self,
+        states: StateInput,
+    ) -> BatchedConnectedElements:
+        state_array = np.asarray(states, dtype=np.uint8)
+        if state_array.ndim == 1:
+            state_array = state_array.reshape(1, -1)
+        if state_array.ndim != 2 or state_array.shape[1] != self.hilbert.size:
+            raise ValueError(f"Expected shape (batch, {self.hilbert.size}), got {state_array.shape}.")
+        if np.any((state_array != 0) & (state_array != 1)):
+            raise ValueError("Spin states must only contain 0 or 1.")
+
+        sample_indices = np.arange(state_array.shape[0], dtype=np.int64)
+        connected_states_chunks: list[SpinStateBatch] = []
+        sample_index_chunks: list[npt.NDArray[np.int64]] = []
+        coefficient_chunks: list[npt.NDArray[np.complex128]] = []
+
+        for term in self.terms:
+            sites = np.asarray(term.sites, dtype=np.intp)
+            local_weights = (1 << np.arange(len(term.sites), dtype=np.int64)).reshape(1, -1)
+            local_columns = np.sum(
+                state_array[:, sites].astype(np.int64, copy=False) * local_weights,
+                axis=1,
+                dtype=np.int64,
+            )
+
+            for column_index in range(term.matrix.shape[1]):
+                matching_samples = sample_indices[local_columns == column_index]
+                if matching_samples.size == 0:
+                    continue
+
+                column = term.matrix[:, column_index]
+                nonzero_rows = np.flatnonzero(np.abs(column) > 0)
+                if nonzero_rows.size == 0:
+                    continue
+
+                repeated_states = np.repeat(state_array[matching_samples], nonzero_rows.size, axis=0)
+                repeated_sample_indices = np.repeat(matching_samples, nonzero_rows.size)
+                local_row_bits = ((nonzero_rows[:, None] >> np.arange(len(term.sites))) & 1).astype(np.uint8)
+                repeated_states[:, sites] = np.tile(local_row_bits, (matching_samples.size, 1))
+                repeated_coefficients = np.tile(
+                    np.asarray(term.coefficient * column[nonzero_rows], dtype=np.complex128),
+                    matching_samples.size,
+                )
+
+                connected_states_chunks.append(repeated_states)
+                sample_index_chunks.append(repeated_sample_indices)
+                coefficient_chunks.append(repeated_coefficients)
+
+        if not connected_states_chunks:
+            return BatchedConnectedElements(
+                sample_indices=np.zeros(0, dtype=np.int64),
+                connected_states=np.zeros((0, self.hilbert.size), dtype=np.uint8),
+                coefficients=np.zeros(0, dtype=np.complex128),
+            )
+
+        return BatchedConnectedElements(
+            sample_indices=np.concatenate(sample_index_chunks),
+            connected_states=np.concatenate(connected_states_chunks, axis=0),
+            coefficients=np.concatenate(coefficient_chunks),
+        )
 
     def iter_matrix_elements(self) -> Iterator[tuple[int, int, complex]]:
         """Yield nonzero matrix elements as ``(row, column, value)`` triples."""

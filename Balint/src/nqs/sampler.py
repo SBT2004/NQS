@@ -15,6 +15,14 @@ LogPsiFn = Callable[[jax.Array], jax.Array]
 LogPsiApplyFn = Callable[[Any, jax.Array], jax.Array]
 
 
+@dataclass(frozen=True)
+class SampleBatch:
+    """Sampled configurations with the log-values used to accept them."""
+
+    states: jax.Array
+    log_values: jax.Array
+
+
 def _metropolis_step(
     log_psi_apply: LogPsiApplyFn,
     params: Any,
@@ -63,7 +71,7 @@ def _scan_samples(
     n_discard_per_chain: int,
     steps_per_chain: int,
     n_samples: int,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     states = jnp.asarray(initial_states, dtype=jnp.uint8)
     log_values = jnp.asarray(log_psi_apply(params, states))
 
@@ -86,7 +94,7 @@ def _scan_samples(
     def sample_step(
         carry: tuple[jax.Array, jax.Array, jax.Array],
         _,
-    ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], jax.Array]:
+    ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], tuple[jax.Array, jax.Array]]:
         current_states, current_log_values, current_rng_key = carry
         next_states, next_log_values, next_rng_key = _metropolis_step(
             log_psi_apply,
@@ -97,7 +105,7 @@ def _scan_samples(
             n_chains=n_chains,
             n_sites=n_sites,
         )
-        return (next_states, next_log_values, next_rng_key), next_states
+        return (next_states, next_log_values, next_rng_key), (next_states, next_log_values)
 
     carry = (states, log_values, rng_key)
     if n_discard_per_chain > 0:
@@ -114,8 +122,10 @@ def _scan_samples(
         length=steps_per_chain,
     )
     final_states, _, final_key = carry
-    flat_samples = collected.reshape((steps_per_chain * n_chains, n_sites))[:n_samples]
-    return flat_samples, final_states, final_key
+    collected_states, collected_log_values = collected
+    flat_samples = collected_states.reshape((steps_per_chain * n_chains, n_sites))[:n_samples]
+    flat_log_values = collected_log_values.reshape((steps_per_chain * n_chains,))[:n_samples]
+    return flat_samples, flat_log_values, final_states, final_key
 
 
 def _scan_samples_unary(
@@ -128,7 +138,7 @@ def _scan_samples_unary(
     n_discard_per_chain: int,
     steps_per_chain: int,
     n_samples: int,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     def apply_unary(_: None, states: jax.Array) -> jax.Array:
         return log_psi_fn(states)
 
@@ -156,11 +166,11 @@ class MetropolisLocal:
     seed: int = 0
     _rng_key: jax.Array = field(init=False, repr=False)
     _chain_states: jax.Array | None = field(default=None, init=False, repr=False)
-    _compiled_draw_samples: Callable[..., tuple[jax.Array, jax.Array, jax.Array]] = field(
+    _compiled_draw_samples: Callable[..., tuple[jax.Array, jax.Array, jax.Array, jax.Array]] = field(
         init=False,
         repr=False,
     )
-    _compiled_draw_samples_unary: Callable[..., tuple[jax.Array, jax.Array, jax.Array]] = field(
+    _compiled_draw_samples_unary: Callable[..., tuple[jax.Array, jax.Array, jax.Array, jax.Array]] = field(
         init=False,
         repr=False,
     )
@@ -212,7 +222,7 @@ class MetropolisLocal:
         *,
         initial_states: jax.Array,
         rng_key: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         return self._compiled_draw_samples_unary(
             log_psi_fn=log_psi_fn,
             initial_states=initial_states,
@@ -226,7 +236,7 @@ class MetropolisLocal:
         *,
         initial_states: jax.Array,
         rng_key: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         return self._compiled_draw_samples(
             log_psi_apply=log_psi_apply,
             params=params,
@@ -235,27 +245,37 @@ class MetropolisLocal:
         )
 
     def sample(self, log_psi_fn: LogPsiFn) -> jax.Array:
+        return self.sample_with_log_values(log_psi_fn).states
+
+    def sample_with_log_values(self, log_psi_fn: LogPsiFn) -> SampleBatch:
         init_key, sample_key = jax.random.split(self._rng_key)
         if self._chain_states is None:
             self._chain_states = self._random_states(init_key)
-        samples, final_states, final_key = self._draw_samples(
+        samples, log_values, final_states, final_key = self._draw_samples(
             log_psi_fn,
             initial_states=self._chain_states,
             rng_key=sample_key,
         )
         self._chain_states = final_states
         self._rng_key = final_key
-        return samples
+        return SampleBatch(states=samples, log_values=log_values)
 
     def sample_with_params(
         self,
         log_psi_apply: LogPsiApplyFn,
         params: Any,
     ) -> jax.Array:
+        return self.sample_with_params_and_log_values(log_psi_apply, params).states
+
+    def sample_with_params_and_log_values(
+        self,
+        log_psi_apply: LogPsiApplyFn,
+        params: Any,
+    ) -> SampleBatch:
         init_key, sample_key = jax.random.split(self._rng_key)
         if self._chain_states is None:
             self._chain_states = self._random_states(init_key)
-        samples, final_states, final_key = self._draw_samples_with_params(
+        samples, log_values, final_states, final_key = self._draw_samples_with_params(
             log_psi_apply,
             params,
             initial_states=self._chain_states,
@@ -263,7 +283,7 @@ class MetropolisLocal:
         )
         self._chain_states = final_states
         self._rng_key = final_key
-        return samples
+        return SampleBatch(states=samples, log_values=log_values)
 
     def independent_sample(
         self,
@@ -271,15 +291,26 @@ class MetropolisLocal:
         *,
         seed_offset: int = 0,
     ) -> jax.Array:
+        return self.independent_sample_with_log_values(
+            log_psi_fn,
+            seed_offset=seed_offset,
+        ).states
+
+    def independent_sample_with_log_values(
+        self,
+        log_psi_fn: LogPsiFn,
+        *,
+        seed_offset: int = 0,
+    ) -> SampleBatch:
         rng_key = jax.random.PRNGKey(self.seed + seed_offset + 1)
         init_key, sample_key = jax.random.split(rng_key)
         initial_states = self._random_states(init_key)
-        samples, _, _ = self._draw_samples(
+        samples, log_values, _, _ = self._draw_samples(
             log_psi_fn,
             initial_states=initial_states,
             rng_key=sample_key,
         )
-        return samples
+        return SampleBatch(states=samples, log_values=log_values)
 
     def independent_sample_with_params(
         self,
@@ -288,19 +319,33 @@ class MetropolisLocal:
         *,
         seed_offset: int = 0,
     ) -> jax.Array:
+        return self.independent_sample_with_params_and_log_values(
+            log_psi_apply,
+            params,
+            seed_offset=seed_offset,
+        ).states
+
+    def independent_sample_with_params_and_log_values(
+        self,
+        log_psi_apply: LogPsiApplyFn,
+        params: Any,
+        *,
+        seed_offset: int = 0,
+    ) -> SampleBatch:
         rng_key = jax.random.PRNGKey(self.seed + seed_offset + 1)
         init_key, sample_key = jax.random.split(rng_key)
         initial_states = self._random_states(init_key)
-        samples, _, _ = self._draw_samples_with_params(
+        samples, log_values, _, _ = self._draw_samples_with_params(
             log_psi_apply,
             params,
             initial_states=initial_states,
             rng_key=sample_key,
         )
-        return samples
+        return SampleBatch(states=samples, log_values=log_values)
 
 __all__ = [
     "LogPsiFn",
     "LogPsiApplyFn",
     "MetropolisLocal",
+    "SampleBatch",
 ]

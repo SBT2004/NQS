@@ -8,7 +8,7 @@ import jax.numpy as jnp
 
 from .expectation import ProjectExpectationBackend, SupportsExpectationBackend
 from .runtime_types import SupportsLogPsi
-from .sampler import MetropolisLocal
+from .sampler import MetropolisLocal, SampleBatch
 
 ParamTree = Any
 
@@ -44,8 +44,14 @@ class VariationalState:
     def sample(self) -> jax.Array:
         return self._expectation_backend.sample()
 
+    def sample_with_log_values(self) -> SampleBatch:
+        return self._expectation_backend.sample_with_log_values()
+
     def independent_sample(self, seed_offset: int = 0) -> jax.Array:
         return self._expectation_backend.independent_sample(seed_offset=seed_offset)
+
+    def independent_sample_with_log_values(self, seed_offset: int = 0) -> SampleBatch:
+        return self._expectation_backend.independent_sample_with_log_values(seed_offset=seed_offset)
 
     def exact_statevector(self) -> jax.Array:
         return self._expectation_backend.exact_statevector()

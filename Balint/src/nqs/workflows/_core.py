@@ -260,16 +260,24 @@ def sampled_entropy_scaling_summary(
         raise ValueError("n_independent_runs must be positive.")
     subsystem_limit = max(1, n_sites // 2) if max_subsystem_size is None else max_subsystem_size
     run_tables: list[pd.DataFrame] = []
+    sampling_state = cast(Any, variational_state)
     for run_index in range(n_independent_runs):
-        sample_batch = np.asarray(variational_state.independent_sample(seed_offset=run_index))
+        original_log_values: np.ndarray | None = None
+        if hasattr(sampling_state, "independent_sample_with_log_values"):
+            sample_with_values = sampling_state.independent_sample_with_log_values(seed_offset=run_index)
+            sample_batch = np.asarray(sample_with_values.states, dtype=np.uint8)
+            original_log_values = np.asarray(sample_with_values.log_values, dtype=np.complex128)
+        else:
+            sample_batch = np.asarray(variational_state.independent_sample(seed_offset=run_index))
         entropy_rows: list[dict[str, Any]] = []
         for subsystem_size in range(1, subsystem_limit + 1):
             subsystem = tuple(range(subsystem_size))
             try:
-                renyi2 = observables.renyi2_entropy_from_samples(
+                renyi2 = observables._renyi2_entropy_from_samples(
                     variational_state.log_value,
                     sample_batch,
                     subsystem=subsystem,
+                    original_log_values=original_log_values,
                 )
             except ValueError:
                 renyi2 = np.nan

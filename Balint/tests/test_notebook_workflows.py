@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import jax
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,7 @@ from nqs.workflows import (  # noqa: E402
 )
 import nqs.observables as observables  # noqa: E402
 from nqs.exact_diag_debug import dense_debug_operator_matrix  # noqa: E402
+from nqs.sampler import SampleBatch  # noqa: E402
 
 
 def _bell_log_amplitude(states: np.ndarray) -> np.ndarray:
@@ -153,6 +155,52 @@ class NotebookWorkflowTests(unittest.TestCase):
         self.assertAlmostEqual(float(summary["entropy_table"]["renyi2"].iloc[0]), np.log(2.0))
         self.assertAlmostEqual(float(summary["entropy_table"]["renyi2_std"].iloc[0]), 0.0)
         self.assertEqual(len(summary["entropy_samples"]), 3)
+
+    def test_sampled_entropy_scaling_summary_reuses_original_sample_log_values(self) -> None:
+        controlled_samples = np.array(
+            [
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [1, 1],
+            ],
+            dtype=np.uint8,
+        )
+        original_log_values = _bell_log_amplitude(controlled_samples)
+
+        class FakeState:
+            def __init__(self) -> None:
+                self.calls: list[int] = []
+
+            def sample(self) -> np.ndarray:
+                raise AssertionError("sample should not be used when independent_sample_with_log_values is available")
+
+            def independent_sample(self, seed_offset: int = 0) -> np.ndarray:
+                raise AssertionError(
+                    "independent_sample should not be used when independent_sample_with_log_values is available"
+                )
+
+            def independent_sample_with_log_values(self, seed_offset: int = 0) -> SampleBatch:
+                self.calls.append(seed_offset)
+                return SampleBatch(
+                    states=jax.numpy.asarray(controlled_samples),
+                    log_values=jax.numpy.asarray(original_log_values),
+                )
+
+            def log_value(self, states: np.ndarray) -> np.ndarray:
+                sample_array = np.asarray(states, dtype=np.uint8)
+                if np.array_equal(sample_array, controlled_samples):
+                    raise AssertionError("original samples should reuse provided log values")
+                return _bell_log_amplitude(sample_array)
+
+            def exact_statevector(self) -> np.ndarray:
+                return np.array([1.0 / np.sqrt(2.0), 0.0, 0.0, 1.0 / np.sqrt(2.0)], dtype=np.complex128)
+
+        state = FakeState()
+        summary = sampled_entropy_scaling_summary(state, n_sites=2, n_independent_runs=2)
+
+        self.assertEqual(state.calls, [0, 1])
+        self.assertAlmostEqual(float(summary["entropy_table"]["renyi2"].iloc[0]), np.log(2.0))
 
     def test_tfim_helpers_return_notebook_ready_configurations(self) -> None:
         config = tfim_config(lattice_shape=(4, 1), h=1.0, pbc=False)
