@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .. import observables
-from ..exact_diag import exact_ground_state
+from ..exact_diag import exact_ground_state, solve_sparse_ground_state, sparse_operator_matrix
 from ..graph import SquareLattice
 from ..hilbert import SpinHilbert
 from ..operator import j1_j2, tfim
@@ -116,22 +116,12 @@ def exact_observables_summary(
     ground_state = np.asarray(exact["ground_state"], dtype=np.complex128)
     states = hilbert.all_states()
     probabilities = np.abs(ground_state) ** 2
-
-    correlation_rows: list[dict[str, Any]] = []
-    for site_i in range(hilbert.size):
-        for site_j in range(hilbert.size):
-            correlation_rows.append(
-                {
-                    "site_i": site_i,
-                    "site_j": site_j,
-                    "correlation": observables.spin_spin_correlation(
-                        states,
-                        site_i=site_i,
-                        site_j=site_j,
-                        weights=probabilities,
-                    ),
-                }
-            )
+    signed_states = hilbert.states_to_pm1(states).astype(np.float64, copy=False)
+    correlation_matrix = pd.DataFrame(
+        np.einsum("bi,bj,b->ij", signed_states, signed_states, probabilities, optimize=True),
+        index=np.arange(hilbert.size),
+        columns=np.arange(hilbert.size),
+    )
 
     spectrum_table = pd.DataFrame(
         {
@@ -176,12 +166,69 @@ def exact_observables_summary(
             subsystem_sites,
             alpha=2.0,
         ),
-        "correlation_matrix": pd.DataFrame(correlation_rows).pivot(
-            index="site_i",
-            columns="site_j",
-            values="correlation",
-        ),
+        "correlation_matrix": correlation_matrix,
     }
+
+
+def run_incremental_exercise_1_ed_benchmark(
+    lengths: Sequence[int],
+    *,
+    J: float = 1.0,
+    h: float = 1.0,
+    pbc: bool = False,
+) -> pd.DataFrame:
+    if not lengths:
+        raise ValueError("lengths must contain at least one system size.")
+
+    rows: list[dict[str, Any]] = []
+    for raw_length in lengths:
+        length = int(raw_length)
+        benchmark_start = perf_counter()
+        try:
+            system = build_system(
+                lattice_shape=(length, 1),
+                pbc=pbc,
+                hamiltonian="tfim",
+                J=J,
+                h=h,
+            )
+            assembly_start = perf_counter()
+            sparse_matrix = sparse_operator_matrix(system["operator"])
+            assembly_seconds = perf_counter() - assembly_start
+            solve_start = perf_counter()
+            exact = solve_sparse_ground_state(sparse_matrix)
+            solve_seconds = perf_counter() - solve_start
+        except Exception as exc:
+            rows.append(
+                {
+                    "length": length,
+                    "label": f"tfim_1d_{length}x1",
+                    "assembly_seconds": np.nan,
+                    "solve_seconds": np.nan,
+                    "runtime_seconds": perf_counter() - benchmark_start,
+                    "completed": False,
+                    "ground_energy": np.nan,
+                    "failure_type": type(exc).__name__,
+                    "failure_message": str(exc),
+                }
+            )
+            continue
+
+        rows.append(
+            {
+                "length": length,
+                "label": f"tfim_1d_{length}x1",
+                "assembly_seconds": assembly_seconds,
+                "solve_seconds": solve_seconds,
+                "runtime_seconds": perf_counter() - benchmark_start,
+                "completed": True,
+                "ground_energy": float(exact["ground_energy"]),
+                "failure_type": "",
+                "failure_message": "",
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def history_table(history: list[dict[str, Any]]) -> pd.DataFrame:

@@ -1,129 +1,4 @@
-## T001 - Replace dense ED with a sparse ground-state solver
-
-### Goal
-Replace the current dense exact-diagonalization path with a sparse, ground-state-focused implementation that never builds a dense Hamiltonian in the main ED flow.
-
-### Scope
-- focus on `src/nqs/exact_diag.py` and the operator-side support it needs
-- optimize for ground-state energy and ground-state vector only
-- use sparse matrices and iterative Hermitian eigensolvers (Lanczos)
-- do not introduce symmetry sectors, momentum blocks, or any other symmetry reduction
-- keep any dense Hamiltonian utilities separate from the production ED path
-
-### Required changes
-- add a project-owned sparse Hamiltonian construction path for `nqs.operator.Operator`
-- The construction should go as follows: the operator module outputs all nonzero matrix elements for going from one sigma to another, that is one row of the matrix
-- assemble the Hamiltonian as a SciPy sparse Hermitian matrix, preferably CSR after COO-style accumulation
-- implement the main ED solver with a sparse Hermitian eigensolver such as `scipy.sparse.linalg.eigsh`
-- return only the lowest eigenpair on the main ED path
-- remove dense-matrix construction from the default ED implementation
-- keep any dense matrix helper explicitly demo/debug-only rather than part of the main solver path
-- ensure the returned ground-state vector remains suitable for downstream exact observables such as reduced density matrices and von Neumann entropy
-
-### Success criteria
-- the main ED path no longer allocates a dense Hamiltonian
-- exact ground-state energy and ground-state vector remain available through the project-owned ED API
-- small-system ground-state energies match the current dense or reference results within numerical tolerance
-- the ED path scales past the current dense-memory failure mode without relying on symmetries
-
-### Status
-Not complete.
-
-Verification notes:
-- The current repo state still uses dense ED in `src/nqs/exact_diag.py`: `operator_matrix(...)` allocates a full dense Hamiltonian and `exact_ground_state(...)` calls `np.linalg.eigh(...)`.
-- No project-owned sparse Hamiltonian construction path or `eigsh`-based ground-state solver is present yet.
-
-
-## T002 - Decouple exact expectations from dense Hamiltonian materialization
-
-### Goal
-Stop using dense Hamiltonian materialization for exact small-system expectation values so the exact expectation backend no longer shares the same memory bottleneck as dense ED.
-
-### Scope
-- focus on `src/nqs/expectation.py`
-- keep the current exact statevector logic where it is still appropriate
-- replace only the dense operator application path
-- do not change the sampled expectation path
-
-### Required changes
-- remove the dependency on dense `operator_matrix(...)` from the exact expectation branch
-- compute exact energies via sparse operator application to a dense statevector
-- preserve the current exact/sampled backend selection behavior
-- keep the exact expectation result numerically consistent with the previous implementation on small systems
-
-### Success criteria
-- exact expectation evaluation no longer builds a dense Hamiltonian
-- exact energy values agree with the previous small-system implementation within tolerance
-- the exact expectation backend remains compatible with the current variational-state and driver code
-
-### Status
-Not complete.
-
-Verification notes:
-- The exact expectation branch in `src/nqs/expectation.py` still calls `operator_matrix(...)` and multiplies by a dense Hamiltonian inside `_exact_expectation_mean(...)`.
-- The sampled expectation path is separate, but the exact path has not been migrated to sparse operator application.
-
-
-## T003 - Split production ED APIs from dense demo/debug helpers
-
-### Goal
-Make the exact-diagonalization API sparse-first and ground-state-focused, while isolating any dense matrix helpers as explicit demo/debug utilities rather than part of the production runtime path.
-
-### Scope
-- focus on the public-facing ED helpers and their immediate callers
-- preserve support for dense-statevector-based exact observables
-- do not keep full-spectrum dense return data on the main ED path
-- limit dense helpers to explicit demo/debug use
-
-### Required changes
-- redefine the main ED result contract around `ground_energy` and `ground_state`
-- remove assumptions that the main ED API returns a dense Hamiltonian or full eigenvalue list
-- update project-owned callers to consume the sparse-first ground-state result shape
-- keep any dense helper naming and placement explicit enough that it is not confused with the production ED path
-
-### Success criteria
-- the main ED API no longer implies dense Hamiltonian ownership
-- downstream workflows continue to work with the sparse-first result shape
-- dense helpers, if retained, are clearly separated from the production ED path
-
-### Status
-Not complete.
-
-Verification notes:
-- The production ED API is still dense-oriented: `ExactDiagResult` includes `matrix` and `eigenvalues`, and `exact_ground_state(...)` returns both.
-- Dense helpers have not been separated from the main ED runtime path yet.
-
-
-## T004 - Preserve exact-observable workflows on top of sparse ED ground states
-
-### Goal
-Keep exact report and analysis workflows working after the sparse ED refactor by ensuring they consume the sparse-solver ground-state vector rather than any dense Hamiltonian artifacts.
-
-### Scope
-- focus on exact-observable and workflow code that depends on `exact_ground_state(...)`
-- preserve current reduced-density-matrix, entropy, and entanglement-spectrum behavior
-- do not expand scope into new observables or new physics functionality
-
-### Required changes
-- update exact workflow helpers to rely only on `ground_energy` and `ground_state`
-- preserve reduced density matrix, von Neumann entropy, Renyi-from-statevector, and entanglement spectrum calculations
-- confirm no workflow still depends on dense ED outputs such as full matrices or full spectra
-- keep notebook-facing exact benchmark helpers report-friendly after the refactor
-
-### Success criteria
-- exact-observable workflows continue to produce the same report-facing results on small systems
-- downstream exact entropy calculations still operate from the returned dense ground-state vector
-- no production exact workflow path depends on dense Hamiltonian materialization
-
-### Status
-Not complete.
-
-Verification notes:
-- The exact-observable workflows still rely on the current dense ED result shape because the sparse ground-state API refactor has not happened yet.
-- Reduced-density-matrix and entropy code still works on the returned dense statevector, but no workflow migration to a sparse-first ED contract has been implemented.
-
-
-## T005 - Add verification and microbenchmarks for sparse ED performance and correctness
+## T002 - Add verification and microbenchmarks for sparse ED performance and correctness
 
 ### Goal
 Add focused verification and benchmark coverage that proves the sparse ED refactor is correct and removes the dominant dense-memory bottleneck.
@@ -139,25 +14,28 @@ Add focused verification and benchmark coverage that proves the sparse ED refact
 - add tests that confirm exact observable outputs derived from the sparse ED ground-state vector remain correct
 - extend the core microbenchmarks to include sparse matrix assembly and sparse ground-state solve timings
 - include at least one benchmark or validation case that demonstrates the main ED path no longer performs dense Hamiltonian allocation
-- benchmark the open-chain TFIM Exercise 1 ED path incrementally at chain lengths `6, 8, 10, 12, 14, 16, 18, 20`, changing the code, running, increasing the size, and running again rather than implementing a full notebook sweep upfront
+- benchmark the open-chain TFIM Exercise 1 ED path incrementally at chain lengths `6, 8, 10, 12, 14, 16`, changing the code, running, increasing the size, and running again rather than implementing a full notebook sweep upfront
 - record per-size runtime and whether each run completes without memory or solver failure
-- use the 20-spin case as the practical optimization gate for the intended machine
+- use the 16-spin case as the practical optimization gate for the intended machine
 
 ### Success criteria
 - sparse ED correctness is covered by automated tests
 - sparse exact expectation correctness is covered by automated tests
 - benchmark coverage distinguishes sparse assembly cost from sparse solve cost
 - verification provides evidence that the dense-memory bottleneck has been removed from the main ED path
-- the incremental Exercise 1 ED benchmark reaches the 20-spin open-chain TFIM case without memory or solver issues
-- the 20-spin Exercise 1 ED case completes in under one minute; if it does, the optimization is considered successful
+- the incremental Exercise 1 ED benchmark reaches the 16-spin open-chain TFIM case without memory or solver issues
+- the 16-spin Exercise 1 ED case completes in under one minute; if it does, the optimization is considered successful
 
 ### Status
-Not complete.
+Partial.
 
 Verification notes:
-- Existing tests and microbenchmarks still target the dense ED path; `tests/test_core_microbenchmarks.py` benchmarks `exact_diag.operator_matrix` rather than sparse assembly or sparse ground-state solves.
-- The incremental `6, 8, 10, 12, 14, 16, 18, 20` Exercise 1 benchmark gate has not been implemented or verified, and there is no evidence yet that the 20-spin case completes under one minute without issues.
-## T006 - JIT the local Metropolis sampler loop for larger TFIM VMC runs
+- Automated correctness coverage now exists for sparse ED and sparse exact expectations: `tests/test_operator.py`, `tests/test_vmc.py`, and `tests/test_notebook_workflows.py` compare sparse results against dense small-system references and assert the main exact-observables path does not densify the Hamiltonian.
+- `tests/test_core_microbenchmarks.py` now distinguishes `exact_diag.sparse_operator_matrix` assembly from `exact_diag.solve_sparse_ground_state` solve cost, and `src/nqs/workflows/_core.py` exposes `run_incremental_exercise_1_ed_benchmark(...)` with per-size assembly, solve, runtime, completion, and failure fields.
+- The required incremental Exercise 1 gate is still only partially covered in repo state: automated checks call the helper only for `[4, 6]`, and there is no saved `6, 8, 10, 12, 14, 16` runtime/completion artifact from that incremental benchmark path.
+- `demos/exercise_1.ipynb` and `demos/report_outputs/exercise_1/exercise_1_exact_summary.csv` do show open-chain `L=16` exact-observable output, but they do not record the required per-size assembly/solve/runtime measurements or solver-failure status.
+- There is still no repo evidence that the 16-spin Exercise 1 ED case completes without memory or solver issues in under one minute on the intended machine.
+## T003 - JIT the local Metropolis sampler loop for larger TFIM VMC runs
 
 ### Goal
 Remove Python-step overhead from the local Metropolis sampler so warmed `5x5` TFIM VMC runs spend materially less time in per-step control flow and repeated dispatch.
@@ -183,11 +61,12 @@ Remove Python-step overhead from the local Metropolis sampler so warmed `5x5` TF
 Not complete.
 
 Verification notes:
-- Recent profiler evidence on the `5x5` TFIM non-ED benchmark still shows `src/nqs/sampler.py` `_draw_samples` and `_metropolis_step` among the dominant warmed-path costs.
-- The current sampler implementation still performs thermalization and collection in explicit Python loops.
+- `src/nqs/sampler.py` still performs thermalization and sample collection in explicit Python `for` loops inside `_draw_samples(...)`.
+- `_metropolis_step(...)` is still dispatched once per thermalization/collection step from Python rather than being fused under `jax.lax.scan` or similar JAX control flow.
+- Current tests exercise correctness and notebook compatibility, but the repo does not yet contain a measured `5x5` warmed benchmark artifact showing reduced sampler control-flow cost.
 
 
-## T007 - Vectorize local-energy assembly for sampled VMC expectations
+## T004 - Vectorize local-energy assembly for sampled VMC expectations
 
 ### Goal
 Reduce the Python and host-side overhead in sampled VMC expectation evaluation by replacing per-sample local-energy assembly loops with batched project-owned logic.
@@ -212,11 +91,11 @@ Reduce the Python and host-side overhead in sampled VMC expectation evaluation b
 Not complete.
 
 Verification notes:
-- Recent profiler evidence on the `5x5` TFIM non-ED benchmark still shows `src/nqs/expectation.py` `expect_and_grad(...)` and `_local_energies(...)` as major warmed-path costs.
-- The current local-energy path still loops over samples and connected states in Python while repeatedly re-entering model evaluation.
+- `src/nqs/expectation.py` `_local_energies(...)` still converts sampled states to NumPy, iterates over samples in Python, and iterates over connected states per sample before re-entering `model.log_psi(...)`.
+- `tests/test_vmc.py` covers sampled local-energy correctness, but the repo does not yet contain a measured `5x5` benchmark artifact showing materially lower warmed local-energy assembly cost.
 
 
-## T008 - Eliminate repeated `log_psi` evaluation across VMC hot paths
+## T005 - Eliminate repeated `log_psi` evaluation across VMC hot paths
 
 ### Goal
 Lower the dominant model-evaluation cost in larger-system VMC by reusing or fusing repeated `log_psi` work across sampling, gradient, and benchmark-diagnostic paths.
@@ -241,11 +120,12 @@ Lower the dominant model-evaluation cost in larger-system VMC by reusing or fusi
 Not complete.
 
 Verification notes:
-- Recent warmed `5x5` TFIM profiles still show `src/nqs/models.py` `log_psi(...)` and `apply(...)` as the dominant cumulative cost.
-- The current implementation still evaluates model log-amplitudes repeatedly across sampler, gradient, and diagnostic code paths.
+- `src/nqs/sampler.py`, `src/nqs/expectation.py`, and `src/nqs/models.py` still call `model.log_psi(...)` independently across sampler acceptance, sampled local-energy evaluation, and gradient code paths.
+- There is no shared cache or fused evaluation path with explicit invalidation tied to parameter or chain-state changes.
+- The repo does not yet contain a measured `5x5` before/after artifact showing reduced cumulative `log_psi/apply` cost.
 
 
-## T009 - Split training-time and report-time cost metrics for non-ED benchmarks
+## T006 - Split training-time and report-time cost metrics for non-ED benchmarks
 
 ### Goal
 Make the larger-system non-ED benchmark outputs distinguish optimizer cost from diagnostic/report generation cost so architecture tradeoffs remain interpretable on `5x5` TFIM runs.
@@ -270,11 +150,12 @@ Make the larger-system non-ED benchmark outputs distinguish optimizer cost from 
 Not complete.
 
 Verification notes:
-- The current non-ED benchmark helper now reports `runtime_seconds`, `callback_runtime_seconds`, and `total_runtime_seconds`, but the notebook/report surface has not yet been reworked into a clearly separated training-vs-report benchmark analysis.
-- The current per-step history still mixes pre-update energy with callback observables, which is acceptable for the present task but leaves the benchmark timing/reporting surface worth tightening further.
+- `src/nqs/workflows/_core.py` now reports `runtime_seconds`, `callback_runtime_seconds`, and `total_runtime_seconds` from `run_non_ed_vmc_benchmark(...)`.
+- `demos/exercise_2.ipynb` still selects and plots `runtime_seconds` as the benchmark cost column, so the notebook-facing analysis does not yet clearly separate optimizer time from report/diagnostic time.
+- `demos/report_outputs/exercise_2/` does not contain a saved large-benchmark summary/report artifact that exposes the split runtime columns.
 
 
-## T010 - Add a dedicated `5x5` TFIM VMC performance regression benchmark
+## T007 - Add a dedicated `5x5` TFIM VMC performance regression benchmark
 
 ### Goal
 Turn the current profiler-guided `5x5` TFIM VMC investigation into a repeatable benchmark/regression surface so future sampler and expectation changes can be evaluated against a concrete larger-system target.
@@ -299,5 +180,6 @@ Turn the current profiler-guided `5x5` TFIM VMC investigation into a repeatable 
 Not complete.
 
 Verification notes:
-- The previous report identified `5x5` TFIM as the practical optimization target, but there is not yet a dedicated repeatable benchmark artifact or regression gate for that path.
-- Existing workflow tests validate behavior, not sustained larger-system performance characteristics.
+- There is no dedicated project-owned `5x5` TFIM performance harness in `tests/` or `src/nqs/workflows/`; the available non-ED benchmark helper is a general training/report helper rather than a narrow regression benchmark.
+- The current repo does not record per-component warmed cost for model evaluation, sampler, and local-energy/gradient work on the `5x5` path.
+- There is no cold-start versus warmed execution separation or practical rerunnable regression gate for the `5x5` TFIM VMC target.

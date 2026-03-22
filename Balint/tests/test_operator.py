@@ -6,7 +6,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from nqs.exact_diag import exact_ground_state, sparse_operator_matrix
+from nqs.exact_diag import exact_ground_state, exact_ground_state_energy, sparse_operator_matrix
 from nqs.exact_diag_debug import dense_debug_operator_matrix
 from nqs.graph import SquareLattice
 from nqs.hilbert import SpinHilbert
@@ -188,6 +188,24 @@ class OperatorTests(unittest.TestCase):
         overlap = np.vdot(expected_eigenvectors[:, 0], result["ground_state"])
         self.assertAlmostEqual(float(np.abs(overlap)), 1.0, places=10)
         self.assertAlmostEqual(float(np.linalg.norm(result["ground_state"])), 1.0, places=10)
+
+    def test_sparse_exact_ground_energies_match_dense_reference_on_small_tfim_systems(self) -> None:
+        cases = (
+            ((3, 1), False, 0.8),
+            ((4, 1), False, 1.0),
+            ((2, 2), True, 0.5),
+        )
+
+        for lattice_shape, pbc, field_strength in cases:
+            with self.subTest(lattice_shape=lattice_shape, pbc=pbc, h=field_strength):
+                graph = SquareLattice(*lattice_shape, pbc=pbc)
+                hilbert = SpinHilbert(graph.n_nodes)
+                operator = tfim(hilbert, graph, J=1.0, h=field_strength)
+
+                expected = float(np.linalg.eigvalsh(dense_debug_operator_matrix(operator))[0].real)
+                actual = exact_ground_state_energy(operator)
+
+                self.assertAlmostEqual(actual, expected, places=10)
 
 
 if __name__ == "__main__":

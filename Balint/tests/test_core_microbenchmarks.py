@@ -13,10 +13,11 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from nqs.exact_diag_debug import dense_debug_operator_matrix
+from nqs.exact_diag import solve_sparse_ground_state, sparse_operator_matrix
 from nqs.graph import Chain1D
 from nqs.hilbert import SpinHilbert
 from nqs.operator import Operator, collect_terms, sx_term, szsz_term
+from nqs.workflows import run_incremental_exercise_1_ed_benchmark
 
 
 @dataclass(frozen=True)
@@ -93,12 +94,18 @@ def _validate_operator_connected_elements(
     assert result == expected
 
 
-def _validate_exact_diag_matrix(operator: Operator, matrix: np.ndarray) -> None:
+def _validate_sparse_operator_matrix(operator: Operator, matrix) -> None:
     dimension = operator.hilbert.n_states
     assert matrix.shape == (dimension, dimension)
-    np.testing.assert_allclose(matrix, matrix.conj().T)
-    assert np.isclose(matrix[0, 0], -(operator.hilbert.size - 1))
-    assert np.isclose(matrix[1, 0], -0.8)
+    dense_matrix = matrix.toarray()
+    np.testing.assert_allclose(dense_matrix, dense_matrix.conj().T)
+    assert np.isclose(dense_matrix[0, 0], -(operator.hilbert.size - 1))
+    assert np.isclose(dense_matrix[1, 0], -0.8)
+
+
+def _validate_sparse_ground_state(_context, result: dict[str, np.ndarray | float]) -> None:
+    assert np.isfinite(result["ground_energy"])
+    assert np.isclose(np.linalg.norm(np.asarray(result["ground_state"], dtype=np.complex128)), 1.0)
 
 
 def run_core_microbenchmarks() -> list[MicrobenchmarkResult]:
@@ -122,14 +129,21 @@ def run_core_microbenchmarks() -> list[MicrobenchmarkResult]:
         validate_fn=_validate_operator_connected_elements,
         repeats=16,
     )
-    exact_diag_result = _measure_microbenchmark(
-        "exact_diag_debug.dense_debug_operator_matrix",
+    exact_diag_assembly_result = _measure_microbenchmark(
+        "exact_diag.sparse_operator_matrix",
         setup_fn=lambda: _build_chain_tfim_operator(8, field_strength=0.8),
-        run_fn=dense_debug_operator_matrix,
-        validate_fn=_validate_exact_diag_matrix,
+        run_fn=sparse_operator_matrix,
+        validate_fn=_validate_sparse_operator_matrix,
         repeats=4,
     )
-    return [hilbert_result, operator_result, exact_diag_result]
+    exact_diag_solve_result = _measure_microbenchmark(
+        "exact_diag.solve_sparse_ground_state",
+        setup_fn=lambda: sparse_operator_matrix(_build_chain_tfim_operator(10, field_strength=0.8)),
+        run_fn=solve_sparse_ground_state,
+        validate_fn=_validate_sparse_ground_state,
+        repeats=4,
+    )
+    return [hilbert_result, operator_result, exact_diag_assembly_result, exact_diag_solve_result]
 
 
 def format_core_microbenchmark_table(results: list[MicrobenchmarkResult]) -> str:
@@ -157,7 +171,8 @@ class CoreMicrobenchmarkTests(unittest.TestCase):
             [
                 "hilbert.state_bitmap_roundtrip",
                 "operator.connected_elements_bits",
-                "exact_diag_debug.dense_debug_operator_matrix",
+                "exact_diag.sparse_operator_matrix",
+                "exact_diag.solve_sparse_ground_state",
             ],
         )
         self.assertTrue(all(result.setup_ms >= 0.0 for result in results))
@@ -171,7 +186,17 @@ class CoreMicrobenchmarkTests(unittest.TestCase):
 
         self.assertIn("hilbert.state_bitmap_roundtrip", table)
         self.assertIn("operator.connected_elements_bits", table)
-        self.assertIn("exact_diag_debug.dense_debug_operator_matrix", table)
+        self.assertIn("exact_diag.sparse_operator_matrix", table)
+        self.assertIn("exact_diag.solve_sparse_ground_state", table)
+
+    def test_incremental_exercise_1_ed_benchmark_tracks_runtime_and_completion(self) -> None:
+        result = run_incremental_exercise_1_ed_benchmark([4, 6], h=1.0, pbc=False)
+
+        self.assertEqual(result["length"].tolist(), [4, 6])
+        self.assertTrue(result["completed"].all())
+        self.assertTrue((result["runtime_seconds"] > 0.0).all())
+        self.assertTrue((result["failure_type"] == "").all())
+        self.assertTrue(np.isfinite(result["ground_energy"]).all())
 
 
 if __name__ == "__main__":

@@ -270,6 +270,23 @@ class VMCTests(unittest.TestCase):
         np.testing.assert_allclose(actual, expected)
         self.assertGreaterEqual(sparse_builder.call_count, 1)
 
+    def test_exact_backend_expect_with_params_matches_dense_reference(self) -> None:
+        hilbert = SpinHilbert(4)
+        operator = _chain_tfim_operator(hilbert, h=1.0)
+        model = RBM(alpha=1)
+        params = model.init(jax.random.PRNGKey(0), hilbert)
+        backend = ProjectExpectationBackend(
+            model=model,
+            sampler=self._make_sampler(hilbert, seed=14),
+            params=params,
+        )
+
+        psi = np.asarray(backend._exact_statevector_for_params(params), dtype=np.complex128)
+        expected = np.vdot(psi, dense_debug_operator_matrix(operator) @ psi)
+        actual = np.asarray(backend.expect_with_params(operator, params).mean)
+
+        np.testing.assert_allclose(actual, expected)
+
     def test_j1j2_architectures_match_ed_with_phase_capable_ansatze(self) -> None:
         hilbert = SpinHilbert(4)
         graph = SquareLattice(2, 2, pbc=True)

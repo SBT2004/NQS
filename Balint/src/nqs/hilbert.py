@@ -73,6 +73,11 @@ class SpinHilbert:
         return np.stack([self.index_to_state(int(bit)) for bit in bit_list], axis=0)
 
     def all_states(self) -> SpinStateBatch:
+        if self.N <= 64:
+            indices = np.arange(self.n_states, dtype=np.uint64)[:, None]
+            bit_positions = np.arange(self.N, dtype=np.uint64)
+            return ((indices >> bit_positions) & 1).astype(np.uint8, copy=False)
+
         states = np.zeros((self.n_states, self.N), dtype=np.uint8)
         for index in range(self.n_states):
             states[index] = self.index_to_state(index)

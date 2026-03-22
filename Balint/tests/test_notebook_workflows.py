@@ -18,6 +18,7 @@ from nqs.workflows import (  # noqa: E402
     run_architecture_benchmark,
     run_architecture_comparison,
     run_ghz_bonus_workflow,
+    run_incremental_exercise_1_ed_benchmark,
     run_hamiltonian_system_size_sweep,
     run_non_ed_vmc_benchmark,
     run_random_architecture_study,
@@ -27,6 +28,7 @@ from nqs.workflows import (  # noqa: E402
     tfim_proxy_sweep_points,
 )
 import nqs.observables as observables  # noqa: E402
+from nqs.exact_diag_debug import dense_debug_operator_matrix  # noqa: E402
 
 
 def _bell_log_amplitude(states: np.ndarray) -> np.ndarray:
@@ -72,6 +74,51 @@ class NotebookWorkflowTests(unittest.TestCase):
         )
         np.testing.assert_allclose(summary["correlation_matrix"].to_numpy(), np.ones((2, 2)))
 
+    def test_exact_observables_summary_matches_dense_reference_on_small_chain(self) -> None:
+        system = build_system(lattice_shape=(4, 1), pbc=False, hamiltonian="tfim", h=1.0)
+        dense_eigenvalues, dense_eigenvectors = np.linalg.eigh(dense_debug_operator_matrix(system["operator"]))
+        dense_ground_state = np.asarray(dense_eigenvectors[:, 0], dtype=np.complex128)
+        dominant_amplitude = dense_ground_state[np.argmax(np.abs(dense_ground_state))]
+        if dominant_amplitude != 0:
+            dense_ground_state *= np.exp(-1j * np.angle(dominant_amplitude))
+        dense_probabilities = np.abs(dense_ground_state) ** 2
+        dense_states = system["hilbert"].all_states()
+        dense_correlations = np.einsum(
+            "bi,bj,b->ij",
+            system["hilbert"].states_to_pm1(dense_states),
+            system["hilbert"].states_to_pm1(dense_states),
+            dense_probabilities,
+            optimize=True,
+        )
+
+        summary = exact_observables_summary(system["operator"], subsystem=(0, 1))
+
+        self.assertAlmostEqual(summary["ground_energy"], float(dense_eigenvalues[0].real), places=10)
+        overlap = np.vdot(dense_ground_state, summary["ground_state"])
+        self.assertAlmostEqual(float(np.abs(overlap)), 1.0, places=10)
+        self.assertAlmostEqual(
+            summary["half_partition_von_neumann"],
+            observables.von_neumann_entropy(dense_ground_state, subsystem=(0, 1)),
+            places=10,
+        )
+        self.assertAlmostEqual(
+            summary["half_partition_renyi2"],
+            observables.renyi_entropy_from_statevector(dense_ground_state, subsystem=(0, 1), alpha=2.0),
+            places=10,
+        )
+        np.testing.assert_allclose(summary["correlation_matrix"].to_numpy(), dense_correlations)
+
+    def test_exact_observables_summary_avoids_dense_hamiltonian_allocation(self) -> None:
+        system = build_system(lattice_shape=(4, 1), pbc=False, hamiltonian="tfim", h=1.0)
+
+        with patch(
+            "scipy.sparse._csr.csr_array.toarray",
+            side_effect=AssertionError("dense Hamiltonian allocation is not allowed on the main ED path"),
+        ):
+            summary = exact_observables_summary(system["operator"], subsystem=(0, 1))
+
+        self.assertTrue(np.isfinite(summary["ground_energy"]))
+
     def test_sampled_entropy_scaling_summary_averages_independent_runs(self) -> None:
         class FakeState:
             def __init__(self) -> None:
@@ -115,6 +162,17 @@ class NotebookWorkflowTests(unittest.TestCase):
         self.assertEqual(config["lattice_shape"], (4, 1))
         self.assertEqual([point["label"] for point in sweep_points], ["tfim_1d_4x1", "tfim_1d_6x1"])
         self.assertEqual([point["lattice_shape"] for point in sweep_points], [(4, 1), (6, 1)])
+
+    def test_incremental_exercise_1_ed_benchmark_records_per_size_completion(self) -> None:
+        benchmark = run_incremental_exercise_1_ed_benchmark([4, 6], h=1.0, pbc=False)
+
+        self.assertEqual(benchmark["label"].tolist(), ["tfim_1d_4x1", "tfim_1d_6x1"])
+        self.assertTrue(benchmark["completed"].all())
+        self.assertTrue((benchmark["runtime_seconds"] > 0.0).all())
+        self.assertTrue((benchmark["assembly_seconds"] > 0.0).all())
+        self.assertTrue((benchmark["solve_seconds"] > 0.0).all())
+        self.assertTrue((benchmark["failure_message"] == "").all())
+        self.assertTrue(np.isfinite(benchmark["ground_energy"]).all())
 
     def test_run_vmc_experiment_records_all_steps_and_rbm_entropy_repeat_default(self) -> None:
         result = run_vmc_experiment(
