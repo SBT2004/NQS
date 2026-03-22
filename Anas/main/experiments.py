@@ -8,7 +8,7 @@ from hamiltonians import TFIM
 from observables import Observables
 from optimizers import AdamOptimizer, SROptimizer
 from ED import exact_tfim_ground_energy
-
+from ED import exact_tfim_entropies
 
 def build_model(
     model_name,
@@ -155,8 +155,14 @@ def run_model(
     S_sr = jnp.array(S_sr)
 
     exact_energy = None
+    exact_entropy = None
+    exact_vn_entropy = None
+
     if L <= 14:
-        exact_energy = exact_tfim_ground_energy(L, J, g)
+        exact_results = exact_tfim_entropies(L, J, g, entropy_subsystem_size)
+        exact_energy = exact_results["energy"]
+        exact_vn_entropy = exact_results["SvN"]
+        exact_entropy = exact_results["S2"]
 
     return {
         "model": model_name,
@@ -182,6 +188,8 @@ def run_model(
         "E_sr": E_sr,
         "S_sr": S_sr,
         "exact_energy": exact_energy,
+        "exact_entropy": exact_entropy,
+        "exact_vn_entropy": exact_vn_entropy,
         "final_params_adam": params_adam,
         "final_params_sr": params_sr,
     }
@@ -212,16 +220,60 @@ def run_g_scan(
             final_entropy = float(res["S_adam"][-1])
 
         exact_energy = None if res["exact_energy"] is None else float(res["exact_energy"])
+        exact_entropy = None if res["exact_entropy"] is None else float(res["exact_entropy"])
 
         results.append({
             "g": float(g),
             "final_energy": final_energy,
             "final_entropy": final_entropy,
             "exact_energy": exact_energy,
+            "exact_entropy": exact_entropy,
             "full_result": res,
         })
     return results
 
+def run_g_scan_with_errorbars(
+    model_name,
+    g_values,
+    seeds,
+    *,
+    use_optimizer="SR",
+    **kwargs,
+):
+    results = []
+
+    for g in g_values:
+        energies = []
+        entropies = []
+        exact_energy = None
+        exact_entropy = None
+
+        for seed in seeds:
+            res = run_model(model_name, g=float(g), seed=int(seed), **kwargs)
+
+            if use_optimizer.upper() == "SR":
+                energies.append(float(res["E_sr"][-1]))
+                entropies.append(float(res["S_sr"][-1]))
+            else:
+                energies.append(float(res["E_adam"][-1]))
+                entropies.append(float(res["S_adam"][-1]))
+
+            exact_energy = None if res["exact_energy"] is None else float(res["exact_energy"])
+            exact_entropy = None if res["exact_entropy"] is None else float(res["exact_entropy"])
+
+        results.append({
+            "g": float(g),
+            "energy_mean": jnp.mean(jnp.array(energies)),
+            "energy_std": jnp.std(jnp.array(energies)),
+            "entropy_mean": jnp.mean(jnp.array(entropies)),
+            "entropy_std": jnp.std(jnp.array(entropies)),
+            "exact_energy": exact_energy,
+            "exact_entropy": exact_entropy,
+            "energies": energies,
+            "entropies": entropies,
+        })
+
+    return results
 
 def run_L_scan(
     model_name,
@@ -254,7 +306,7 @@ def run_L_scan(
 
 def run_entropy_vs_subsystem_size(
     model_name,
-    subsystem_sizes,
+    subsystem_sizes=None,   
     *,
     optimizer="SR",
     L=10,
@@ -264,6 +316,15 @@ def run_entropy_vs_subsystem_size(
     seed=0,
     **kwargs,
 ):
+    # -------------------------
+    # Default behavior
+    # -------------------------
+    if subsystem_sizes is None:
+        subsystem_sizes = list(range(1, L // 2 + 1))
+
+    # -------------------------
+    # Train model
+    # -------------------------
     res = run_model(
         model_name,
         L=L,
@@ -274,14 +335,19 @@ def run_entropy_vs_subsystem_size(
         **kwargs,
     )
 
-    key = random.PRNGKey(seed + 12345)
-
+    # -------------------------
+    # Select trained params
+    # -------------------------
     if optimizer.upper() == "SR":
         params = res["final_params_sr"]
     else:
         params = res["final_params_adam"]
 
+    # -------------------------
+    # Rebuild model + sampler
+    # -------------------------
     arch_key = random.PRNGKey(seed + 999)
+
     arch, params0, _ = build_model(
         model_name=model_name,
         L=L,
@@ -295,6 +361,7 @@ def run_entropy_vs_subsystem_size(
 
     wf = NeuralQuantumState(arch, params0, L)
     obs = Observables(wf)
+
     sampler = Sampler(
         kwargs.get("nchains", 32),
         kwargs.get("nsamples_per_chain", 16),
@@ -306,12 +373,17 @@ def run_entropy_vs_subsystem_size(
     sample_key = random.PRNGKey(seed + 54321)
     samples = sampler.sample_chain(sample_key, params)
 
+    # -------------------------
+    # Compute entropy profile
+    # -------------------------
+    key = random.PRNGKey(seed + 12345)
+
     profile = obs.entropy_profile(
-        params=params,
-        samples=samples,
-        key=key,
-        subsystem_sizes=subsystem_sizes,
-        n_pairings=entropy_pairings,
+    params=params,
+    samples=samples,
+    key=key,
+    subsystem_sizes=subsystem_sizes,
+    n_pairings=entropy_pairings,
     )
 
     return {

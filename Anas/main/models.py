@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from jax import random
+from jax.flatten_util import ravel_pytree
 from functools import partial
 
 
@@ -18,7 +19,7 @@ class NeuralQuantumState:
         return jax.vmap(self.logpsi, in_axes=(None, 0))(params, sigmas)
 
     def flatten_params(self, params):
-        flat, unravel = jax.flatten_util.ravel_pytree(params)
+        flat, unravel = ravel_pytree(params)
         return flat, unravel
 
 
@@ -77,6 +78,7 @@ class CNN:
         keys = random.split(key, self.n_conv_layers + 1)
 
         conv_params = []
+
         W0 = random.normal(keys[0], (self.channels, 1, self.kernel)) * 0.5
         b0 = jnp.zeros(self.channels)
         conv_params.append((W0, b0))
@@ -88,6 +90,7 @@ class CNN:
 
         dense = random.normal(keys[-1], (self.channels * self.L, 1)) * 0.5
         bias = jnp.zeros(1)
+
         return (conv_params, dense, bias)
 
     @partial(jax.jit, static_argnames=("self",))
@@ -108,10 +111,7 @@ class CNN:
 
         x = x.reshape(-1)
         return (dense.T @ x + bias)[0]
-    
+
 def count_parameters(params):
-    """
-    Count total number of scalar trainable parameters in a pytree.
-    """
-    flat, _ = jax.flatten_util.ravel_pytree(params)
+    flat, _ = ravel_pytree(params)
     return int(flat.size)

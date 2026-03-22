@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import optax
+from jax.flatten_util import ravel_pytree
 
 
 class AdamOptimizer:
@@ -20,13 +21,13 @@ class AdamOptimizer:
 
         def grad_logpsi(p, s):
             g = jax.grad(self.wf.logpsi)(p, s)
-            return jax.flatten_util.ravel_pytree(g)[0]
+            return ravel_pytree(g)[0]
 
         O = jax.vmap(grad_logpsi, in_axes=(None, 0))(params, samples)
         O_mean = jnp.mean(O, axis=0)
         grad_E = 2.0 * jnp.mean((energies - E_mean)[:, None] * (O - O_mean), axis=0)
 
-        flat, unravel = jax.flatten_util.ravel_pytree(params)
+        flat, unravel = ravel_pytree(params)
         updates, self.state = self.opt.update(grad_E, self.state, flat)
         flat = optax.apply_updates(flat, updates)
 
@@ -48,7 +49,7 @@ class SROptimizer:
 
         def grad_logpsi(p, s):
             g = jax.grad(self.wf.logpsi)(p, s)
-            return jax.flatten_util.ravel_pytree(g)[0]
+            return ravel_pytree(g)[0]
 
         O = jax.vmap(grad_logpsi, in_axes=(None, 0))(params, samples)
         O_mean = jnp.mean(O, axis=0, keepdims=True)
@@ -61,7 +62,7 @@ class SROptimizer:
 
         delta = -self.lr * jnp.linalg.solve(S, grad_E)
 
-        flat, unravel = jax.flatten_util.ravel_pytree(params)
+        flat, unravel = ravel_pytree(params)
         flat = flat + delta
 
         return unravel(flat), E_mean, samples

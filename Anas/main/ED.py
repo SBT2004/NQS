@@ -82,3 +82,61 @@ def exact_tfim_entropies(L, J, g, subsystem_size):
         "SvN": SvN,
         "S2": S2,
     }
+
+def exact_energy_variance(L, J, g):
+    """
+    For an exact eigenstate this should be ~ 0.
+    """
+    H = exact_tfim_hamiltonian(L, J, g)
+    E0, psi0 = exact_tfim_ground_state(L, J, g)
+
+    Hpsi = H @ psi0
+    H2psi = H @ Hpsi
+
+    mean_E = jnp.vdot(psi0, Hpsi)
+    mean_E2 = jnp.vdot(psi0, H2psi)
+
+    return jnp.real(mean_E2 - mean_E**2)
+
+
+def exact_magnetization_z(L, J, g):
+    """
+    <m_z> = < (1/L) sum_i sigma_i >
+    """
+    E0, psi0 = exact_tfim_ground_state(L, J, g)
+    states = enumerate_spin_basis(L)
+    probs = jnp.abs(psi0) ** 2
+
+    mz_vals = jnp.mean(states, axis=1)
+    return jnp.sum(probs * mz_vals)
+
+
+def exact_abs_magnetization_z(L, J, g):
+    """
+    <|m_z|>
+    """
+    E0, psi0 = exact_tfim_ground_state(L, J, g)
+    states = enumerate_spin_basis(L)
+    probs = jnp.abs(psi0) ** 2
+
+    mz_vals = jnp.mean(states, axis=1)
+    return jnp.sum(probs * jnp.abs(mz_vals))
+
+
+def exact_spin_spin_correlation(L, J, g, r):
+    """
+    C(r) = (1/L) sum_i <sigma_i sigma_{i+r}>
+    """
+    E0, psi0 = exact_tfim_ground_state(L, J, g)
+    states = enumerate_spin_basis(L)
+    probs = jnp.abs(psi0) ** 2
+
+    corr_vals = jnp.mean(states * jnp.roll(states, -r, axis=1), axis=1)
+    return jnp.sum(probs * corr_vals)
+
+
+def exact_correlation_profile(L, J, g, r_values):
+    out = {}
+    for r in r_values:
+        out[int(r)] = exact_spin_spin_correlation(L, J, g, int(r))
+    return out
