@@ -9,7 +9,7 @@ from scipy.sparse.linalg import eigsh
 from .operator import Operator
 
 
-class ExactDiagResult(TypedDict):
+class ExactGroundStateResult(TypedDict):
     ground_state: np.ndarray
     ground_energy: float
 
@@ -37,16 +37,9 @@ def sparse_operator_matrix(operator: Operator) -> csr_array:
     return matrix
 
 
-def operator_matrix(operator: Operator) -> np.ndarray:
-    """Debug/demo-only dense matrix helper for small exact checks.
+def exact_ground_state(operator: Operator) -> ExactGroundStateResult:
+    """Return the sparse-solver ground-state result for production ED paths."""
 
-    The production ED path uses :func:`sparse_operator_matrix` instead.
-    """
-
-    return np.asarray(sparse_operator_matrix(operator).toarray(), dtype=np.complex128)
-
-
-def exact_ground_state(operator: Operator) -> ExactDiagResult:
     sparse_matrix = sparse_operator_matrix(operator)
     eigenvalues, eigenvectors = eigsh(sparse_matrix, k=1, which="SA")
     ground_energy = float(eigenvalues[0].real)
@@ -62,3 +55,11 @@ def exact_ground_state(operator: Operator) -> ExactDiagResult:
 
 def exact_ground_state_energy(operator: Operator) -> float:
     return float(exact_ground_state(operator)["ground_energy"])
+
+
+__all__ = [
+    "ExactGroundStateResult",
+    "exact_ground_state",
+    "exact_ground_state_energy",
+    "sparse_operator_matrix",
+]

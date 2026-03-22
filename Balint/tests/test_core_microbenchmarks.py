@@ -13,7 +13,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from nqs.exact_diag import operator_matrix
+from nqs.exact_diag_debug import dense_debug_operator_matrix
 from nqs.graph import Chain1D
 from nqs.hilbert import SpinHilbert
 from nqs.operator import Operator, collect_terms, sx_term, szsz_term
@@ -123,9 +123,9 @@ def run_core_microbenchmarks() -> list[MicrobenchmarkResult]:
         repeats=16,
     )
     exact_diag_result = _measure_microbenchmark(
-        "exact_diag.operator_matrix",
+        "exact_diag_debug.dense_debug_operator_matrix",
         setup_fn=lambda: _build_chain_tfim_operator(8, field_strength=0.8),
-        run_fn=operator_matrix,
+        run_fn=dense_debug_operator_matrix,
         validate_fn=_validate_exact_diag_matrix,
         repeats=4,
     )
@@ -157,7 +157,7 @@ class CoreMicrobenchmarkTests(unittest.TestCase):
             [
                 "hilbert.state_bitmap_roundtrip",
                 "operator.connected_elements_bits",
-                "exact_diag.operator_matrix",
+                "exact_diag_debug.dense_debug_operator_matrix",
             ],
         )
         self.assertTrue(all(result.setup_ms >= 0.0 for result in results))
@@ -171,7 +171,7 @@ class CoreMicrobenchmarkTests(unittest.TestCase):
 
         self.assertIn("hilbert.state_bitmap_roundtrip", table)
         self.assertIn("operator.connected_elements_bits", table)
-        self.assertIn("exact_diag.operator_matrix", table)
+        self.assertIn("exact_diag_debug.dense_debug_operator_matrix", table)
 
 
 if __name__ == "__main__":

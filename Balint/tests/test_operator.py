@@ -6,7 +6,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from nqs.exact_diag import exact_ground_state, operator_matrix, sparse_operator_matrix
+from nqs.exact_diag import exact_ground_state, sparse_operator_matrix
+from nqs.exact_diag_debug import dense_debug_operator_matrix
 from nqs.graph import SquareLattice
 from nqs.hilbert import SpinHilbert
 from nqs.operator import LocalTerm, Operator, heisenberg_term, j1_j2, local_matrix, sigmax, sigmaz, tfim
@@ -146,7 +147,7 @@ class OperatorTests(unittest.TestCase):
         hilbert = SpinHilbert(2)
         operator = Operator(hilbert, [LocalTerm((0,), sigmax()), LocalTerm((1,), sigmaz())])
 
-        matrix = operator_matrix(operator)
+        matrix = dense_debug_operator_matrix(operator)
         expected = np.array(
             [
                 [1, 1, 0, 0],
@@ -169,7 +170,7 @@ class OperatorTests(unittest.TestCase):
             ],
         )
 
-        dense_matrix = operator_matrix(operator)
+        dense_matrix = dense_debug_operator_matrix(operator)
         sparse_matrix = sparse_operator_matrix(operator)
 
         np.testing.assert_allclose(sparse_matrix.toarray(), dense_matrix)
@@ -180,7 +181,7 @@ class OperatorTests(unittest.TestCase):
         graph = SquareLattice(3, 1, pbc=False)
         operator = tfim(hilbert, graph, J=1.0, h=0.8)
 
-        expected_eigenvalues, expected_eigenvectors = np.linalg.eigh(operator_matrix(operator))
+        expected_eigenvalues, expected_eigenvectors = np.linalg.eigh(dense_debug_operator_matrix(operator))
         result = exact_ground_state(operator)
 
         self.assertAlmostEqual(result["ground_energy"], float(expected_eigenvalues[0].real))

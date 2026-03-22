@@ -13,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from nqs.driver import VMC
 import nqs.expectation as expectation_module
 from nqs.expectation import ProjectExpectationBackend
-from nqs.exact_diag import exact_ground_state_energy, operator_matrix, sparse_operator_matrix
+from nqs.exact_diag import exact_ground_state_energy, sparse_operator_matrix
+from nqs.exact_diag_debug import dense_debug_operator_matrix
 from nqs.graph import Chain1D, SquareLattice
 from nqs.hilbert import SpinHilbert
 from nqs.loss import energy_loss
@@ -257,7 +258,7 @@ class VMCTests(unittest.TestCase):
         )
 
         psi = np.asarray(backend.exact_statevector(), dtype=np.complex128)
-        expected = np.vdot(psi, operator_matrix(operator) @ psi)
+        expected = np.vdot(psi, dense_debug_operator_matrix(operator) @ psi)
 
         with mock.patch.object(
             expectation_module,
