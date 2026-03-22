@@ -10,7 +10,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from demos.exercise_report_helper import build_output_manifest, plot_training_history, save_report_figure, save_report_table  # noqa: E402
+from demos.exercise_report_helper import (  # noqa: E402
+    add_report_figure_context,
+    build_output_manifest,
+    plot_training_history,
+    save_report_figure,
+    save_report_table,
+)
 
 
 class ExerciseReportHelperTests(unittest.TestCase):
@@ -31,6 +37,11 @@ class ExerciseReportHelperTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             table_paths = save_report_table(summary_table, "architecture_summary", output_dir=temp_dir)
             figure = plot_training_history(history_table, "renyi2_entropy")
+            add_report_figure_context(
+                figure,
+                distinction="Required report output",
+                context="Exercise helper smoke test",
+            )
             figure_path = save_report_figure(figure, "training_history", output_dir=temp_dir)
             plt.close(figure)
 
