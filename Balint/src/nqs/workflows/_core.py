@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from time import perf_counter
 from typing import TYPE_CHECKING, Any, Sequence, cast
 
 import jax
@@ -256,6 +257,104 @@ def sampled_entropy_scaling_summary(
         "entropy_table": entropy_table,
         "entropy_samples": entropy_samples,
         "scaling_fit": scaling_fit,
+    }
+
+
+def _energy_trend_metrics(history_df: pd.DataFrame, *, window: int = 5) -> dict[str, float]:
+    energy_values = np.asarray(history_df["energy"], dtype=np.float64)
+    if energy_values.size == 0:
+        raise ValueError("history_df must contain at least one energy value.")
+
+    tail_size = min(window, energy_values.size)
+    tail = energy_values[-tail_size:]
+    if tail_size >= 2:
+        tail_steps = np.arange(tail_size, dtype=np.float64)
+        tail_slope = float(np.polyfit(tail_steps, tail, deg=1)[0])
+    else:
+        tail_slope = 0.0
+
+    return {
+        "initial_energy": float(energy_values[0]),
+        "best_energy": float(np.min(energy_values)),
+        "energy_drop": float(energy_values[0] - energy_values[-1]),
+        "tail_window_energy_std": float(np.std(tail, ddof=0)),
+        "tail_window_energy_slope": tail_slope,
+    }
+
+
+def _mean_nn_correlation_from_spins(
+    spins_pm1: np.ndarray,
+    nn_edges: np.ndarray,
+) -> float:
+    if nn_edges.size == 0:
+        return float("nan")
+    correlations = spins_pm1[:, nn_edges[:, 0]] * spins_pm1[:, nn_edges[:, 1]]
+    return float(np.mean(correlations))
+
+
+def _sampled_final_observable_summary(
+    variational_state: SupportsSamplingAndLogValue,
+    graph: SquareLattice,
+    *,
+    entropy_n_independent_runs: int,
+    observable_n_independent_runs: int = 3,
+) -> dict[str, float]:
+    if observable_n_independent_runs <= 0:
+        raise ValueError("observable_n_independent_runs must be positive.")
+
+    abs_magnetization_values: list[float] = []
+    nn_correlation_values: list[float] = []
+    nn_edges = np.asarray(tuple(graph.iter_neighbor_pairs(1)), dtype=np.intp)
+    for run_index in range(observable_n_independent_runs):
+        sample_batch = np.asarray(
+            variational_state.independent_sample(seed_offset=1_000 + run_index),
+            dtype=np.uint8,
+        )
+        spins_pm1 = 2.0 * sample_batch.astype(np.float64) - 1.0
+        per_sample_magnetization = np.mean(spins_pm1, axis=1)
+        abs_magnetization_values.append(float(np.mean(np.abs(per_sample_magnetization))))
+        nn_correlation_values.append(_mean_nn_correlation_from_spins(spins_pm1, nn_edges))
+
+    subsystem = half_subsystem(graph.n_nodes)
+    try:
+        entropy_stats = observables.renyi2_entropy_statistics(
+            variational_state,
+            subsystem=subsystem,
+            n_repeats=entropy_n_independent_runs,
+            force_sampled=True,
+        )
+        half_partition_renyi2 = float(entropy_stats["mean"])
+        half_partition_renyi2_std = float(entropy_stats["std"])
+        entropy_success = 1.0
+    except ValueError:
+        half_partition_renyi2 = np.nan
+        half_partition_renyi2_std = np.nan
+        entropy_success = 0.0
+
+    return {
+        "final_half_partition_renyi2": half_partition_renyi2,
+        "final_half_partition_renyi2_std": half_partition_renyi2_std,
+        "entropy_estimator_success": entropy_success,
+        "final_abs_magnetization": float(np.mean(abs_magnetization_values)),
+        "final_abs_magnetization_std": float(np.std(abs_magnetization_values, ddof=0)),
+        "final_nn_correlation": float(np.mean(nn_correlation_values)),
+        "final_nn_correlation_std": float(np.std(nn_correlation_values, ddof=0)),
+    }
+
+
+def _non_ed_training_observables(
+    variational_state: SupportsSamplingAndLogValue,
+    graph: SquareLattice,
+    *,
+    step: int,
+) -> dict[str, object]:
+    sample_batch = np.asarray(variational_state.independent_sample(seed_offset=10_000 + step), dtype=np.uint8)
+    spins_pm1 = 2.0 * sample_batch.astype(np.float64) - 1.0
+    per_sample_magnetization = np.mean(spins_pm1, axis=1)
+    nn_edges = np.asarray(tuple(graph.iter_neighbor_pairs(1)), dtype=np.intp)
+    return {
+        "abs_magnetization": float(np.mean(np.abs(per_sample_magnetization))),
+        "nn_correlation": _mean_nn_correlation_from_spins(spins_pm1, nn_edges),
     }
 
 
@@ -844,6 +943,199 @@ def _default_sweep_label(config: dict[str, Any]) -> str:
     if hamiltonian == "j1_j2":
         return f"j1j2_L{lattice_label}_J2{config.get('J2', 0.4)}"
     return f"{hamiltonian}_L{lattice_label}"
+
+
+def run_non_ed_vmc_benchmark(
+    benchmark_configs: dict[str, dict[str, Any]],
+    *,
+    sweep_points: Sequence[dict[str, Any]],
+    learning_rate: float = 1e-2,
+    n_samples: int = 128,
+    n_discard_per_chain: int = 16,
+    n_chains: int = 8,
+    n_iter: int = 20,
+    callback_every: int = 5,
+    entropy_n_independent_runs: int = 4,
+    max_entropy_subsystem_size: int | None = 4,
+    base_seed: int = 0,
+) -> dict[str, Any]:
+    if not benchmark_configs:
+        raise ValueError("benchmark_configs must not be empty.")
+    if not sweep_points:
+        raise ValueError("sweep_points must not be empty.")
+
+    summary_rows: list[dict[str, Any]] = []
+    history_frames: list[pd.DataFrame] = []
+    entropy_frames: list[pd.DataFrame] = []
+    benchmark_results: list[dict[str, Any]] = []
+    for config_offset, (benchmark_label, benchmark_config) in enumerate(benchmark_configs.items()):
+        if "model_name" not in benchmark_config:
+            raise ValueError("each benchmark config must define model_name.")
+        model_name = str(benchmark_config["model_name"])
+        model_kwargs = dict(benchmark_config.get("model_kwargs", {}))
+
+        for sweep_offset, raw_point in enumerate(sweep_points):
+            point = dict(raw_point)
+            if "hamiltonian" not in point:
+                raise ValueError("each sweep point must define a hamiltonian.")
+
+            system_label = str(point.pop("label", _default_sweep_label(point)))
+            raw_lattice_shape = tuple(point.pop("lattice_shape", (2, 2)))
+            if len(raw_lattice_shape) != 2:
+                raise ValueError("lattice_shape must contain exactly two dimensions.")
+            lattice_shape = (int(raw_lattice_shape[0]), int(raw_lattice_shape[1]))
+            pbc = bool(point.pop("pbc", True))
+            hamiltonian = str(point.pop("hamiltonian"))
+            seed = base_seed + (config_offset * len(sweep_points)) + sweep_offset
+
+            system = build_system(
+                lattice_shape=lattice_shape,
+                pbc=pbc,
+                hamiltonian=hamiltonian,
+                **point,
+            )
+            hilbert = system["hilbert"]
+            model, variational_state, vmc_driver = build_vmc_experiment(
+                hilbert=hilbert,
+                operator=system["operator"],
+                learning_rate=learning_rate,
+                seed=seed,
+                n_samples=n_samples,
+                n_discard_per_chain=n_discard_per_chain,
+                n_chains=n_chains,
+                model_name=model_name,
+                model_kwargs=model_kwargs,
+                lattice_shape=lattice_shape,
+            )
+            parameter_count = _count_model_parameters(variational_state.parameters)
+            callback_runtime_seconds = 0.0
+
+            def benchmark_callback(step: int, driver: Any, graph: SquareLattice = system["graph"]) -> dict[str, object]:
+                nonlocal callback_runtime_seconds
+                callback_start = perf_counter()
+                result = _non_ed_training_observables(
+                    driver.variational_state,
+                    graph,
+                    step=step,
+                )
+                callback_runtime_seconds += perf_counter() - callback_start
+                return result
+
+            start = perf_counter()
+            history = vmc_driver.run(
+                n_iter,
+                callback=benchmark_callback,
+                callback_every=callback_every,
+            )
+            total_runtime_seconds = perf_counter() - start
+            runtime_seconds = max(0.0, total_runtime_seconds - callback_runtime_seconds)
+            history_df = history_table(history)
+            final_energy = float(np.asarray(variational_state.energy(system["operator"])))
+            final_row: dict[str, Any] = {
+                column: np.nan
+                for column in history_df.columns
+                if column not in {"step", "energy"}
+            }
+            final_row.update(
+                {
+                    "step": n_iter,
+                    "energy": final_energy,
+                    "is_post_update": True,
+                }
+            )
+            history_df["is_post_update"] = False
+            history_df = pd.concat(
+                [history_df, pd.DataFrame([final_row])],
+                ignore_index=True,
+            )
+            history_df["benchmark_label"] = benchmark_label
+            history_df["model"] = model_name
+            history_df["system_label"] = system_label
+            history_df["lattice_shape"] = [lattice_shape] * len(history_df)
+            history_df["n_sites"] = hilbert.size
+            history_df["parameter_count"] = parameter_count
+            history_df["seed"] = seed
+            history_frames.append(history_df)
+
+            entropy_scan = sampled_entropy_scaling_summary(
+                variational_state,
+                hilbert.size,
+                max_subsystem_size=max_entropy_subsystem_size,
+                n_independent_runs=entropy_n_independent_runs,
+            )
+            entropy_table = entropy_scan["entropy_table"].copy()
+            entropy_table["benchmark_label"] = benchmark_label
+            entropy_table["model"] = model_name
+            entropy_table["system_label"] = system_label
+            entropy_table["lattice_shape"] = [lattice_shape] * len(entropy_table)
+            entropy_table["n_sites"] = hilbert.size
+            entropy_table["parameter_count"] = parameter_count
+            entropy_frames.append(entropy_table)
+            valid_entropy_points = int(np.count_nonzero(np.isfinite(entropy_table["renyi2"])))
+
+            trend_metrics = _energy_trend_metrics(history_df)
+            observable_metrics = _sampled_final_observable_summary(
+                variational_state,
+                system["graph"],
+                entropy_n_independent_runs=entropy_n_independent_runs,
+            )
+
+            summary_rows.append(
+                {
+                    "benchmark_label": benchmark_label,
+                    "model": model_name,
+                    "model_kwargs": model_kwargs,
+                    "system_label": system_label,
+                    "hamiltonian": hamiltonian,
+                    "lattice_shape": lattice_shape,
+                    "n_sites": hilbert.size,
+                    "seed": seed,
+                    "parameter_count": parameter_count,
+                    "final_energy": final_energy,
+                    "final_energy_per_site": final_energy / hilbert.size,
+                    "runtime_seconds": runtime_seconds,
+                    "mean_step_time_seconds": runtime_seconds / max(1, n_iter),
+                    "callback_runtime_seconds": callback_runtime_seconds,
+                    "total_runtime_seconds": total_runtime_seconds,
+                    "history_points": len(history_df),
+                    "valid_entropy_points": valid_entropy_points,
+                    **trend_metrics,
+                    **observable_metrics,
+                }
+            )
+            benchmark_results.append(
+                {
+                    "benchmark_label": benchmark_label,
+                    "model_name": model_name,
+                    "model_kwargs": model_kwargs,
+                    "system_label": system_label,
+                    "seed": seed,
+                    "model": model,
+                    "system": system,
+                    "history": history,
+                    "history_df": history_df,
+                    "entropy_scan_table": entropy_table,
+                    "parameter_count": parameter_count,
+                    "final_energy": final_energy,
+                    "runtime_seconds": runtime_seconds,
+                    "trend_metrics": trend_metrics,
+                    "observable_metrics": observable_metrics,
+                }
+            )
+
+    summary_table = pd.DataFrame(summary_rows).sort_values(
+        by=["n_sites", "model", "parameter_count", "benchmark_label"]
+    ).reset_index(drop=True)
+    training_history_table = pd.concat(history_frames, ignore_index=True)
+    entropy_scan_table = pd.concat(entropy_frames, ignore_index=True)
+    return {
+        "summary_table": summary_table,
+        "training_history_table": training_history_table,
+        "entropy_scan_table": entropy_scan_table,
+        "benchmark_results": benchmark_results,
+        "entropy_n_independent_runs": entropy_n_independent_runs,
+        "max_entropy_subsystem_size": max_entropy_subsystem_size,
+    }
 
 
 def run_hamiltonian_system_size_sweep(

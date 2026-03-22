@@ -16,6 +16,7 @@ from nqs.workflows import (  # noqa: E402
     run_architecture_comparison,
     run_ghz_bonus_workflow,
     run_hamiltonian_system_size_sweep,
+    run_non_ed_vmc_benchmark,
     run_random_architecture_study,
     run_vmc_experiment,
     sampled_entropy_scaling_summary,
@@ -211,6 +212,65 @@ class NotebookWorkflowTests(unittest.TestCase):
             set(result["training_history_table"]["sweep_label"].tolist()),
             {"tfim_critical", "j1j2_frustrated"},
         )
+
+    def test_run_non_ed_vmc_benchmark_reports_non_exact_training_metrics(self) -> None:
+        result = run_non_ed_vmc_benchmark(
+            benchmark_configs={
+                "rbm_small": {
+                    "model_name": "RBM",
+                    "model_kwargs": {"alpha": 1},
+                }
+            },
+            sweep_points=[
+                {
+                    "label": "tfim_4x4_non_ed",
+                    "hamiltonian": "tfim",
+                    "lattice_shape": (4, 4),
+                    "pbc": False,
+                    "h": 1.0,
+                }
+            ],
+            n_samples=8,
+            n_discard_per_chain=1,
+            n_chains=2,
+            n_iter=2,
+            callback_every=1,
+            entropy_n_independent_runs=1,
+            max_entropy_subsystem_size=2,
+        )
+
+        summary = result["summary_table"]
+        self.assertEqual(summary["benchmark_label"].tolist(), ["rbm_small"])
+        self.assertEqual(summary["n_sites"].tolist(), [16])
+        self.assertTrue((summary["parameter_count"] > 0).all())
+        self.assertTrue(np.isfinite(summary["final_energy"]).all())
+        self.assertIn("runtime_seconds", summary.columns)
+        self.assertIn("callback_runtime_seconds", summary.columns)
+        self.assertIn("total_runtime_seconds", summary.columns)
+        self.assertIn("tail_window_energy_std", summary.columns)
+        self.assertIn("final_half_partition_renyi2", summary.columns)
+        self.assertIn("final_nn_correlation", summary.columns)
+        self.assertIn("valid_entropy_points", summary.columns)
+        self.assertEqual(
+            result["training_history_table"]["system_label"].tolist(),
+            ["tfim_4x4_non_ed"] * 3,
+        )
+        self.assertIn("abs_magnetization", result["training_history_table"].columns)
+        self.assertIn("nn_correlation", result["training_history_table"].columns)
+        self.assertIn("is_post_update", result["training_history_table"].columns)
+        self.assertEqual(
+            result["entropy_scan_table"]["subsystem_size"].drop_duplicates().tolist(),
+            [1, 2],
+        )
+        self.assertTrue((summary["valid_entropy_points"] >= 0).all())
+        self.assertTrue((summary["valid_entropy_points"] <= 2).all())
+        self.assertTrue((summary["total_runtime_seconds"] >= summary["runtime_seconds"]).all())
+        self.assertTrue((summary["energy_drop"] >= 0.0).all())
+        history = result["training_history_table"]
+        post_update_rows = history.loc[history["is_post_update"]]
+        self.assertEqual(post_update_rows["step"].tolist(), [2])
+        self.assertTrue(np.isclose(post_update_rows["energy"].iloc[0], summary["final_energy"].iloc[0]))
+        self.assertTrue(np.isclose(summary["best_energy"].iloc[0], np.min(history["energy"])))
 
     def test_run_ghz_bonus_workflow_returns_training_outputs(self) -> None:
         result = run_ghz_bonus_workflow(
