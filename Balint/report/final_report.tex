@@ -30,9 +30,9 @@
     \begin{equation}
         n = \sum_i s_i 2^i .
     \end{equation}
-    For $L=16$, the Hilbert-space dimension is $2^{16}=65{,}536$, which is still small enough for exact diagonalization and explicit reshaping of the ground-state vector.
+    For $L=16$, the Hilbert-space dimension is $2^{16}=65{,}536$, which is still small enough for exact diagonalization and explicit reshaping of the ground-state vector for calculating reduced density matrices.
 
-    The lattice geometry is supplied by the open \texttt{Chain1D} graph object, which provides a deterministic site ordering together with the nearest-neighbor bond list used in the Hamiltonian. This keeps the basis convention separate from the interaction pattern and makes the same infrastructure reusable for both one-dimensional chains and two-dimensional square lattices elsewhere in the project.
+    The lattice geometry is supplied by the \texttt{Chain1D} graph object, which provides a deterministic site ordering together with the nearest-neighbor bond list used in the Hamiltonian. This keeps the basis convention separate from the interaction pattern and makes the same infrastructure reusable for both one-dimensional chains and two-dimensional square lattices elsewhere in the project.
 
     The Hamiltonian is assembled through the TFIM operator builder, which constructs the operator as a sum of local $\sigma_i^z \sigma_j^z$ interaction terms over graph edges and on-site $\sigma_i^x$ field terms,
     \begin{equation}
