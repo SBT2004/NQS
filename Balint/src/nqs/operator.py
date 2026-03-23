@@ -3,19 +3,13 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from numbers import Number
-from typing import TYPE_CHECKING, Iterable, Literal, Protocol, TypeAlias, cast
+from typing import Iterable, Literal, Protocol, TypeAlias
 
 import numpy as np
 import numpy.typing as npt
 
 from .graph import Graph, SquareLattice
 from .hilbert import SpinHilbert, SpinState, SpinStateBatch, StateInput
-
-if TYPE_CHECKING:
-    import netket as nk
-    from netket.utils.types import Array as NetKetArray
-else:
-    NetKetArray = object
 
 
 LocalMatrix: TypeAlias = npt.NDArray[np.complex128]
@@ -423,24 +417,14 @@ class Operator:
             np.zeros(0, dtype=np.complex128),
         )
 
-    def to_netket(self) -> "nk.operator.LocalOperator":
-        """Convert to NetKet's LocalOperator.
-
-        This compatibility helper intentionally performs a lazy NetKet import so
-        the ordinary project-owned runtime path stays NetKet-free. Calling this
-        method still requires NetKet to be installed.
-        """
-
+    def to_netket(self):
         try:
             import netket as nk
         except ImportError as exc:
             raise ImportError("Operator.to_netket() requires NetKet to be installed.") from exc
 
         netket_hilbert = nk.hilbert.Spin(s=0.5, N=self.hilbert.size)
-        operators = cast(
-            list[NetKetArray],
-            [np.asarray(term.matrix, dtype=np.complex128) * term.coefficient for term in self.terms],
-        )
+        operators = [np.asarray(term.matrix, dtype=np.complex128) * term.coefficient for term in self.terms]
         acting_on = [list(term.sites) for term in self.terms]
         return nk.operator.LocalOperator(netket_hilbert, operators=operators, acting_on=acting_on)
 

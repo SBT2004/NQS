@@ -8,7 +8,9 @@ from typing import Any, Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 
 
 def ensure_report_output_dir(name: str = "notebook_reports") -> Path:
@@ -114,10 +116,21 @@ def plot_entropy_scan(
 ) -> Figure:
     figure, axis = plt.subplots(figsize=(8, 4.5))
     for label, group in entropy_scan_table.groupby(line_column):
+        ordered_group = group.sort_values("subsystem_size").copy()
+        ordered_group = ordered_group.loc[np.isfinite(ordered_group["renyi2"])].copy()
+        if ordered_group.empty:
+            continue
+        if "renyi2_ci95" in ordered_group.columns:
+            yerr = np.asarray(ordered_group["renyi2_ci95"], dtype=np.float64)
+        elif "renyi2_std" in ordered_group.columns:
+            yerr = np.asarray(ordered_group["renyi2_std"], dtype=np.float64)
+        else:
+            yerr = np.zeros(len(ordered_group), dtype=np.float64)
+        yerr = np.nan_to_num(yerr, nan=0.0, posinf=0.0, neginf=0.0)
         axis.errorbar(
-            group["subsystem_size"],
-            group["renyi2"],
-            yerr=group.get("renyi2_std"),
+            ordered_group["subsystem_size"],
+            ordered_group["renyi2"],
+            yerr=yerr,
             marker="o",
             capsize=3,
             label=str(label),
@@ -182,12 +195,49 @@ def plot_training_history(
     return figure
 
 
+def plot_lattice_graph(
+    graph: Any,
+    *,
+    title: str,
+    edge_specs: dict[int, str] | tuple[tuple[int, str], ...],
+    legend_entries: Sequence[tuple[str, str]],
+    legend_columns: int = 1,
+    figsize: tuple[float, float] | None = None,
+) -> Figure:
+    if figsize is None:
+        figure, axis = graph.draw(
+            edge_specs=edge_specs,
+            title=title,
+            node_size=500,
+            font_size=9,
+        )
+    else:
+        figure, axis = plt.subplots(figsize=figsize)
+        figure, axis = graph.draw(
+            edge_specs=edge_specs,
+            ax=axis,
+            title=title,
+            node_size=500,
+            font_size=9,
+        )
+    axis.legend(
+        handles=[Line2D([0], [0], color=color, lw=2.3, label=label) for color, label in legend_entries],
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.05),
+        frameon=False,
+        ncol=legend_columns,
+    )
+    figure.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
+    return figure
+
+
 __all__ = [
     "add_report_figure_context",
     "build_output_manifest",
     "ensure_report_output_dir",
     "plot_architecture_summary",
     "plot_energy_benchmark",
+    "plot_lattice_graph",
     "plot_entropy_scan",
     "plot_training_history",
     "save_report_figure",

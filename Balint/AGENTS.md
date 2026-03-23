@@ -42,6 +42,9 @@
   `graph -> hilbert -> operator -> model -> sampler -> variational state -> driver -> observables`.
 - RBM is the first reference ansatz. FFNN and CNN should fit the same interface
   rather than introduce parallel workflows.
+- Default to periodic boundary conditions (`pbc=True`) in new or updated
+  workflows, notebook configs, and report assumptions unless the task
+  explicitly requires open boundaries or a boundary-condition comparison.
 - Treat von Neumann entropy as a small-system exact tool. Treat Renyi-2 via
   SWAP as the scalable NQS entanglement observable.
 

@@ -17,8 +17,7 @@ ParamTree = Any
 
 def _states_to_pm1(states: jax.Array) -> jax.Array:
     # Our Hilbert space stores spins as {0, 1}, but neural-network formulas are
-    # usually written for {-1, +1}. Keeping the conversion in one helper makes
-    # the rest of the model code easier to read.
+    # usually written for {-1, +1}.
     return 2.0 * states.astype(jnp.float32) - 1.0
 
 

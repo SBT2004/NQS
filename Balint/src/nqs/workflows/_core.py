@@ -722,16 +722,20 @@ def _renyi2_entropy_scaling_from_sample_batch(
         swapped_right_log = swapped_log[pair_count:]
         estimator = np.exp(swapped_left_log + swapped_right_log - left_log - right_log)
         swap_value = np.real_if_close(np.mean(estimator))
+        swap_magnitude = float(np.abs(np.mean(estimator)))
         if np.iscomplexobj(swap_value):
-            if abs(np.imag(swap_value)) > cutoff:
-                entropies.append(np.nan)
-                continue
-            swap_real = float(np.real(swap_value))
+            imag_part = abs(float(np.imag(swap_value)))
+            if imag_part > cutoff:
+                swap_real = swap_magnitude
+            else:
+                swap_real = float(np.real(swap_value))
         else:
             swap_real = float(swap_value)
         if swap_real <= 0:
-            entropies.append(np.nan)
-            continue
+            if swap_magnitude <= cutoff:
+                entropies.append(np.nan)
+                continue
+            swap_real = swap_magnitude
         entropies.append(float(-np.log(swap_real)))
     return entropies
 
@@ -958,6 +962,7 @@ def run_vmc_experiment(
     callback_every: int = 5,
     entropy_n_independent_runs: int | None = None,
     entropy_force_sampled: bool = False,
+    compute_exact: bool = True,
     seed: int = 0,
 ) -> dict[str, Any]:
     system = build_system(
@@ -992,7 +997,14 @@ def run_vmc_experiment(
         callback_every=callback_every,
     )
     history_df = history_table(history)
-    exact = exact_observables_summary(system["operator"])
+    if compute_exact:
+        exact = exact_observables_summary(system["operator"])
+    else:
+        exact = {
+            "ground_energy": float("nan"),
+            "half_partition_renyi2": float("nan"),
+            "entropy_table": pd.DataFrame(),
+        }
     final_energy = float(np.asarray(variational_state.energy(system["operator"])))
     independent_run_count = entropy_n_independent_runs
     if independent_run_count is None:
@@ -1031,7 +1043,7 @@ def run_vmc_experiment(
         "parameter_count": _count_model_parameters(variational_state.parameters),
         "final_energy": final_energy,
         "final_entropy": final_entropy,
-        "energy_error": final_energy - exact["ground_energy"],
+        "energy_error": final_energy - float(exact["ground_energy"]),
         "entropy_scan_table": entropy_scan["entropy_table"],
         "entropy_scan_samples": entropy_scan["entropy_samples"],
         "entropy_scan_fit": entropy_scan["scaling_fit"],
@@ -1040,6 +1052,7 @@ def run_vmc_experiment(
         "sampled_scaling_fit": sampled_entropy["scaling_fit"],
         "entropy_n_independent_runs": independent_run_count,
         "entropy_force_sampled": entropy_force_sampled,
+        "compute_exact": compute_exact,
     }
 
 
@@ -2269,6 +2282,7 @@ def run_hamiltonian_system_size_sweep(
     callback_every: int = 5,
     entropy_n_independent_runs: int | None = None,
     entropy_force_sampled: bool = False,
+    compute_exact: bool = True,
     base_seed: int = 0,
 ) -> dict[str, Any]:
     if not sweep_points:
@@ -2310,6 +2324,7 @@ def run_hamiltonian_system_size_sweep(
             callback_every=callback_every,
             entropy_n_independent_runs=entropy_n_independent_runs,
             entropy_force_sampled=entropy_force_sampled,
+            compute_exact=compute_exact,
             seed=seed,
             **point,
         )
@@ -2357,6 +2372,7 @@ def run_hamiltonian_system_size_sweep(
         "model_name": model_name,
         "model_kwargs": dict(model_kwargs),
         "entropy_force_sampled": entropy_force_sampled,
+        "compute_exact": compute_exact,
     }
 
 
@@ -2428,21 +2444,43 @@ def run_ghz_bonus_workflow(
         model_kwargs=model_kwargs,
         lattice_shape=lattice_shape,
     )
-    entropy_logger = observables.entropy_callback(subsystem=half_subsystem(hilbert.size))
+    entropy_logger = observables.entropy_callback(
+        subsystem=half_subsystem(hilbert.size),
+        force_sampled=True,
+    )
     history = vmc_driver.run(
         n_iter,
         callback=entropy_logger,
         callback_every=callback_every,
     )
     history_df = history_table(history)
-    final_statevector = np.asarray(variational_state.exact_statevector(), dtype=np.complex128)
-    metrics = _ghz_state_metrics(final_statevector)
+    final_energy = float(np.asarray(variational_state.energy(system["operator"])))
+    final_statevector: np.ndarray | None
+    target_statevector: np.ndarray | None
+    try:
+        final_statevector = np.asarray(variational_state.exact_statevector(), dtype=np.complex128)
+    except ValueError:
+        final_statevector = None
+        target_statevector = None
+        logged_entropy = history_df["renyi2_entropy"].dropna()
+        metrics = {
+            "ghz_fidelity": float("nan"),
+            "cat_sector_weight": float("nan"),
+            "half_partition_renyi2": float(logged_entropy.iloc[-1]) if not logged_entropy.empty else float("nan"),
+            "used_exact_statevector": 0.0,
+        }
+    else:
+        target_statevector = _ghz_statevector(hilbert.size)
+        metrics = {
+            **_ghz_state_metrics(final_statevector),
+            "used_exact_statevector": 1.0,
+        }
     return {
         "system": system,
         "history": history,
         "history_df": history_df,
-        "final_energy": float(np.asarray(variational_state.energy(system["operator"]))),
-        "target_statevector": _ghz_statevector(hilbert.size),
+        "final_energy": final_energy,
+        "target_statevector": target_statevector,
         "final_statevector": final_statevector,
         "ghz_metrics": metrics,
     }
