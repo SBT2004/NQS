@@ -648,6 +648,33 @@ def _renyi2_entropy_statistics_from_sample_batches(
     }
 
 
+def _standard_error(std: Any, count: Any) -> np.ndarray:
+    std_array = np.asarray(std, dtype=np.float64)
+    count_array = np.asarray(count, dtype=np.float64)
+    sem = np.zeros_like(std_array, dtype=np.float64)
+    valid_mask = np.isfinite(std_array) & np.isfinite(count_array) & (count_array > 0.0)
+    sem[valid_mask] = std_array[valid_mask] / np.sqrt(count_array[valid_mask])
+    return sem
+
+
+def _append_confidence_interval_columns(
+    frame: pd.DataFrame,
+    *,
+    mean_column: str,
+    std_column: str,
+    count_column: str,
+    sem_column: str,
+    ci95_column: str,
+) -> pd.DataFrame:
+    result = frame.copy()
+    sem = _standard_error(result[std_column], result[count_column])
+    mean_values = np.asarray(result[mean_column], dtype=np.float64)
+    sem[~np.isfinite(mean_values)] = np.nan
+    result[sem_column] = sem
+    result[ci95_column] = 1.96 * sem
+    return result
+
+
 def _renyi2_entropy_scaling_from_sample_batch(
     variational_state: SupportsSamplingAndLogValue,
     *,
@@ -759,10 +786,22 @@ def sampled_entropy_scaling_summary(
     entropy_table = (
         entropy_samples.groupby("subsystem_size", as_index=False)
         .agg(
+            n_repeats=("run_index", "nunique"),
             renyi2=("renyi2", "mean"),
             renyi2_std=("renyi2", "std"),
         )
         .fillna({"renyi2_std": 0.0})
+    )
+    entropy_table = cast(
+        pd.DataFrame,
+        _append_confidence_interval_columns(
+            cast(pd.DataFrame, entropy_table),
+            mean_column="renyi2",
+            std_column="renyi2_std",
+            count_column="n_repeats",
+            sem_column="renyi2_sem",
+            ci95_column="renyi2_ci95",
+        ),
     )
 
     subsystem_sizes = np.asarray(entropy_table["subsystem_size"], dtype=np.float64)
@@ -1231,6 +1270,202 @@ def sampler_acceptance_diagnostics(
     }
 
 
+def _autocorrelation(values: np.ndarray, max_lag: int) -> tuple[np.ndarray, float]:
+    series = np.asarray(values, dtype=np.float64).reshape(-1)
+    if series.size == 0:
+        raise ValueError("values must contain at least one entry.")
+    if max_lag < 0:
+        raise ValueError("max_lag must be non-negative.")
+
+    centered = series - float(np.mean(series))
+    variance = float(np.dot(centered, centered))
+    if variance <= 0.0:
+        lags = np.arange(min(max_lag, series.size - 1) + 1, dtype=np.int64)
+        autocorr = np.ones_like(lags, dtype=np.float64)
+        return autocorr, 0.5
+
+    lags = np.arange(min(max_lag, series.size - 1) + 1, dtype=np.int64)
+    autocorr = np.empty_like(lags, dtype=np.float64)
+    autocorr[0] = 1.0
+    for lag in lags[1:]:
+        autocorr[lag] = float(np.dot(centered[:-lag], centered[lag:]) / variance)
+
+    tau_int = 0.5
+    for value in autocorr[1:]:
+        if value <= 0.0:
+            break
+        tau_int += float(value)
+    return autocorr, tau_int
+
+
+def sampler_mixing_diagnostics(
+    variational_state: SupportsSamplingAndLogValue,
+    *,
+    n_steps: int | None = None,
+    max_lag: int = 8,
+    seed_offset: int = 0,
+) -> dict[str, Any]:
+    sampling_state = cast(Any, variational_state)
+    if not hasattr(sampling_state, "sampler") or not hasattr(sampling_state, "model") or not hasattr(
+        sampling_state,
+        "parameters",
+    ):
+        raise TypeError("variational_state must expose sampler, model, and parameters for diagnostics.")
+    sampler = sampling_state.sampler
+    if not isinstance(sampler, MetropolisLocal):
+        raise TypeError("sampler diagnostics require a MetropolisLocal sampler.")
+
+    total_steps = sampler.n_discard_per_chain + sampler._steps_per_chain() if n_steps is None else int(n_steps)
+    if total_steps <= 1:
+        raise ValueError("n_steps must be greater than one for mixing diagnostics.")
+
+    rng_key = jax.random.PRNGKey(sampler.seed + seed_offset + 101)
+    init_key, step_key = jax.random.split(rng_key)
+    states = sampler._random_states(init_key)
+    log_values = jnp.asarray(sampling_state.model.log_psi(sampling_state.parameters, states))
+
+    rows: list[dict[str, Any]] = []
+    for step_index in range(total_steps):
+        previous_states = states
+        states, log_values, step_key = _metropolis_step(
+            sampling_state.model.log_psi,
+            sampling_state.parameters,
+            states=states,
+            log_values=log_values,
+            rng_key=step_key,
+            n_chains=sampler.n_chains,
+            n_sites=sampler.hilbert.size,
+        )
+        states_np = np.asarray(states, dtype=np.uint8)
+        accepted = np.any(states_np != np.asarray(previous_states, dtype=np.uint8), axis=1)
+        spin_states = (2.0 * states_np.astype(np.float64)) - 1.0
+        chain_magnetization = np.mean(spin_states, axis=1)
+        rows.append(
+            {
+                "step": step_index + 1,
+                "phase": "burn_in" if step_index < sampler.n_discard_per_chain else "sampling",
+                "acceptance_rate": float(np.mean(accepted)),
+                "mean_magnetization": float(np.mean(chain_magnetization)),
+                "abs_mean_magnetization": float(np.mean(np.abs(chain_magnetization))),
+                "unique_state_fraction": float(np.unique(states_np, axis=0).shape[0] / sampler.n_chains),
+            }
+        )
+
+    trace_table = pd.DataFrame(rows)
+    sampling_trace = trace_table.loc[trace_table["phase"] == "sampling"].reset_index(drop=True)
+    autocorr_values, tau_int = _autocorrelation(
+        sampling_trace["mean_magnetization"].to_numpy(),
+        max_lag=max_lag,
+    )
+    autocorrelation_table = pd.DataFrame(
+        {
+            "lag": np.arange(len(autocorr_values), dtype=np.int64),
+            "mean_magnetization_autocorrelation": autocorr_values,
+        }
+    )
+    summary_table = pd.DataFrame(
+        [
+            {"metric": "sampling_steps", "value": float(len(sampling_trace))},
+            {"metric": "mean_sampling_acceptance", "value": float(sampling_trace["acceptance_rate"].mean())},
+            {"metric": "mean_abs_magnetization", "value": float(sampling_trace["abs_mean_magnetization"].mean())},
+            {"metric": "mean_unique_state_fraction", "value": float(sampling_trace["unique_state_fraction"].mean())},
+            {"metric": "integrated_autocorrelation_time", "value": float(tau_int)},
+        ]
+    )
+    return {
+        "trace_table": trace_table,
+        "autocorrelation_table": autocorrelation_table,
+        "summary_table": summary_table,
+        "integrated_autocorrelation_time": float(tau_int),
+    }
+
+
+def swap_estimator_diagnostics(
+    variational_state: SupportsSamplingAndLogValue,
+    n_sites: int,
+    *,
+    max_subsystem_size: int | None = None,
+    n_independent_runs: int = 1,
+    sample_batches: Sequence[Any] | None = None,
+) -> dict[str, Any]:
+    sampled = sampled_entropy_scaling_summary(
+        variational_state,
+        n_sites=n_sites,
+        max_subsystem_size=max_subsystem_size,
+        n_independent_runs=n_independent_runs,
+        sample_batches=sample_batches,
+    )
+    subsystem_limit = max(1, n_sites // 2) if max_subsystem_size is None else max_subsystem_size
+    try:
+        exact = renyi2_subsystem_scan_summary(
+            variational_state,
+            n_sites=n_sites,
+            max_subsystem_size=subsystem_limit,
+            n_independent_runs=1,
+            force_sampled=False,
+        )
+        exact_available = True
+        exact_table = exact["entropy_table"].copy().rename(columns={"renyi2": "exact_renyi2"})
+    except ValueError as exc:
+        if not _is_exact_entropy_unavailable_error(exc):
+            raise
+        exact_available = False
+        exact_table = pd.DataFrame(
+            {
+                "subsystem_size": np.arange(1, subsystem_limit + 1, dtype=np.int64),
+                "exact_renyi2": np.full(subsystem_limit, np.nan, dtype=np.float64),
+            }
+        )
+
+    diagnostics_table = sampled["entropy_table"].copy().rename(
+        columns={"renyi2": "sampled_renyi2", "renyi2_std": "sampled_renyi2_std"}
+    )
+    diagnostics_table = diagnostics_table.merge(exact_table[["subsystem_size", "exact_renyi2"]], on="subsystem_size")
+    diagnostics_table["exact_available"] = exact_available
+    diagnostics_table["abs_error"] = np.abs(diagnostics_table["sampled_renyi2"] - diagnostics_table["exact_renyi2"])
+    diagnostics_table["within_one_sigma"] = (
+        diagnostics_table["exact_available"]
+        & np.isfinite(diagnostics_table["abs_error"])
+        & (diagnostics_table["abs_error"] <= (diagnostics_table["sampled_renyi2_std"] + 1e-8))
+    )
+    finite_abs_error = diagnostics_table["abs_error"].to_numpy(dtype=np.float64)
+    has_finite_abs_error = bool(np.isfinite(finite_abs_error).any())
+    summary_table = pd.DataFrame(
+        [
+            {"metric": "exact_available", "value": float(exact_available)},
+            {
+                "metric": "valid_subsystem_fraction",
+                "value": float(np.mean(np.isfinite(diagnostics_table["sampled_renyi2"]))),
+            },
+            {
+                "metric": "mean_abs_error",
+                "value": float(np.nanmean(finite_abs_error))
+                if exact_available and has_finite_abs_error
+                else np.nan,
+            },
+            {
+                "metric": "max_abs_error",
+                "value": float(np.nanmax(finite_abs_error))
+                if exact_available and has_finite_abs_error
+                else np.nan,
+            },
+            {
+                "metric": "subsystems_within_one_sigma_fraction",
+                "value": float(np.mean(diagnostics_table["within_one_sigma"]))
+                if exact_available
+                else np.nan,
+            },
+        ]
+    )
+    return {
+        "diagnostics_table": diagnostics_table,
+        "summary_table": summary_table,
+        "sampled_entropy_table": sampled["entropy_table"],
+        "sampled_entropy_samples": sampled["entropy_samples"],
+        "exact_available": exact_available,
+    }
+
+
 def renyi2_subsystem_scan_summary(
     variational_state: SupportsSamplingAndLogValue,
     n_sites: int,
@@ -1522,6 +1757,7 @@ def run_random_architecture_study(
     entropy_n_independent_runs: int = 4,
     max_subsystem_size: int | None = None,
     real_amplitude_only: bool = False,
+    include_support_diagnostics: bool = False,
 ) -> dict[str, Any]:
     if not architecture_configs:
         raise ValueError("architecture_configs must not be empty.")
@@ -1596,6 +1832,26 @@ def run_random_architecture_study(
                 max_subsystem_size=subsystem_limit,
                 n_independent_runs=entropy_n_independent_runs,
             )
+            if include_support_diagnostics:
+                diagnostic_batch = variational_state.independent_sample_with_log_values(seed_offset=10_000 + seed)
+                diagnostic_states = np.asarray(diagnostic_batch.states, dtype=np.uint8)
+                diagnostic_log_values = np.asarray(diagnostic_batch.log_values, dtype=np.complex128).reshape(-1)
+                acceptance_diagnostics = sampler_acceptance_diagnostics(variational_state, seed_offset=20_000 + seed)
+                mixing_diagnostics = sampler_mixing_diagnostics(variational_state, seed_offset=30_000 + seed)
+                diagnostic_log_amplitude_std = float(np.std(np.real(diagnostic_log_values), ddof=0))
+                diagnostic_phase_std = float(np.std(np.imag(diagnostic_log_values), ddof=0))
+                diagnostic_unique_state_fraction = float(
+                    np.unique(diagnostic_states.reshape(diagnostic_states.shape[0], -1), axis=0).shape[0]
+                    / diagnostic_states.shape[0]
+                )
+                diagnostic_acceptance = float(acceptance_diagnostics["overall_acceptance"])
+                diagnostic_tau_int = float(mixing_diagnostics["integrated_autocorrelation_time"])
+            else:
+                diagnostic_log_amplitude_std = np.nan
+                diagnostic_phase_std = np.nan
+                diagnostic_unique_state_fraction = np.nan
+                diagnostic_acceptance = np.nan
+                diagnostic_tau_int = np.nan
             parameter_count = _count_model_parameters(variational_state.parameters)
 
             sampled_table = sampled_entropy_scan["entropy_table"].copy()
@@ -1646,6 +1902,11 @@ def run_random_architecture_study(
                     "half_partition_sampled_renyi2": float(half_partition_row["renyi2"]),
                     "half_partition_sampled_std": float(half_partition_row["renyi2_std"]),
                     "sampled_minus_exact": float(half_partition_row["renyi2"] - half_partition_row["exact_renyi2"]),
+                    "diagnostic_log_amplitude_std": diagnostic_log_amplitude_std,
+                    "diagnostic_phase_std": diagnostic_phase_std,
+                    "diagnostic_unique_state_fraction": diagnostic_unique_state_fraction,
+                    "diagnostic_acceptance": diagnostic_acceptance,
+                    "diagnostic_tau_int": diagnostic_tau_int,
                 }
             )
             trial_results.append(
@@ -1664,6 +1925,12 @@ def run_random_architecture_study(
                     "sampled_entropy_scan_table": sampled_entropy_scan["entropy_table"],
                     "sampled_entropy_scan_samples": sampled_entropy_scan["entropy_samples"],
                     "real_amplitude_only": real_amplitude_only,
+                    "include_support_diagnostics": include_support_diagnostics,
+                    "diagnostic_log_amplitude_std": diagnostic_log_amplitude_std,
+                    "diagnostic_phase_std": diagnostic_phase_std,
+                    "diagnostic_unique_state_fraction": diagnostic_unique_state_fraction,
+                    "diagnostic_acceptance": diagnostic_acceptance,
+                    "diagnostic_tau_int": diagnostic_tau_int,
                 }
             )
 
@@ -1685,6 +1952,17 @@ def run_random_architecture_study(
         )
         .fillna({"sampled_renyi2_std": 0.0, "estimator_std": 0.0})
     ).sort_values(by=["model", "subsystem_size"]).reset_index(drop=True)
+    entropy_scan_table = cast(
+        pd.DataFrame,
+        _append_confidence_interval_columns(
+            cast(pd.DataFrame, entropy_scan_table),
+            mean_column="sampled_renyi2",
+            std_column="sampled_renyi2_std",
+            count_column="n_trials",
+            sem_column="sampled_renyi2_sem",
+            ci95_column="sampled_renyi2_ci95",
+        ),
+    )
     summary_table = cast(
         Any,
         trial_table.groupby(["model", "architecture_family", "initialization_label"], as_index=False)
@@ -1701,9 +1979,25 @@ def run_random_architecture_study(
             half_partition_sampled_std=("half_partition_sampled_renyi2", "std"),
             estimator_std=("half_partition_sampled_std", "mean"),
             sampled_minus_exact=("sampled_minus_exact", "mean"),
+            diagnostic_log_amplitude_std=("diagnostic_log_amplitude_std", "mean"),
+            diagnostic_phase_std=("diagnostic_phase_std", "mean"),
+            diagnostic_unique_state_fraction=("diagnostic_unique_state_fraction", "mean"),
+            diagnostic_acceptance=("diagnostic_acceptance", "mean"),
+            diagnostic_tau_int=("diagnostic_tau_int", "mean"),
         )
         .fillna({"half_partition_sampled_std": 0.0, "estimator_std": 0.0})
     ).sort_values(by="model").reset_index(drop=True)
+    summary_table = cast(
+        pd.DataFrame,
+        _append_confidence_interval_columns(
+            cast(pd.DataFrame, summary_table),
+            mean_column="half_partition_sampled_renyi2",
+            std_column="half_partition_sampled_std",
+            count_column="n_trials",
+            sem_column="half_partition_sampled_sem",
+            ci95_column="half_partition_sampled_ci95",
+        ),
+    )
     return {
         "system": system,
         "trial_table": trial_table,
@@ -1712,6 +2006,7 @@ def run_random_architecture_study(
         "trial_results": trial_results,
         "entropy_n_independent_runs": entropy_n_independent_runs,
         "real_amplitude_only": real_amplitude_only,
+        "include_support_diagnostics": include_support_diagnostics,
     }
 
 

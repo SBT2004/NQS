@@ -22,7 +22,9 @@ from ._core import (
     run_tfim_5x5_vmc_performance_benchmark,
     run_vmc_experiment,
     sampler_acceptance_diagnostics,
+    sampler_mixing_diagnostics,
     sampled_entropy_scaling_summary,
+    swap_estimator_diagnostics,
     tfim_config,
     tfim_proxy_sweep_points,
 )
@@ -49,7 +51,9 @@ __all__ = [
     "run_tfim_5x5_vmc_performance_benchmark",
     "run_vmc_experiment",
     "sampler_acceptance_diagnostics",
+    "sampler_mixing_diagnostics",
     "sampled_entropy_scaling_summary",
+    "swap_estimator_diagnostics",
     "tfim_config",
     "tfim_proxy_sweep_points",
 ]

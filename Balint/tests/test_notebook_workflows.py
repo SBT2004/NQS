@@ -26,7 +26,9 @@ from nqs.workflows import (  # noqa: E402
     run_random_architecture_study,
     run_vmc_experiment,
     sampler_acceptance_diagnostics,
+    sampler_mixing_diagnostics,
     sampled_entropy_scaling_summary,
+    swap_estimator_diagnostics,
     tfim_config,
     tfim_proxy_sweep_points,
 )
@@ -528,6 +530,105 @@ class NotebookWorkflowTests(unittest.TestCase):
         self.assertIn("steps_per_chain", diagnostics["config_table"]["parameter"].tolist())
         self.assertGreaterEqual(diagnostics["overall_acceptance"], 0.0)
         self.assertLessEqual(diagnostics["overall_acceptance"], 1.0)
+
+    def test_sampler_mixing_diagnostics_reports_autocorrelation_summary(self) -> None:
+        system = build_system(lattice_shape=(2, 2), pbc=False, hamiltonian="tfim", h=1.0)
+        model = build_model(model_name="FFNN", model_kwargs={"hidden_dims": (4,)}, lattice_shape=(2, 2))
+        params = initialize_random_parameters(
+            model,
+            system["hilbert"],
+            seed=0,
+            phase_scale=0.0,
+        )
+        variational_state = build_variational_state(
+            model=model,
+            hilbert=system["hilbert"],
+            seed=0,
+            n_samples=8,
+            n_discard_per_chain=2,
+            n_chains=4,
+            params=params,
+        )
+
+        diagnostics = sampler_mixing_diagnostics(variational_state, max_lag=3)
+
+        self.assertEqual(diagnostics["autocorrelation_table"]["lag"].tolist(), [0, 1])
+        self.assertEqual(diagnostics["autocorrelation_table"]["mean_magnetization_autocorrelation"].iloc[0], 1.0)
+        self.assertIn("integrated_autocorrelation_time", diagnostics["summary_table"]["metric"].tolist())
+        self.assertGreaterEqual(diagnostics["integrated_autocorrelation_time"], 0.5)
+
+    def test_swap_estimator_diagnostics_merges_exact_and_sampled_support(self) -> None:
+        controlled_samples = np.array(
+            [
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [1, 1],
+            ],
+            dtype=np.uint8,
+        )
+        provided_batches = [
+            SampleBatch(
+                states=jax.numpy.asarray(controlled_samples),
+                log_values=jax.numpy.asarray(_bell_log_amplitude(controlled_samples)),
+            )
+        ]
+
+        class FakeState:
+            def sample(self) -> np.ndarray:
+                raise AssertionError("sample should not be used when sample_batches are provided")
+
+            def independent_sample(self, seed_offset: int = 0) -> np.ndarray:
+                raise AssertionError("independent_sample should not be used when sample_batches are provided")
+
+            def log_value(self, states: np.ndarray) -> np.ndarray:
+                return _bell_log_amplitude(np.asarray(states, dtype=np.uint8))
+
+            def exact_statevector(self) -> np.ndarray:
+                return np.array([1.0 / np.sqrt(2.0), 0.0, 0.0, 1.0 / np.sqrt(2.0)], dtype=np.complex128)
+
+        diagnostics = swap_estimator_diagnostics(
+            FakeState(),
+            n_sites=2,
+            n_independent_runs=1,
+            sample_batches=provided_batches,
+        )
+
+        row = diagnostics["diagnostics_table"].iloc[0]
+        self.assertTrue(bool(row["exact_available"]))
+        self.assertAlmostEqual(float(row["sampled_renyi2"]), np.log(2.0))
+        self.assertAlmostEqual(float(row["exact_renyi2"]), np.log(2.0))
+        self.assertAlmostEqual(float(row["abs_error"]), 0.0)
+        self.assertTrue(bool(row["within_one_sigma"]))
+
+    def test_run_random_architecture_study_can_include_support_diagnostics(self) -> None:
+        result = run_random_architecture_study(
+            architecture_configs={
+                "FFNN": {"hidden_dims": (4,)},
+                "CNN": {"channels": (2,), "kernel_size": (1, 1)},
+            },
+            seeds=(0,),
+            lattice_shape=(2, 2),
+            hamiltonian="tfim",
+            n_samples=16,
+            n_discard_per_chain=2,
+            n_chains=4,
+            entropy_n_independent_runs=1,
+            real_amplitude_only=True,
+            include_support_diagnostics=True,
+        )
+
+        summary = result["summary_table"]
+        self.assertTrue(np.isfinite(summary["diagnostic_log_amplitude_std"]).all())
+        self.assertTrue(np.isfinite(summary["diagnostic_acceptance"]).all())
+        self.assertTrue(np.isfinite(summary["diagnostic_tau_int"]).all())
+        self.assertTrue((summary["diagnostic_unique_state_fraction"] > 0.0).all())
+        self.assertIn("half_partition_sampled_ci95", summary.columns)
+        self.assertTrue((summary["half_partition_sampled_ci95"] >= 0.0).all())
+
+        entropy_scan = result["entropy_scan_table"]
+        self.assertIn("sampled_renyi2_ci95", entropy_scan.columns)
+        self.assertTrue((entropy_scan["sampled_renyi2_ci95"] >= 0.0).all())
 
     def test_run_hamiltonian_system_size_sweep_tracks_training_entropy(self) -> None:
         result = run_hamiltonian_system_size_sweep(

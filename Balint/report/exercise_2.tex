@@ -1,0 +1,238 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage[hidelinks]{hyperref}
+
+\graphicspath{{../demos/report_outputs/exercise_2/}{Balint/demos/report_outputs/exercise_2/}}
+
+\title{Final Report}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section*{Exercise 2: Neural Quantum States and Sampled Renyi Entropy}
+
+This section introduces the neural-quantum-state workflow used later in the project. The model module contains the variational ansaetze, the sampler module generates configurations with a local Metropolis chain, and the observables module evaluates quantities such as the SWAP-based Renyi entropy. This separation is a deliberate design choice: once a model returns a wavefunction amplitude for a spin configuration, the same sampling and measurement layer can be reused across all three architectures.
+
+\subsection*{2/a Neural Quantum State Representation}
+
+The common abstraction used throughout this exercise is a quantity of the form
+\begin{equation}
+    \log \psi_\theta(\sigma),
+\end{equation}
+which is the complex logarithm of the wavefunction amplitude for a spin configuration $\sigma$. This is the key interface boundary in the implementation. Once a model provides this object, the same sampling and observable code can be reused without model-specific logic in the Monte Carlo or SWAP-estimator layers.
+
+All three ansatz classes first convert the stored spin variables from $\{0,1\}$ to the more standard $\{-1,+1\}$ convention. The final network output is then interpreted as two real channels: one for the log-amplitude and one for a raw phase variable $p_\theta(\sigma)$. In the implemented models the phase is bounded as $\phi_\theta(\sigma)=\pi \tanh p_\theta(\sigma)$, so the output takes the form
+\begin{equation}
+    \log \psi_\theta(\sigma) = a_\theta(\sigma) + i \pi \tanh p_\theta(\sigma).
+\end{equation}
+This keeps the interface uniform across all architectures and makes it straightforward to evaluate amplitude ratios later in the sampler and in the SWAP estimator.
+
+For the present TFIM benchmark a real non-negative representation would in principle be sufficient in the computational basis, because the model is stoquastic there and its ground state can be chosen positive by a Perron--Frobenius argument.\footnote{See Bravyi et al., ``Monte Carlo simulation of stoquastic Hamiltonians,'' \emph{Quantum Information and Computation} 15 (2015), which explicitly lists the transverse-field Ising model as a stoquastic example.} The project still keeps a complex-valued interface because the same code is meant to carry over to frustrated models, where a positive real representation is not generally available. In particular, for the square-lattice $J_1$-$J_2$ antiferromagnet the Marshall--Peierls sign rule is known to break down once the frustration is strong enough, so the wavefunction cannot in general be treated as an everywhere-positive amplitude in the computational basis.\footnote{See Bishop, Farnell, and Parkinson, ``Phase Transitions in the Spin-Half $J_1$--$J_2$ Model,'' \emph{Phys. Rev. B} 58 (1998), which reports a breakdown of the Marshall--Peierls sign rule on the square lattice at $J_2/J_1 \approx 0.26$.}
+
+The RBM ansatz is the closest to the standard NQS construction. Its hidden width is set by an integer density parameter $\alpha$, so the number of hidden units scales as $\alpha N$. After the visible spins are mapped to $\{-1,+1\}$, the hidden variables are summed out analytically, which gives the usual closed-form log-amplitude,
+\begin{equation}
+    \log \psi_\theta(\sigma)
+    =
+    \sum_i a_i \sigma_i
+    +
+    \sum_j \log \cosh\!\left(W_j \cdot \sigma + b_j\right)
+    +
+    i \pi \tanh \!\left[
+        \sum_i \tilde{a}_i \sigma_i
+        +
+        \sum_j \left(\tilde{W}_j \cdot \sigma + \tilde{b}_j\right)
+    \right].
+\end{equation}
+In the implemented RBM, the amplitude channel therefore keeps the standard analytically summed hidden contribution, while a separate linear phase channel supplies the complex phase before the final bounding step. Of the three models, this is the one that stays closest to the original RBM-NQS construction.
+
+The FFNN ansatz replaces the analytic RBM structure by a dense multilayer perceptron. A configurable sequence of hidden widths defines the network depth and capacity, each hidden layer is followed by a fixed activation, and the final dense layer produces the two output channels for log-amplitude and phase. Unlike the RBM, there is no special hidden-spin summation here; the dependence on the spin configuration is learned entirely through the stacked nonlinear dense layers. This makes the FFNN the cleanest generic baseline in the present comparison.
+
+The CNN ansatz keeps the same output convention but changes the internal representation of the state. Instead of treating the spin configuration as a flat vector throughout, it is first reshaped into a lattice-shaped tensor, then passed through a stack of convolution layers, and finally flattened again before the two-channel output head. This is the only ansatz that explicitly takes the lattice geometry into account, so it can encode local geometric structure and translation-related patterns more naturally than a dense network.
+
+\subsection*{2/b Architecture-Agnostic Monte Carlo Sampling}
+
+Sampling is performed with a local Metropolis scheme acting directly on spin configurations. Starting from a batch of chains, one site is chosen uniformly at random in each chain and the corresponding spin is flipped, producing a proposed state $\sigma'$. The acceptance probability is computed from the wavefunction ratio,
+\begin{equation}
+    A(\sigma \rightarrow \sigma')
+    =
+    \min\!\left(
+        1,
+        \frac{\lvert \psi_\theta(\sigma') \rvert^2}{\lvert \psi_\theta(\sigma) \rvert^2}
+    \right)
+    =
+    \min\!\left(
+        1,
+        \exp \bigl[ 2 \operatorname{Re} \bigl( \log \psi_\theta(\sigma') - \log \psi_\theta(\sigma) \bigr) \bigr]
+    \right).
+\end{equation}
+This is exactly the expression used in the implementation: the log-amplitudes of the current and proposed states are evaluated in batch, and only their real parts enter the Metropolis ratio because the sampling measure is $\lvert \psi_\theta(\sigma) \rvert^2$.
+
+The same sampler is used for RBM, FFNN, and CNN. In particular, no stochastic reconfiguration is introduced for the RBM in this exercise, for the sake of a unified VMC scheme for all three ansaetze.
+
+The proposal move is a single-spin local update. This is the simplest option and the cleanest common baseline because it does not depend on any architecture-specific structure or model-specific proposal design. It also matches the project interface naturally: once $\log \psi_\theta(\sigma)$ is available, a local flip proposal can be scored without any extra model logic. In that sense it is the most transparent architecture-agnostic choice.
+
+This simplicity comes with a cost. Alternatives such as multi-spin proposals, exchange moves, cluster-style updates, or more structured Hamiltonian-aware proposal rules could in principle improve mixing, especially when the state develops stronger correlations. A single-spin local move changes the configuration only minimally at each step, so one expects slower decorrelation when the correlation length becomes large. This is the usual critical-slowing-down problem of local Ising updates: near a continuous transition, increasingly large correlated regions have to be rearranged through many local moves.\footnote{This is the motivation behind cluster algorithms such as Swendsen--Wang; see Swendsen and Wang, ``Nonuniversal critical dynamics in Monte Carlo simulations,'' \emph{Phys. Rev. Lett.} 58 (1987).} Deep in the ordered phase the system is still strongly correlated, but it is no longer critical in the same sense, so the correlation length is finite and the slowdown is less severe than in the near-critical regime. For that reason the retained workflow now includes a sampler-mixing diagnostic based on the magnetization autocorrelation of the local-update chain, and any final claim about critical slowdown should be tied to that measured table rather than to acceptance alone.
+
+The retained acceptance diagnostic in Figure~\ref{fig:sampler-acceptance} should be read in that limited sense. It shows that the sampled workflow is numerically well behaved at the retained budget, but it is not a full mixing study.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.82\linewidth]{exercise_2_sampler_acceptance.png}
+    \caption{Sampler-acceptance diagnostic for the retained Exercise 2 runs.}
+    \label{fig:sampler-acceptance}
+\end{figure}
+
+\subsection*{2/c Renyi-2 From the SWAP Estimator}
+
+The practical entanglement observable carried over from Exercise 1 is the Renyi-2 entropy,
+\begin{equation}
+    S_2(A) = -\log \mathrm{tr}(\rho_A^2).
+\end{equation}
+For sampled neural quantum states, the useful identity is the replica-SWAP expression
+\begin{equation}
+    \mathrm{tr}(\rho_A^2)
+    =
+    \langle \mathrm{SWAP}_A \rangle,
+\end{equation}
+which can be estimated from pairs of independently sampled configurations. Writing two configurations as $\sigma = (\sigma_A,\sigma_B)$ and $\eta = (\eta_A,\eta_B)$, the local SWAP estimator is
+\begin{equation}
+    \mathrm{SWAP}_A^{\mathrm{loc}}(\sigma,\eta)
+    =
+    \frac{
+        \psi_\theta(\eta_A,\sigma_B)\,
+        \psi_\theta(\sigma_A,\eta_B)
+    }{
+        \psi_\theta(\sigma_A,\sigma_B)\,
+        \psi_\theta(\eta_A,\eta_B)
+    }.
+\end{equation}
+Taking the average of this quantity over sampled replica pairs gives an estimator for $\langle \mathrm{SWAP}_A \rangle$, and therefore for $S_2(A)$.
+
+The implementation follows this formula directly. Samples are flattened into a batch, paired row by row, and the subsystem-$A$ spins are exchanged between the two replicas to form the swapped configurations. The code then evaluates the log-amplitudes of the swapped states and constructs the estimator through exponentiated log-amplitude differences,
+\begin{equation}
+    \mathrm{SWAP}_A^{\mathrm{loc}}(\sigma,\eta)
+    =
+    \exp \Bigl[
+        \log \psi_\theta(\eta_A,\sigma_B)
+        +
+        \log \psi_\theta(\sigma_A,\eta_B)
+        -
+        \log \psi_\theta(\sigma_A,\sigma_B)
+        -
+        \log \psi_\theta(\eta_A,\eta_B)
+    \Bigr].
+\end{equation}
+This is exactly the form that makes the shared $\log \psi_\theta$ interface useful: the observable code only needs log-amplitude evaluations on original and swapped configurations, so no model-specific entanglement logic is required.
+
+The retained small-system validation is summarized in Table~\ref{tab:swap-validation} and Figure~\ref{fig:swap-validation}. It should be read only as a basic check that the sampled SWAP route is behaving sensibly.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{rrrrr}
+        \toprule
+        $\lvert A \rvert$ & exact $S_2(A)$ & sampled $S_2(A)$ & sampled std & estimator std \\
+        \midrule
+        1 & 0.1868 & 0.1115 & 0.0000 & 0.0434 \\
+        2 & 0.1206 & 0.1155 & 0.0000 & 0.0502 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Retained SWAP-validation data for the exact-validation benchmark.}
+    \label{tab:swap-validation}
+\end{table}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.82\linewidth]{exercise_2_swap_validation.png}
+    \caption{Sampled SWAP estimates compared with exact Renyi-2 benchmark values.}
+    \label{fig:swap-validation}
+\end{figure}
+
+The agreement is only moderate, and it should not be overstated. For $\lvert A \rvert = 2$ the sampled estimate is close to the exact value in the retained run, while for $\lvert A \rvert = 1$ the deviation is more visible. This is enough to show that the implementation is targeting the right quantity, but not enough to treat the sampled estimator as quantitatively sharp at the current budget.
+
+That same point explains the noise discussion. As the subsystem grows, the swapped configurations become less typical under the original sampling distribution, so the ratio in the local estimator fluctuates more strongly. In practice this means that larger subsystems tend to produce noisier SWAP estimates. The retained workflow therefore now exposes a subsystem-by-subsystem SWAP-diagnostic table that records the sampled mean, sampled spread, exact benchmark value when available, and the corresponding sampled-versus-exact gap. That is the support material that should be used to judge whether the small-system validation is merely qualitative or already strong enough for the final report. Higher-order Renyi entropies could be defined in the same replica spirit, but they would require more replicas and typically inherit even worse estimator quality. In the present workflow, Renyi-2 is therefore the practical compromise between physical usefulness and estimator stability.
+
+\subsection*{2/d Random Initialization Choices}
+
+The first retained random-state study asks how strongly the sampled half-partition Renyi-2 depends on initialization before any training is performed. The two relevant choices are the overall parameter scale and whether the phase channel is allowed to fluctuate freely from the start. The retained summary is given in Table~\ref{tab:initialization-summary} and Figure~\ref{fig:initialization}.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{lrrrr}
+        \toprule
+        initialization & valid fraction & sampled $S_2(A)$ & sampled std & estimator std \\
+        \midrule
+        default complex & 0.00 & --- & 0.0000 & 0.0000 \\
+        real scale 0.25 & 1.00 & 0.0290 & 0.0100 & 0.0389 \\
+        real scale 1 & 1.00 & 1.4726 & 0.4215 & 0.4286 \\
+        real scale 2 & 1.00 & 2.0003 & 0.3772 & 0.7217 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Retained summary of the random-initialization study.}
+    \label{tab:initialization-summary}
+\end{table}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\linewidth]{exercise_2_initialization.png}
+    \caption{Half-partition sampled Renyi-2 for the retained initialization choices.}
+    \label{fig:initialization}
+\end{figure}
+
+The clearest conclusion is that unrestricted random complex phases are not usable under the retained sampling budget. The default complex initialization produces no valid entropy points in the summary table, so allowing the phase channel to fluctuate freely from the outset pushes the SWAP estimator outside its numerically stable regime. This is consistent with the structure of the estimator: once the phase varies too strongly between original and swapped configurations, the replica ratio becomes much harder to average reliably. For the final report, this point should be backed not only by the missing sampled entropies but also by exact-versus-sampled checks on the small exact system, so estimator failure is separated cleanly from any genuine change in random-state entanglement.
+
+Within the real-amplitude family, the overall scale matters strongly. A small real scale gives a state very close to a low-entanglement random baseline, while larger scales produce substantially larger sampled Renyi-2 values even before any optimization. In the retained data the half-partition estimate rises from about $0.029$ at scale $0.25$ to about $1.47$ at scale $1$ and about $2.00$ at scale $2$. The interpretation is not that larger scales are automatically better, but that the random-state entanglement seen by the sampler is already highly sensitive to how broadly the amplitude channel is initialized.
+
+\subsection*{2/e Architecture Comparison}
+
+The second retained random-state study compares architecture families at a fixed real-amplitude initialization rule. The summary is listed in Table~\ref{tab:architecture-summary} and shown in Figure~\ref{fig:architecture}. At this stage these results should be read mainly as a diagnostic for the current implementation, not as a reliable architecture ranking.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{lrrr}
+        \toprule
+        model & sampled $S_2(A)$ & sampled std & estimator std \\
+        \midrule
+        CNN channels=4 & 0.0054 & 0.0073 & 0.0061 \\
+        CNN channels=6 & 0.0015 & 0.0051 & 0.0089 \\
+        FFNN width=8 & 0.0303 & 0.0223 & 0.0257 \\
+        FFNN width=12 & 0.0364 & 0.0125 & 0.0305 \\
+        RBM alpha=1 & 1.5584 & 0.3528 & 0.3365 \\
+        RBM alpha=2 & 1.4952 & 0.2196 & 0.2875 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Retained summary of the architecture-comparison study.}
+    \label{tab:architecture-summary}
+\end{table}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\linewidth]{exercise_2_architecture.png}
+    \caption{Half-partition sampled Renyi-2 for the retained architecture comparison.}
+    \label{fig:architecture}
+\end{figure}
+
+The retained outputs show a very large separation between the RBM and the other two models. Taken at face value, the RBM gives sampled half-partition Renyi-2 values around $1.50$--$1.56$, whereas the FFNN and CNN remain close to zero. That spread is large enough that it should not yet be promoted to a physics conclusion. The safer reading is that the present FFNN and CNN paths are not yet competitive under the retained setup, either because the architecture comparison is still too noisy or because there is an implementation issue that still needs to be investigated. For that reason the retained workflow now also records model-sanity diagnostics for reruns: sampled log-amplitude spread, sampled phase spread, state-space coverage in the retained sample, acceptance, and a simple autocorrelation estimate. Those checks are needed before the FFNN/CNN comparison can be cited as evidence rather than as a debugging prompt.
+
+For that reason the within-family trends are not interpreted strongly here. The small FFNN width dependence and the near-zero CNN values are better treated as a debugging signal than as evidence for a clean architectural hierarchy.
+
+\subsection*{Conclusion}
+
+Exercise 2 sets up the neural-quantum-state side of the project around a common $\log \psi_\theta(\sigma)$ interface. That choice makes it possible to compare an RBM, a dense feed-forward network, and a convolutional network inside the same project-owned workflow without changing the surrounding Monte Carlo and observable code. The local Metropolis sampler is kept deliberately simple and uniform across the three ansatz families, even though that simplicity comes with the expected weakness that single-spin updates will decorrelate more slowly once the state develops stronger long-range structure.
+
+The practical entanglement observable is the sampled Renyi-2 entropy obtained from the SWAP estimator. The retained validation data are sufficient to show that this estimator path is implemented sensibly, while also making clear that finite-sample noise is already a real issue even in the small validation setting. That is precisely why Renyi-2 is the right quantity to carry forward: it remains accessible from samples, whereas more demanding entanglement probes would be even harder to estimate reliably.
+
+The retained random-state studies still make two useful points. First, initialization matters strongly, especially through parameter scale and through whether the phase channel is allowed to fluctuate freely. Under the retained budget, unrestricted random complex phases make the SWAP route numerically unusable, while larger real-amplitude scales increase the sampled random-state entanglement substantially. Second, the architecture comparison is not yet mature enough to support a strong claim beyond saying that the current non-RBM runs need further investigation. For the next exercise, the main outcome is therefore the usable Renyi-2 measurement route together with the practical lesson that estimator quality, sampler quality, and model implementation have to be judged together.
+
+\end{document}
