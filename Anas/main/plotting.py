@@ -453,3 +453,148 @@ def plot_cnn_entropy_vs_kernel(
     plt.legend()
     plt.tight_layout()
     plt.show()
+
+import matplotlib.pyplot as plt
+import jax.numpy as jnp
+
+from random_state_experiments import disorder_averaged_entropy_profile
+
+
+def plot_entropy_profiles_vs_subsystem_size_for_sizes(
+    *,
+    L=16,
+    seeds=range(10),
+    subsystem_sizes=None,
+    entropy_pairings=16,
+    nchains=32,
+    nsamples_per_chain=16,
+    neq=50,
+    nskip=2,
+):
+    if subsystem_sizes is None:
+        subsystem_sizes = list(range(1, L // 2 + 1))
+
+    # -------------------------
+    # RBM: small / medium / large
+    # -------------------------
+    rbm_configs = {
+        "small": {"hidden": 4},
+        "medium": {"hidden": 24},
+        "large": {"hidden": 36},
+    }
+
+    plt.figure(figsize=(8, 5))
+    for label, cfg in rbm_configs.items():
+        res = disorder_averaged_entropy_profile(
+            "RBM",
+            L=L,
+            seeds=seeds,
+            subsystem_sizes=subsystem_sizes,
+            entropy_pairings=entropy_pairings,
+            nchains=nchains,
+            nsamples_per_chain=nsamples_per_chain,
+            neq=neq,
+            nskip=nskip,
+            hidden=cfg["hidden"],
+        )
+
+        x = jnp.array(res["subsystem_sizes"])
+        y = jnp.array(res["mean"])
+        yerr = jnp.array(res["std"])
+
+        plt.errorbar(
+            x, y, yerr=yerr,
+            marker="o", capsize=4,
+            label=f"{label} ({cfg['hidden']} hidden)"
+        )
+
+    plt.xlabel("Subsystem size")
+    plt.ylabel(r"Rényi-2 entropy $S_2$")
+    plt.title(f"RBM: entropy scaling vs subsystem size, L={L}")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # -------------------------
+    # FFN: small / medium / large
+    # -------------------------
+    ffn_configs = {
+        "small": {"hidden_layers": (8,)},
+        "medium": {"hidden_layers": (32, 32)},
+        "large": {"hidden_layers": (64, 64)},
+    }
+
+    plt.figure(figsize=(8, 5))
+    for label, cfg in ffn_configs.items():
+        res = disorder_averaged_entropy_profile(
+            "FFN",
+            L=L,
+            seeds=seeds,
+            subsystem_sizes=subsystem_sizes,
+            entropy_pairings=entropy_pairings,
+            nchains=nchains,
+            nsamples_per_chain=nsamples_per_chain,
+            neq=neq,
+            nskip=nskip,
+            hidden_layers=cfg["hidden_layers"],
+        )
+
+        x = jnp.array(res["subsystem_sizes"])
+        y = jnp.array(res["mean"])
+        yerr = jnp.array(res["std"])
+
+        plt.errorbar(
+            x, y, yerr=yerr,
+            marker="o", capsize=4,
+            label=f"{label} {cfg['hidden_layers']}"
+        )
+
+    plt.xlabel("Subsystem size")
+    plt.ylabel(r"Rényi-2 entropy $S_2$")
+    plt.title(f"FFN: entropy scaling vs subsystem size, L={L}")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # -------------------------
+    # CNN: small / medium / large
+    # -------------------------
+    cnn_configs = {
+    "small": {"channels": 4, "n_conv_layers": 1},
+    "medium": {"channels": 16, "n_conv_layers": 2},
+    "large": {"channels": 16, "n_conv_layers": 3},
+    }
+
+    plt.figure(figsize=(8, 5))
+    for label, cfg in cnn_configs.items():
+        res = disorder_averaged_entropy_profile(
+            "CNN",
+            L=L,
+            seeds=seeds,
+            subsystem_sizes=subsystem_sizes,
+            entropy_pairings=entropy_pairings,
+            nchains=nchains,
+            nsamples_per_chain=nsamples_per_chain,
+            neq=neq,
+            nskip=nskip,
+            channels=cfg["channels"],
+            kernel=3,
+            n_conv_layers=cfg["n_conv_layers"],
+        )
+
+        x = jnp.array(res["subsystem_sizes"])
+        y = jnp.array(res["mean"])
+        yerr = jnp.array(res["std"])
+
+        plt.errorbar(
+            x, y, yerr=yerr,
+            marker="o", capsize=4,
+            label=f"{label} (ch={cfg['channels']}, layers={cfg['n_conv_layers']})"
+        )
+
+    plt.xlabel("Subsystem size")
+    plt.ylabel(r"Rényi-2 entropy $S_2$")
+    plt.title(f"CNN: entropy scaling vs subsystem size, L={L}")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()

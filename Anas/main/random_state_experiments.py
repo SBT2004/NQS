@@ -16,22 +16,36 @@ def build_model(
     channels=16,
     kernel=3,
     n_conv_layers=1,
+    init_scale=None,
 ):
     if model_name == "RBM":
-        arch = RBM(L, hidden=hidden)
-        model_info = {"hidden": hidden}
+        if init_scale is None:
+            init_scale = 0.1
+        arch = RBM(L, hidden=hidden, init_scale=init_scale)
+        model_info = {"hidden": hidden, "init_scale": init_scale}
 
     elif model_name == "FFN":
+        if init_scale is None:
+            init_scale = 1.0
         hidden_layers = list(hidden_layers)
-        arch = FFN(L, hidden_layers=hidden_layers)
-        model_info = {"hidden_layers": hidden_layers}
+        arch = FFN(L, hidden_layers=hidden_layers, init_scale=init_scale)
+        model_info = {"hidden_layers": hidden_layers, "init_scale": init_scale}
 
     elif model_name == "CNN":
-        arch = CNN(L, channels=channels, kernel=kernel, n_conv_layers=n_conv_layers)
+        if init_scale is None:
+            init_scale = 0.5
+        arch = CNN(
+            L,
+            channels=channels,
+            kernel=kernel,
+            n_conv_layers=n_conv_layers,
+            init_scale=init_scale,
+        )
         model_info = {
             "channels": channels,
             "kernel": kernel,
             "n_conv_layers": n_conv_layers,
+            "init_scale": init_scale,
         }
 
     else:
@@ -51,6 +65,7 @@ def build_random_state(
     channels=16,
     kernel=3,
     n_conv_layers=1,
+    init_scale=None,
 ):
     key = random.PRNGKey(seed)
     arch, params, model_info = build_model(
@@ -62,6 +77,7 @@ def build_random_state(
         channels=channels,
         kernel=kernel,
         n_conv_layers=n_conv_layers,
+        init_scale=init_scale,
     )
 
     wf = NeuralQuantumState(arch, params, L)
@@ -76,7 +92,6 @@ def build_random_state(
         "model_info": model_info,
         "n_parameters": count_parameters(params),
     }
-
 
 def sample_random_state(
     wavefunction,
@@ -115,6 +130,7 @@ def disorder_averaged_entropy_profile(
     channels=16,
     kernel=3,
     n_conv_layers=1,
+    init_scale=None,
 ):
     """
     Disorder-averaged Renyi-2 entropy profile S2(L_A) for one architecture.
@@ -138,6 +154,7 @@ def disorder_averaged_entropy_profile(
             channels=channels,
             kernel=kernel,
             n_conv_layers=n_conv_layers,
+            init_scale=init_scale,
         )
 
         wf = state["wavefunction"]
@@ -195,10 +212,10 @@ def compare_architectures_entropy_scaling(
     cnn_channels=16,
     cnn_kernel=3,
     cnn_n_conv_layers=1,
+    rbm_init_scale=0.1,
+    ffn_init_scale=1.0,
+    cnn_init_scale=0.5,
 ):
-    """
-    Returns disorder-averaged S2(L_A) curves for RBM, FFN, CNN.
-    """
     results = {}
 
     results["RBM"] = disorder_averaged_entropy_profile(
@@ -212,6 +229,7 @@ def compare_architectures_entropy_scaling(
         neq=neq,
         nskip=nskip,
         hidden=rbm_hidden,
+        init_scale=rbm_init_scale,
     )
 
     results["FFN"] = disorder_averaged_entropy_profile(
@@ -225,6 +243,7 @@ def compare_architectures_entropy_scaling(
         neq=neq,
         nskip=nskip,
         hidden_layers=ffn_hidden_layers,
+        init_scale=ffn_init_scale,
     )
 
     results["CNN"] = disorder_averaged_entropy_profile(
@@ -240,6 +259,7 @@ def compare_architectures_entropy_scaling(
         channels=cnn_channels,
         kernel=cnn_kernel,
         n_conv_layers=cnn_n_conv_layers,
+        init_scale=cnn_init_scale,
     )
 
     return results
