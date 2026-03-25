@@ -8,7 +8,7 @@ import jax.numpy as jnp
 
 from .expectation import ProjectExpectationBackend, SupportsExpectationBackend
 from .runtime_types import SupportsLogPsi
-from .sampler import MetropolisLocal
+from .sampler import MetropolisLocal, SampleBatch
 
 ParamTree = Any
 
@@ -44,8 +44,14 @@ class VariationalState:
     def sample(self) -> jax.Array:
         return self._expectation_backend.sample()
 
+    def sample_with_log_values(self) -> SampleBatch:
+        return self._expectation_backend.sample_with_log_values()
+
     def independent_sample(self, seed_offset: int = 0) -> jax.Array:
         return self._expectation_backend.independent_sample(seed_offset=seed_offset)
+
+    def independent_sample_with_log_values(self, seed_offset: int = 0) -> SampleBatch:
+        return self._expectation_backend.independent_sample_with_log_values(seed_offset=seed_offset)
 
     def exact_statevector(self) -> jax.Array:
         return self._expectation_backend.exact_statevector()
@@ -63,8 +69,14 @@ class VariationalState:
     ):
         return self._expectation_backend.expect_with_params(operator, params)
 
+    def expect_on_sample_batch(self, operator: Any, sample_batch: SampleBatch):
+        return self._expectation_backend.expect_on_sample_batch(operator, sample_batch)
+
     def energy(self, operator: Any) -> jax.Array:
         return jnp.real(self.expect(operator).mean)
+
+    def energy_on_sample_batch(self, operator: Any, sample_batch: SampleBatch) -> jax.Array:
+        return jnp.real(self.expect_on_sample_batch(operator, sample_batch).mean)
 
     def energy_with_params(
         self,

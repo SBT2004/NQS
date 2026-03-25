@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import jax
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +16,7 @@ from nqs.workflows import (  # noqa: E402
     build_system,
     exact_observables_summary,
     history_table,
+    initialize_random_parameters,
     run_architecture_benchmark,
     run_architecture_comparison,
     run_ghz_bonus_workflow,
@@ -23,12 +25,17 @@ from nqs.workflows import (  # noqa: E402
     run_non_ed_vmc_benchmark,
     run_random_architecture_study,
     run_vmc_experiment,
+    sampler_acceptance_diagnostics,
+    sampler_mixing_diagnostics,
     sampled_entropy_scaling_summary,
+    swap_estimator_diagnostics,
     tfim_config,
     tfim_proxy_sweep_points,
 )
 import nqs.observables as observables  # noqa: E402
 from nqs.exact_diag_debug import dense_debug_operator_matrix  # noqa: E402
+from nqs.sampler import SampleBatch  # noqa: E402
+from nqs.vmc_setup import build_model, build_variational_state  # noqa: E402
 
 
 def _bell_log_amplitude(states: np.ndarray) -> np.ndarray:
@@ -154,6 +161,149 @@ class NotebookWorkflowTests(unittest.TestCase):
         self.assertAlmostEqual(float(summary["entropy_table"]["renyi2_std"].iloc[0]), 0.0)
         self.assertEqual(len(summary["entropy_samples"]), 3)
 
+    def test_sampled_entropy_scaling_summary_reuses_original_sample_log_values(self) -> None:
+        controlled_samples = np.array(
+            [
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [1, 1],
+            ],
+            dtype=np.uint8,
+        )
+        original_log_values = _bell_log_amplitude(controlled_samples)
+
+        class FakeState:
+            def __init__(self) -> None:
+                self.calls: list[int] = []
+
+            def sample(self) -> np.ndarray:
+                raise AssertionError("sample should not be used when independent_sample_with_log_values is available")
+
+            def independent_sample(self, seed_offset: int = 0) -> np.ndarray:
+                raise AssertionError(
+                    "independent_sample should not be used when independent_sample_with_log_values is available"
+                )
+
+            def independent_sample_with_log_values(self, seed_offset: int = 0) -> SampleBatch:
+                self.calls.append(seed_offset)
+                return SampleBatch(
+                    states=jax.numpy.asarray(controlled_samples),
+                    log_values=jax.numpy.asarray(original_log_values),
+                )
+
+            def log_value(self, states: np.ndarray) -> np.ndarray:
+                sample_array = np.asarray(states, dtype=np.uint8)
+                if np.array_equal(sample_array, controlled_samples):
+                    raise AssertionError("original samples should reuse provided log values")
+                return _bell_log_amplitude(sample_array)
+
+            def exact_statevector(self) -> np.ndarray:
+                return np.array([1.0 / np.sqrt(2.0), 0.0, 0.0, 1.0 / np.sqrt(2.0)], dtype=np.complex128)
+
+        state = FakeState()
+        summary = sampled_entropy_scaling_summary(state, n_sites=2, n_independent_runs=2)
+
+        self.assertEqual(state.calls, [0, 1])
+        self.assertAlmostEqual(float(summary["entropy_table"]["renyi2"].iloc[0]), np.log(2.0))
+
+    def test_sampled_entropy_scaling_summary_uses_provided_sample_batches_without_resampling(self) -> None:
+        controlled_samples = np.array(
+            [
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [1, 1],
+            ],
+            dtype=np.uint8,
+        )
+        provided_batches = [
+            SampleBatch(
+                states=jax.numpy.asarray(controlled_samples),
+                log_values=jax.numpy.asarray(_bell_log_amplitude(controlled_samples)),
+            )
+            for _ in range(2)
+        ]
+
+        class FakeState:
+            def sample(self) -> np.ndarray:
+                raise AssertionError("provided sample batches should bypass sample")
+
+            def independent_sample(self, seed_offset: int = 0) -> np.ndarray:
+                raise AssertionError("provided sample batches should bypass independent_sample")
+
+            def independent_sample_with_log_values(self, seed_offset: int = 0) -> SampleBatch:
+                raise AssertionError("provided sample batches should bypass independent_sample_with_log_values")
+
+            def log_value(self, states: np.ndarray) -> np.ndarray:
+                sample_array = np.asarray(states, dtype=np.uint8)
+                if np.array_equal(sample_array, controlled_samples):
+                    raise AssertionError("provided original log values should be reused for original samples")
+                return _bell_log_amplitude(sample_array)
+
+            def exact_statevector(self) -> np.ndarray:
+                return np.array([1.0 / np.sqrt(2.0), 0.0, 0.0, 1.0 / np.sqrt(2.0)], dtype=np.complex128)
+
+        summary = sampled_entropy_scaling_summary(
+            FakeState(),
+            n_sites=2,
+            n_independent_runs=2,
+            sample_batches=provided_batches,
+        )
+
+        self.assertAlmostEqual(float(summary["entropy_table"]["renyi2"].iloc[0]), np.log(2.0))
+
+    def test_sampled_entropy_scaling_summary_keeps_valid_subsystems_when_one_swap_estimate_fails(self) -> None:
+        controlled_samples = np.array(
+            [
+                [0, 0, 0, 0],
+                [1, 1, 1, 1],
+            ],
+            dtype=np.uint8,
+        )
+        provided_batches = [
+            SampleBatch(
+                states=jax.numpy.asarray(controlled_samples),
+                log_values=jax.numpy.asarray(np.zeros(controlled_samples.shape[0], dtype=np.complex128)),
+            )
+        ]
+
+        class FakeState:
+            def sample(self) -> np.ndarray:
+                raise AssertionError("sample should not be used when sample_batches are provided")
+
+            def independent_sample(self, seed_offset: int = 0) -> np.ndarray:
+                raise AssertionError("independent_sample should not be used when sample_batches are provided")
+
+            def log_value(self, states: np.ndarray) -> np.ndarray:
+                lookup: dict[tuple[int, ...], complex] = {
+                    (1, 0, 0, 0): 0.0j,
+                    (0, 1, 1, 1): 0.0j,
+                    (1, 1, 0, 0): 0.5j * np.pi,
+                    (0, 0, 1, 1): 0.5j * np.pi,
+                }
+                result = []
+                for state in np.asarray(states, dtype=np.uint8).reshape(-1, 4):
+                    key = tuple(int(value) for value in state.tolist())
+                    if key not in lookup:
+                        raise AssertionError(f"unexpected state queried: {key}")
+                    result.append(lookup[key])
+                return np.asarray(result, dtype=np.complex128)
+
+            def exact_statevector(self) -> np.ndarray:
+                raise AssertionError("exact_statevector should not be used on the sampled path")
+
+        summary = sampled_entropy_scaling_summary(
+            FakeState(),
+            n_sites=4,
+            n_independent_runs=1,
+            sample_batches=provided_batches,
+        )
+
+        self.assertEqual(summary["entropy_table"]["subsystem_size"].tolist(), [1, 2])
+        self.assertAlmostEqual(float(summary["entropy_table"]["renyi2"].iloc[0]), 0.0)
+        self.assertTrue(np.isnan(float(summary["entropy_table"]["renyi2"].iloc[1])))
+
     def test_tfim_helpers_return_notebook_ready_configurations(self) -> None:
         config = tfim_config(lattice_shape=(4, 1), h=1.0, pbc=False)
         sweep_points = tfim_proxy_sweep_points([4, 6], h=1.0, pbc=False)
@@ -270,6 +420,216 @@ class NotebookWorkflowTests(unittest.TestCase):
         self.assertTrue(np.isfinite(result["entropy_scan_table"]["exact_renyi2"]).all())
         self.assertTrue(np.isfinite(result["entropy_scan_table"]["sampled_renyi2"]).all())
 
+    def test_run_random_architecture_study_supports_labeled_init_variants_without_exact_backend(self) -> None:
+        result = run_random_architecture_study(
+            architecture_configs={
+                "rbm_default": {
+                    "model_name": "RBM",
+                    "model_kwargs": {"alpha": 1},
+                },
+                "rbm_real_scaled": {
+                    "model_name": "RBM",
+                    "model_kwargs": {"alpha": 1},
+                    "initialization": {
+                        "parameter_scale": 0.25,
+                        "phase_scale": 0.0,
+                        "label": "scale=0.25, real-amplitude",
+                    },
+                },
+            },
+            seeds=(0,),
+            lattice_shape=(4, 4),
+            hamiltonian="tfim",
+            pbc=False,
+            h=2.5,
+            n_samples=32,
+            n_discard_per_chain=2,
+            n_chains=4,
+            entropy_n_independent_runs=1,
+        )
+
+        summary = result["summary_table"]
+        self.assertEqual(summary["model"].tolist(), ["rbm_default", "rbm_real_scaled"])
+        self.assertEqual(summary["architecture_family"].tolist(), ["RBM", "RBM"])
+        self.assertEqual(summary["exact_available"].tolist(), [False, False])
+        self.assertTrue(np.isnan(summary["half_partition_exact_renyi2"]).all())
+        self.assertEqual(summary["initialization_label"].tolist(), ["default", "scale=0.25, real-amplitude"])
+        self.assertTrue((summary["valid_entropy_points"] >= 0).all())
+        self.assertTrue((summary["valid_entropy_fraction"] >= 0.0).all())
+        self.assertTrue((summary["valid_entropy_fraction"] <= 1.0).all())
+        self.assertEqual(
+            result["entropy_scan_table"]["initialization_label"].drop_duplicates().tolist(),
+            ["default", "scale=0.25, real-amplitude"],
+        )
+        self.assertIsNone(result["trial_results"][0]["exact_entropy_scan_table"])
+
+    def test_run_random_architecture_study_propagates_unexpected_exact_entropy_errors(self) -> None:
+        with patch(
+            "nqs.workflows._core.renyi2_subsystem_scan_summary",
+            side_effect=ValueError("unexpected exact failure"),
+        ):
+            with self.assertRaisesRegex(ValueError, "unexpected exact failure"):
+                run_random_architecture_study(
+                    architecture_configs={"RBM": {"alpha": 1}},
+                    seeds=(0,),
+                    lattice_shape=(2, 2),
+                    hamiltonian="tfim",
+                    n_samples=16,
+                    n_discard_per_chain=2,
+                    n_chains=4,
+                    entropy_n_independent_runs=1,
+                    real_amplitude_only=True,
+                )
+
+    def test_initialize_random_parameters_can_zero_phase_and_rescale(self) -> None:
+        system = build_system(lattice_shape=(2, 2), pbc=False, hamiltonian="tfim", h=1.0)
+        model = build_model(model_name="RBM", model_kwargs={"alpha": 1}, lattice_shape=(2, 2))
+
+        default_params = initialize_random_parameters(model, system["hilbert"], seed=0)
+        scaled_real_params = initialize_random_parameters(
+            model,
+            system["hilbert"],
+            seed=0,
+            parameter_scale=0.5,
+            phase_scale=0.0,
+        )
+
+        np.testing.assert_allclose(
+            np.asarray(scaled_real_params["visible_bias"]),
+            0.5 * np.asarray(default_params["visible_bias"]),
+        )
+        np.testing.assert_allclose(
+            np.asarray(scaled_real_params["phase_bias"]),
+            np.zeros_like(np.asarray(default_params["phase_bias"])),
+        )
+
+    def test_sampler_acceptance_diagnostics_reports_burn_in_and_sampling_phases(self) -> None:
+        system = build_system(lattice_shape=(2, 2), pbc=False, hamiltonian="tfim", h=1.0)
+        model = build_model(model_name="FFNN", model_kwargs={"hidden_dims": (4,)}, lattice_shape=(2, 2))
+        params = initialize_random_parameters(
+            model,
+            system["hilbert"],
+            seed=0,
+            phase_scale=0.0,
+        )
+        variational_state = build_variational_state(
+            model=model,
+            hilbert=system["hilbert"],
+            seed=0,
+            n_samples=8,
+            n_discard_per_chain=2,
+            n_chains=4,
+            params=params,
+        )
+
+        diagnostics = sampler_acceptance_diagnostics(variational_state)
+
+        self.assertEqual(diagnostics["summary_table"]["phase"].tolist(), ["burn_in", "sampling"])
+        self.assertTrue((diagnostics["summary_table"]["mean_acceptance"] >= 0.0).all())
+        self.assertTrue((diagnostics["summary_table"]["mean_acceptance"] <= 1.0).all())
+        self.assertIn("steps_per_chain", diagnostics["config_table"]["parameter"].tolist())
+        self.assertGreaterEqual(diagnostics["overall_acceptance"], 0.0)
+        self.assertLessEqual(diagnostics["overall_acceptance"], 1.0)
+
+    def test_sampler_mixing_diagnostics_reports_autocorrelation_summary(self) -> None:
+        system = build_system(lattice_shape=(2, 2), pbc=False, hamiltonian="tfim", h=1.0)
+        model = build_model(model_name="FFNN", model_kwargs={"hidden_dims": (4,)}, lattice_shape=(2, 2))
+        params = initialize_random_parameters(
+            model,
+            system["hilbert"],
+            seed=0,
+            phase_scale=0.0,
+        )
+        variational_state = build_variational_state(
+            model=model,
+            hilbert=system["hilbert"],
+            seed=0,
+            n_samples=8,
+            n_discard_per_chain=2,
+            n_chains=4,
+            params=params,
+        )
+
+        diagnostics = sampler_mixing_diagnostics(variational_state, max_lag=3)
+
+        self.assertEqual(diagnostics["autocorrelation_table"]["lag"].tolist(), [0, 1])
+        self.assertEqual(diagnostics["autocorrelation_table"]["mean_magnetization_autocorrelation"].iloc[0], 1.0)
+        self.assertIn("integrated_autocorrelation_time", diagnostics["summary_table"]["metric"].tolist())
+        self.assertGreaterEqual(diagnostics["integrated_autocorrelation_time"], 0.5)
+
+    def test_swap_estimator_diagnostics_merges_exact_and_sampled_support(self) -> None:
+        controlled_samples = np.array(
+            [
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [1, 1],
+            ],
+            dtype=np.uint8,
+        )
+        provided_batches = [
+            SampleBatch(
+                states=jax.numpy.asarray(controlled_samples),
+                log_values=jax.numpy.asarray(_bell_log_amplitude(controlled_samples)),
+            )
+        ]
+
+        class FakeState:
+            def sample(self) -> np.ndarray:
+                raise AssertionError("sample should not be used when sample_batches are provided")
+
+            def independent_sample(self, seed_offset: int = 0) -> np.ndarray:
+                raise AssertionError("independent_sample should not be used when sample_batches are provided")
+
+            def log_value(self, states: np.ndarray) -> np.ndarray:
+                return _bell_log_amplitude(np.asarray(states, dtype=np.uint8))
+
+            def exact_statevector(self) -> np.ndarray:
+                return np.array([1.0 / np.sqrt(2.0), 0.0, 0.0, 1.0 / np.sqrt(2.0)], dtype=np.complex128)
+
+        diagnostics = swap_estimator_diagnostics(
+            FakeState(),
+            n_sites=2,
+            n_independent_runs=1,
+            sample_batches=provided_batches,
+        )
+
+        row = diagnostics["diagnostics_table"].iloc[0]
+        self.assertTrue(bool(row["exact_available"]))
+        self.assertAlmostEqual(float(row["sampled_renyi2"]), np.log(2.0))
+        self.assertAlmostEqual(float(row["exact_renyi2"]), np.log(2.0))
+        self.assertAlmostEqual(float(row["abs_error"]), 0.0)
+        self.assertTrue(bool(row["within_one_sigma"]))
+
+    def test_run_random_architecture_study_can_include_support_diagnostics(self) -> None:
+        result = run_random_architecture_study(
+            architecture_configs={
+                "FFNN": {"hidden_dims": (4,)},
+                "CNN": {"channels": (2,), "kernel_size": (1, 1)},
+            },
+            seeds=(0,),
+            lattice_shape=(2, 2),
+            hamiltonian="tfim",
+            n_samples=16,
+            n_discard_per_chain=2,
+            n_chains=4,
+            entropy_n_independent_runs=1,
+            real_amplitude_only=True,
+            include_support_diagnostics=True,
+        )
+
+        summary = result["summary_table"]
+        self.assertTrue(np.isfinite(summary["diagnostic_log_amplitude_std"]).all())
+        self.assertTrue(np.isfinite(summary["diagnostic_acceptance"]).all())
+        self.assertTrue(np.isfinite(summary["diagnostic_tau_int"]).all())
+        self.assertTrue((summary["diagnostic_unique_state_fraction"] > 0.0).all())
+        self.assertIn("half_partition_sampled_ci95", summary.columns)
+        self.assertTrue((summary["half_partition_sampled_ci95"] >= 0.0).all())
+
+        entropy_scan = result["entropy_scan_table"]
+        self.assertIn("sampled_renyi2_ci95", entropy_scan.columns)
+        self.assertTrue((entropy_scan["sampled_renyi2_ci95"] >= 0.0).all())
+
     def test_run_hamiltonian_system_size_sweep_tracks_training_entropy(self) -> None:
         result = run_hamiltonian_system_size_sweep(
             sweep_points=[
@@ -337,13 +697,18 @@ class NotebookWorkflowTests(unittest.TestCase):
         self.assertEqual(summary["n_sites"].tolist(), [16])
         self.assertTrue((summary["parameter_count"] > 0).all())
         self.assertTrue(np.isfinite(summary["final_energy"]).all())
-        self.assertIn("runtime_seconds", summary.columns)
+        self.assertIn("benchmark_mode", summary.columns)
+        self.assertIn("training_runtime_seconds", summary.columns)
         self.assertIn("callback_runtime_seconds", summary.columns)
+        self.assertIn("postprocessing_runtime_seconds", summary.columns)
+        self.assertIn("entropy_scan_runtime_seconds", summary.columns)
+        self.assertIn("report_runtime_seconds", summary.columns)
         self.assertIn("total_runtime_seconds", summary.columns)
         self.assertIn("tail_window_energy_std", summary.columns)
         self.assertIn("final_half_partition_renyi2", summary.columns)
         self.assertIn("final_nn_correlation", summary.columns)
         self.assertIn("valid_entropy_points", summary.columns)
+        self.assertEqual(summary["benchmark_mode"].tolist(), ["sampled"])
         self.assertEqual(
             result["training_history_table"]["system_label"].tolist(),
             ["tfim_4x4_non_ed"] * 3,
@@ -357,7 +722,25 @@ class NotebookWorkflowTests(unittest.TestCase):
         )
         self.assertTrue((summary["valid_entropy_points"] >= 0).all())
         self.assertTrue((summary["valid_entropy_points"] <= 2).all())
-        self.assertTrue((summary["total_runtime_seconds"] >= summary["runtime_seconds"]).all())
+        self.assertTrue((summary["training_runtime_seconds"] > 0.0).all())
+        self.assertTrue((summary["callback_runtime_seconds"] >= 0.0).all())
+        self.assertTrue((summary["postprocessing_runtime_seconds"] >= 0.0).all())
+        self.assertTrue((summary["entropy_scan_runtime_seconds"] >= 0.0).all())
+        self.assertTrue((summary["report_runtime_seconds"] >= summary["callback_runtime_seconds"]).all())
+        self.assertTrue(
+            np.allclose(
+                summary["report_runtime_seconds"],
+                summary["callback_runtime_seconds"]
+                + summary["postprocessing_runtime_seconds"]
+                + summary["entropy_scan_runtime_seconds"],
+            )
+        )
+        self.assertTrue(
+            np.allclose(
+                summary["total_runtime_seconds"],
+                summary["training_runtime_seconds"] + summary["report_runtime_seconds"],
+            )
+        )
         history = result["training_history_table"]
         post_update_rows = history.loc[history["is_post_update"]]
         self.assertEqual(post_update_rows["step"].tolist(), [2])

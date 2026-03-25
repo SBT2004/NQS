@@ -11,7 +11,7 @@ from jax.experimental import sparse as jsparse
 from .exact_diag import sparse_operator_matrix
 from .operator import Operator
 from .runtime_types import SupportsLogPsi
-from .sampler import MetropolisLocal
+from .sampler import LogPsiApplyFn, MetropolisLocal, SampleBatch
 
 ParamTree = Any
 
@@ -32,7 +32,13 @@ class SupportsExpectationBackend(Protocol):
     def sample(self) -> jax.Array:
         ...
 
+    def sample_with_log_values(self) -> SampleBatch:
+        ...
+
     def independent_sample(self, seed_offset: int = 0) -> jax.Array:
+        ...
+
+    def independent_sample_with_log_values(self, seed_offset: int = 0) -> SampleBatch:
         ...
 
     def exact_statevector(self) -> jax.Array:
@@ -47,6 +53,9 @@ class SupportsExpectationBackend(Protocol):
     def expect_with_params(self, operator: Any, params: ParamTree) -> ExpectationResult:
         ...
 
+    def expect_on_sample_batch(self, operator: Any, sample_batch: SampleBatch) -> ExpectationResult:
+        ...
+
 
 @dataclass
 class ProjectExpectationBackend:
@@ -59,23 +68,32 @@ class ProjectExpectationBackend:
     _all_states: jax.Array | None = field(default=None, init=False, repr=False)
     _exact_operator_cache_operator: Operator | None = field(default=None, init=False, repr=False)
     _exact_operator_cache_value: jsparse.BCOO | None = field(default=None, init=False, repr=False)
+    _sampler_log_psi_apply: LogPsiApplyFn = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self._sampler_log_psi_apply = self.model.log_psi
         if self.sampler.hilbert.n_states <= self.exact_backend_max_states:
             self._all_states = jnp.asarray(self.sampler.hilbert.all_states(), dtype=jnp.uint8)
 
     def set_parameters(self, params: ParamTree) -> None:
         self.params = params
 
-    def _log_value_fn(self, params: ParamTree):
-        return lambda states: self.model.log_psi(params, states)
-
     def sample(self) -> jax.Array:
-        return self.sampler.sample(self._log_value_fn(self.params))
+        return self.sample_with_log_values().states
+
+    def sample_with_log_values(self) -> SampleBatch:
+        return self.sampler.sample_with_params_and_log_values(
+            self._sampler_log_psi_apply,
+            self.params,
+        )
 
     def independent_sample(self, seed_offset: int = 0) -> jax.Array:
-        return self.sampler.independent_sample(
-            self._log_value_fn(self.params),
+        return self.independent_sample_with_log_values(seed_offset=seed_offset).states
+
+    def independent_sample_with_log_values(self, seed_offset: int = 0) -> SampleBatch:
+        return self.sampler.independent_sample_with_params_and_log_values(
+            self._sampler_log_psi_apply,
+            self.params,
             seed_offset=seed_offset,
         )
 
@@ -118,38 +136,86 @@ class ProjectExpectationBackend:
         operator: Operator,
         params: ParamTree,
         samples: jax.Array,
+        sample_log_values: jax.Array | None = None,
     ) -> jax.Array:
         sample_array = np.asarray(samples, dtype=np.uint8).reshape(-1, operator.hilbert.size)
-        sample_bits = operator.hilbert.states_to_bits(sample_array)
-        original_log_values = np.asarray(
-            self.model.log_psi(params, jnp.asarray(sample_array, dtype=jnp.uint8)),
-            dtype=np.complex128,
-        ).reshape(-1)
-        local_energies = np.zeros(sample_array.shape[0], dtype=np.complex128)
-
-        for sample_index, state_bits in enumerate(sample_bits):
-            connected = operator.connected_elements_bits(int(state_bits))
-            if not connected:
-                continue
-            connected_bits = np.asarray([connected_state_bits for connected_state_bits, _ in connected], dtype=object)
-            connected_states = operator.hilbert.bits_to_states(connected_bits)
-            coefficients = np.asarray([value for _, value in connected], dtype=np.complex128)
-            connected_log_values = np.asarray(
-                self.model.log_psi(params, jnp.asarray(connected_states, dtype=jnp.uint8)),
+        if sample_log_values is None:
+            original_log_values = np.asarray(
+                self.model.log_psi(params, jnp.asarray(sample_array, dtype=jnp.uint8)),
                 dtype=np.complex128,
             ).reshape(-1)
-            local_energies[sample_index] = np.sum(
-                coefficients * np.exp(connected_log_values - original_log_values[sample_index])
+        else:
+            original_log_values = np.asarray(sample_log_values, dtype=np.complex128).reshape(-1)
+        batched_connected = operator.connected_elements_batched(sample_array)
+        local_energies = np.zeros(sample_array.shape[0], dtype=np.complex128)
+        if batched_connected.sample_indices.size == 0:
+            return jnp.asarray(local_energies)
+
+        same_state_mask = np.all(
+            batched_connected.connected_states
+            == sample_array[batched_connected.sample_indices],
+            axis=1,
+        )
+        if np.any(same_state_mask):
+            diagonal_coefficients = batched_connected.coefficients[same_state_mask]
+            diagonal_sample_indices = batched_connected.sample_indices[same_state_mask]
+            local_energies += np.bincount(
+                diagonal_sample_indices,
+                weights=np.real(diagonal_coefficients),
+                minlength=sample_array.shape[0],
+            )
+            local_energies += 1j * np.bincount(
+                diagonal_sample_indices,
+                weights=np.imag(diagonal_coefficients),
+                minlength=sample_array.shape[0],
             )
 
+        offdiagonal_mask = ~same_state_mask
+        if not np.any(offdiagonal_mask):
+            return jnp.asarray(local_energies)
+
+        offdiagonal_sample_indices = batched_connected.sample_indices[offdiagonal_mask]
+        offdiagonal_coefficients = batched_connected.coefficients[offdiagonal_mask]
+        connected_log_values = np.asarray(
+            self.model.log_psi(
+                params,
+                jnp.asarray(batched_connected.connected_states[offdiagonal_mask], dtype=jnp.uint8),
+            ),
+            dtype=np.complex128,
+        ).reshape(-1)
+        weighted_contributions = offdiagonal_coefficients * np.exp(
+            connected_log_values - original_log_values[offdiagonal_sample_indices]
+        )
+        # np.bincount gives a compact grouped sum from connected-state rows back
+        # to the original sample index; it only accepts real weights, so the
+        # complex accumulation is split into real and imaginary parts.
+        local_energies += np.bincount(
+            offdiagonal_sample_indices,
+            weights=np.real(weighted_contributions),
+            minlength=sample_array.shape[0],
+        )
+        local_energies += 1j * np.bincount(
+            offdiagonal_sample_indices,
+            weights=np.imag(weighted_contributions),
+            minlength=sample_array.shape[0],
+        )
         return jnp.asarray(local_energies)
 
     def expect(self, operator: Any) -> ExpectationResult:
         project_operator = self._require_project_operator(operator)
         if self._all_states is not None:
             return ExpectationResult(mean=self._exact_expectation_mean(project_operator, self.params))
-        samples = self.sample()
-        local_energies = self._local_energies(project_operator, self.params, samples)
+        sample_batch = self.sample_with_log_values()
+        return self.expect_on_sample_batch(project_operator, sample_batch)
+
+    def expect_on_sample_batch(self, operator: Any, sample_batch: SampleBatch) -> ExpectationResult:
+        project_operator = self._require_project_operator(operator)
+        local_energies = self._local_energies(
+            project_operator,
+            self.params,
+            sample_batch.states,
+            sample_log_values=sample_batch.log_values,
+        )
         return ExpectationResult(mean=jnp.mean(local_energies))
 
     def expect_and_grad(self, operator: Any) -> tuple[ExpectationResult, ParamTree]:
@@ -161,14 +227,19 @@ class ProjectExpectationBackend:
             energy, grads = jax.value_and_grad(exact_energy)(self.params)
             return ExpectationResult(mean=energy), grads
 
-        samples = self.sample()
+        sample_batch = self.sample_with_log_values()
         local_energies = jax.lax.stop_gradient(
-            self._local_energies(project_operator, self.params, samples)
+            self._local_energies(
+                project_operator,
+                self.params,
+                sample_batch.states,
+                sample_log_values=sample_batch.log_values,
+            )
         )
         energy = jnp.real(jnp.mean(local_energies))
 
         def surrogate_loss(params: ParamTree) -> jax.Array:
-            log_values = jnp.asarray(self.model.log_psi(params, samples))
+            log_values = jnp.asarray(self.model.log_psi(params, sample_batch.states))
             centered_local_energies = local_energies - jnp.mean(local_energies)
             return 2.0 * jnp.real(
                 jnp.mean(jnp.conj(log_values) * centered_local_energies)
@@ -186,11 +257,17 @@ class ProjectExpectationBackend:
         if self._all_states is not None:
             return ExpectationResult(mean=self._exact_expectation_mean(project_operator, params))
 
-        samples = self.sampler.independent_sample(
-            self._log_value_fn(params),
+        sample_batch = self.sampler.independent_sample_with_params_and_log_values(
+            self._sampler_log_psi_apply,
+            params,
             seed_offset=0,
         )
-        local_energies = self._local_energies(project_operator, params, samples)
+        local_energies = self._local_energies(
+            project_operator,
+            params,
+            sample_batch.states,
+            sample_log_values=sample_batch.log_values,
+        )
         return ExpectationResult(mean=jnp.mean(local_energies))
 
 

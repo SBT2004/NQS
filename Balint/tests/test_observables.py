@@ -3,11 +3,13 @@ import unittest
 from pathlib import Path
 from typing import cast
 
+import jax
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import nqs.observables as observables
+from nqs.sampler import SampleBatch
 
 
 def _bell_state() -> np.ndarray:
@@ -159,6 +161,59 @@ class ObservableTests(unittest.TestCase):
         self.assertAlmostEqual(stats["mean"], np.log(2.0))
         self.assertAlmostEqual(stats["std"], 0.0)
         self.assertNotIn("exact", stats)
+
+    def test_renyi2_entropy_statistics_reuses_original_sample_log_values_when_available(self) -> None:
+        bell = _bell_state()
+        log_amplitude = _log_amplitude_from_statevector(bell)
+        controlled_samples = np.array(
+            [
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [1, 1],
+            ],
+            dtype=np.uint8,
+        )
+        original_log_values = log_amplitude(controlled_samples)
+
+        class FakeState:
+            def __init__(self) -> None:
+                self.sample_calls: list[int] = []
+
+            def sample(self) -> np.ndarray:
+                raise AssertionError("sample should not be used when independent_sample_with_log_values is available")
+
+            def independent_sample(self, seed_offset: int = 0) -> np.ndarray:
+                raise AssertionError(
+                    "independent_sample should not be used when independent_sample_with_log_values is available"
+                )
+
+            def independent_sample_with_log_values(self, seed_offset: int = 0) -> SampleBatch:
+                self.sample_calls.append(seed_offset)
+                return SampleBatch(
+                    states=jax.numpy.asarray(controlled_samples),
+                    log_values=jax.numpy.asarray(original_log_values),
+                )
+
+            def log_value(self, states: np.ndarray) -> np.ndarray:
+                sample_array = np.asarray(states, dtype=np.uint8)
+                if np.array_equal(sample_array, controlled_samples):
+                    raise AssertionError("original samples should reuse provided log values")
+                return log_amplitude(sample_array)
+
+            def exact_statevector(self) -> np.ndarray:
+                return bell
+
+        state = FakeState()
+        stats = observables.renyi2_entropy_statistics(
+            state,
+            subsystem=(0,),
+            n_repeats=2,
+            force_sampled=True,
+        )
+
+        self.assertEqual(state.sample_calls, [0, 1])
+        self.assertAlmostEqual(stats["mean"], np.log(2.0))
 
     def test_renyi2_entropy_prefers_exact_statevector_by_default(self) -> None:
         bell = _bell_state()

@@ -22,7 +22,7 @@ from nqs.models import CNN, FFNN, RBM
 from nqs.operator import Operator, collect_terms, j1_j2, sx_term, szsz_term
 from nqs.optimizer import Adam
 from nqs.runtime_types import states_from_signed_spins, states_to_signed_spins
-from nqs.sampler import MetropolisLocal
+from nqs.sampler import MetropolisLocal, SampleBatch
 from nqs.vmc_setup import build_variational_state, build_vmc_experiment
 
 
@@ -101,6 +101,13 @@ class VMCTests(unittest.TestCase):
     def _make_sampler(self, hilbert: SpinHilbert, seed: int) -> MetropolisLocal:
         return MetropolisLocal(hilbert=hilbert, n_samples=16, n_discard_per_chain=2, n_chains=4, seed=seed)
 
+    def _architecture_cases(self) -> tuple[tuple[str, RBM | FFNN | CNN, SpinHilbert], ...]:
+        return (
+            ("RBM", RBM(alpha=1), SpinHilbert(4)),
+            ("FFNN", FFNN(hidden_dims=(8, 4)), SpinHilbert(4)),
+            ("CNN", CNN(spatial_shape=(2, 2), channels=(4,), kernel_size=(2, 2)), SpinHilbert(4)),
+        )
+
     def _make_driver(self, hilbert: SpinHilbert, seed: int) -> VMC:
         operator = _chain_tfim_operator(hilbert, h=1.0)
         _, _, driver = build_vmc_experiment(
@@ -162,6 +169,173 @@ class VMCTests(unittest.TestCase):
         expected = _reference_local_energies(operator, model, params, samples)
 
         np.testing.assert_allclose(actual, expected)
+
+    def test_bitmap_local_energies_skips_diagonal_connected_log_psi_queries(self) -> None:
+        hilbert = SpinHilbert(4)
+        model = RBM(alpha=1)
+        params = model.init(jax.random.PRNGKey(0), hilbert)
+        backend = ProjectExpectationBackend(
+            model=model,
+            sampler=self._make_sampler(hilbert, seed=16),
+            params=params,
+            exact_backend_max_states=0,
+        )
+        operator = _chain_tfim_operator(hilbert, h=1.0)
+        samples = np.array(
+            [
+                [0, 0, 0, 0],
+                [0, 0, 0, 0],
+                [1, 0, 1, 0],
+            ],
+            dtype=np.uint8,
+        )
+        batched_connected = operator.connected_elements_batched(samples)
+
+        with mock.patch.object(model, "log_psi", wraps=model.log_psi) as log_psi:
+            backend._local_energies(operator, params, jax.numpy.asarray(samples, dtype=jax.numpy.uint8))
+
+        self.assertEqual(log_psi.call_count, 2)
+        original_query_states = np.asarray(log_psi.call_args_list[0].args[1])
+        connected_query_states = np.asarray(log_psi.call_args_list[1].args[1])
+        diagonal_mask = np.all(
+            batched_connected.connected_states == samples[batched_connected.sample_indices],
+            axis=1,
+        )
+        self.assertEqual(original_query_states.shape[0], samples.shape[0])
+        self.assertEqual(
+            connected_query_states.shape[0],
+            int(np.count_nonzero(~diagonal_mask)),
+        )
+
+    def test_sampled_expect_and_grad_matches_reference_fixed_sample_estimator(self) -> None:
+        hilbert = SpinHilbert(4)
+        model = RBM(alpha=1)
+        params = model.init(jax.random.PRNGKey(0), hilbert)
+        backend = ProjectExpectationBackend(
+            model=model,
+            sampler=self._make_sampler(hilbert, seed=15),
+            params=params,
+            exact_backend_max_states=0,
+        )
+        operator = _chain_tfim_operator(hilbert, h=1.0)
+        samples = jax.numpy.asarray(
+            np.array(
+                [
+                    [0, 0, 0, 0],
+                    [1, 0, 1, 0],
+                    [1, 1, 0, 1],
+                    [0, 1, 1, 0],
+                ],
+                dtype=np.uint8,
+            ),
+            dtype=jax.numpy.uint8,
+        )
+        reference_local_energies = jax.numpy.asarray(
+            _reference_local_energies(operator, model, params, np.asarray(samples))
+        )
+
+        def reference_surrogate_loss(current_params: dict[str, object]) -> jax.Array:
+            log_values = jax.numpy.asarray(model.log_psi(current_params, samples))
+            centered_local_energies = reference_local_energies - jax.numpy.mean(reference_local_energies)
+            return 2.0 * jax.numpy.real(
+                jax.numpy.mean(jax.numpy.conj(log_values) * centered_local_energies)
+            )
+
+        expected_energy = np.real(np.asarray(jax.numpy.mean(reference_local_energies)))
+        expected_grads = jax.grad(reference_surrogate_loss)(params)
+
+        sample_batch = SampleBatch(
+            states=samples,
+            log_values=jax.numpy.asarray(model.log_psi(params, samples)),
+        )
+        with mock.patch.object(backend, "sample_with_log_values", return_value=sample_batch):
+            result, actual_grads = backend.expect_and_grad(operator)
+
+        np.testing.assert_allclose(np.asarray(result.mean), expected_energy)
+        expected_leaves = jax.tree_util.tree_leaves(expected_grads)
+        actual_leaves = jax.tree_util.tree_leaves(actual_grads)
+        self.assertEqual(len(actual_leaves), len(expected_leaves))
+        for expected_leaf, actual_leaf in zip(expected_leaves, actual_leaves):
+            np.testing.assert_allclose(np.asarray(actual_leaf), np.asarray(expected_leaf))
+
+    def test_expect_on_sample_batch_matches_reference_fixed_sample_energy(self) -> None:
+        hilbert = SpinHilbert(4)
+        model = RBM(alpha=1)
+        params = model.init(jax.random.PRNGKey(0), hilbert)
+        backend = ProjectExpectationBackend(
+            model=model,
+            sampler=self._make_sampler(hilbert, seed=18),
+            params=params,
+            exact_backend_max_states=0,
+        )
+        operator = _chain_tfim_operator(hilbert, h=1.0)
+        samples = np.array(
+            [
+                [0, 0, 0, 0],
+                [1, 0, 1, 0],
+                [1, 1, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=np.uint8,
+        )
+        sample_batch = SampleBatch(
+            states=jax.numpy.asarray(samples, dtype=jax.numpy.uint8),
+            log_values=jax.numpy.asarray(model.log_psi(params, samples)),
+        )
+
+        actual = backend.expect_on_sample_batch(operator, sample_batch)
+        expected = np.mean(_reference_local_energies(operator, model, params, samples))
+
+        np.testing.assert_allclose(np.asarray(actual.mean), expected)
+
+    def test_sampler_sample_with_params_matches_sample_contract_across_architectures(self) -> None:
+        for label, model, hilbert in self._architecture_cases():
+            with self.subTest(model=label):
+                params = model.init(jax.random.PRNGKey(0), hilbert)
+                reference_sampler = self._make_sampler(hilbert, seed=21)
+                compiled_sampler = self._make_sampler(hilbert, seed=21)
+
+                def log_psi_fn(states: jax.Array) -> jax.Array:
+                    return model.log_psi(params, states)
+
+                reference_first = np.asarray(reference_sampler.sample(log_psi_fn))
+                compiled_first = np.asarray(compiled_sampler.sample_with_params(model.log_psi, params))
+                np.testing.assert_array_equal(compiled_first, reference_first)
+
+                reference_second = np.asarray(reference_sampler.sample(log_psi_fn))
+                compiled_second = np.asarray(compiled_sampler.sample_with_params(model.log_psi, params))
+                np.testing.assert_array_equal(compiled_second, reference_second)
+
+                np.testing.assert_array_equal(
+                    np.asarray(compiled_sampler._chain_states),
+                    np.asarray(reference_sampler._chain_states),
+                )
+
+    def test_sampler_independent_sample_with_params_matches_sample_contract_across_architectures(self) -> None:
+        for label, model, hilbert in self._architecture_cases():
+            with self.subTest(model=label):
+                params = model.init(jax.random.PRNGKey(1), hilbert)
+                reference_sampler = self._make_sampler(hilbert, seed=22)
+                compiled_sampler = self._make_sampler(hilbert, seed=22)
+
+                def log_psi_fn(states: jax.Array) -> jax.Array:
+                    return model.log_psi(params, states)
+
+                for seed_offset in (0, 3):
+                    reference_samples = np.asarray(
+                        reference_sampler.independent_sample(log_psi_fn, seed_offset=seed_offset)
+                    )
+                    compiled_samples = np.asarray(
+                        compiled_sampler.independent_sample_with_params(
+                            model.log_psi,
+                            params,
+                            seed_offset=seed_offset,
+                        )
+                    )
+                    np.testing.assert_array_equal(compiled_samples, reference_samples)
+
+                self.assertIsNone(reference_sampler._chain_states)
+                self.assertIsNone(compiled_sampler._chain_states)
 
     def test_variational_state_and_driver_update_parameters(self) -> None:
         hilbert = SpinHilbert(4)

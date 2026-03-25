@@ -1,26 +1,29 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Number
-from typing import TYPE_CHECKING, Iterable, Protocol, TypeAlias, cast
+from typing import Iterable, Literal, Protocol, TypeAlias
 
 import numpy as np
 import numpy.typing as npt
 
 from .graph import Graph, SquareLattice
-from .hilbert import SpinHilbert, SpinState, StateInput
-
-if TYPE_CHECKING:
-    import netket as nk
-    from netket.utils.types import Array as NetKetArray
-else:
-    NetKetArray = object
+from .hilbert import SpinHilbert, SpinState, SpinStateBatch, StateInput
 
 
 LocalMatrix: TypeAlias = npt.NDArray[np.complex128]
 ConnectedElement: TypeAlias = tuple[SpinState, complex]
 ConnectedElementBits: TypeAlias = tuple[int, complex]
+FastTermKind: TypeAlias = Literal["sx", "szsz", "sxsx", "sysy", "heisenberg"]
+SUPPORTED_FAST_TERM_KINDS = frozenset({"sx", "szsz", "sxsx", "sysy", "heisenberg"})
+
+
+@dataclass(frozen=True)
+class BatchedConnectedElements:
+    sample_indices: npt.NDArray[np.int64]
+    connected_states: SpinStateBatch
+    coefficients: npt.NDArray[np.complex128]
 
 
 class SupportsConnectedElements(Protocol):
@@ -80,24 +83,24 @@ def _pair_sites(i: int, j: int) -> tuple[int, int]:
 
 
 def sx_term(site: int, coefficient: complex = 1.0) -> "LocalTerm":
-    return LocalTerm((site,), sigmax(), coefficient=coefficient)
+    return LocalTerm((site,), sigmax(), coefficient=coefficient, _fast_kind="sx")
 
 
 def szsz_term(i: int, j: int, coefficient: complex = 1.0) -> "LocalTerm":
-    return LocalTerm(_pair_sites(i, j), kron_product(sigmaz(), sigmaz()), coefficient=coefficient)
+    return LocalTerm(_pair_sites(i, j), kron_product(sigmaz(), sigmaz()), coefficient=coefficient, _fast_kind="szsz")
 
 
 def sxsx_term(i: int, j: int, coefficient: complex = 1.0) -> "LocalTerm":
-    return LocalTerm(_pair_sites(i, j), kron_product(sigmax(), sigmax()), coefficient=coefficient)
+    return LocalTerm(_pair_sites(i, j), kron_product(sigmax(), sigmax()), coefficient=coefficient, _fast_kind="sxsx")
 
 
 def sysy_term(i: int, j: int, coefficient: complex = 1.0) -> "LocalTerm":
-    return LocalTerm(_pair_sites(i, j), kron_product(sigmay(), sigmay()), coefficient=coefficient)
+    return LocalTerm(_pair_sites(i, j), kron_product(sigmay(), sigmay()), coefficient=coefficient, _fast_kind="sysy")
 
 
 def heisenberg_term(i: int, j: int, coefficient: complex = 1.0) -> "LocalTerm":
     matrix = kron_product(sigmax(), sigmax()) + kron_product(sigmay(), sigmay()) + kron_product(sigmaz(), sigmaz())
-    return LocalTerm(_pair_sites(i, j), matrix, coefficient=coefficient)
+    return LocalTerm(_pair_sites(i, j), matrix, coefficient=coefficient, _fast_kind="heisenberg")
 
 
 def collect_terms(*term_groups: Iterable["LocalTerm"]) -> list["LocalTerm"]:
@@ -112,6 +115,7 @@ class LocalTerm:
     sites: tuple[int, ...]
     matrix: LocalMatrix
     coefficient: complex = 1.0
+    _fast_kind: FastTermKind | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         matrix = np.asarray(self.matrix, dtype=np.complex128)
@@ -132,6 +136,12 @@ class LocalTerm:
             raise ValueError(
                 f"LocalTerm matrix must have shape {(local_dim, local_dim)} for {len(self.sites)} sites."
             )
+        if self._fast_kind is not None:
+            if self._fast_kind not in SUPPORTED_FAST_TERM_KINDS:
+                raise ValueError(f"Unsupported LocalTerm fast kind: {self._fast_kind!r}.")
+            expected_site_count = 1 if self._fast_kind == "sx" else 2
+            if len(self.sites) != expected_site_count:
+                raise ValueError(f"LocalTerm fast kind {self._fast_kind!r} requires {expected_site_count} site(s).")
 
 
 class Operator:
@@ -161,13 +171,7 @@ class Operator:
         contributions: dict[int, complex] = {}
 
         for term in self.terms:
-            local_index = self._local_index_bits(state_bits, term.sites)
-            column = term.matrix[:, local_index]
-            nonzero_rows = np.flatnonzero(np.abs(column) > 0)
-
-            for row in nonzero_rows:
-                global_index = self._write_local_bits(state_bits, term.sites, int(row))
-                value = complex(term.coefficient * column[row])
+            for global_index, value in self._connected_elements_bits_for_term(state_bits, term):
                 contributions[global_index] = contributions.get(global_index, 0.0) + value
 
         return [
@@ -175,6 +179,48 @@ class Operator:
             for index, value in sorted(contributions.items(), key=lambda item: item[0])
             if value != 0
         ]
+
+    def connected_elements_batched(
+        self,
+        states: StateInput,
+    ) -> BatchedConnectedElements:
+        state_array = np.asarray(states, dtype=np.uint8)
+        if state_array.ndim == 1:
+            state_array = state_array.reshape(1, -1)
+        if state_array.ndim != 2 or state_array.shape[1] != self.hilbert.size:
+            raise ValueError(f"Expected shape (batch, {self.hilbert.size}), got {state_array.shape}.")
+        if np.any((state_array != 0) & (state_array != 1)):
+            raise ValueError("Spin states must only contain 0 or 1.")
+
+        sample_indices = np.arange(state_array.shape[0], dtype=np.int64)
+        connected_states_chunks: list[SpinStateBatch] = []
+        sample_index_chunks: list[npt.NDArray[np.int64]] = []
+        coefficient_chunks: list[npt.NDArray[np.complex128]] = []
+
+        for term in self.terms:
+            term_sample_indices, term_connected_states, term_coefficients = self._connected_elements_batched_for_term(
+                state_array,
+                sample_indices,
+                term,
+            )
+            if term_sample_indices.size == 0:
+                continue
+            connected_states_chunks.append(term_connected_states)
+            sample_index_chunks.append(term_sample_indices)
+            coefficient_chunks.append(term_coefficients)
+
+        if not connected_states_chunks:
+            return BatchedConnectedElements(
+                sample_indices=np.zeros(0, dtype=np.int64),
+                connected_states=np.zeros((0, self.hilbert.size), dtype=np.uint8),
+                coefficients=np.zeros(0, dtype=np.complex128),
+            )
+
+        return BatchedConnectedElements(
+            sample_indices=np.concatenate(sample_index_chunks),
+            connected_states=np.concatenate(connected_states_chunks, axis=0),
+            coefficients=np.concatenate(coefficient_chunks),
+        )
 
     def iter_matrix_elements(self) -> Iterator[tuple[int, int, complex]]:
         """Yield nonzero matrix elements as ``(row, column, value)`` triples."""
@@ -188,24 +234,197 @@ class Operator:
             if any(site < 0 or site >= self.hilbert.size for site in term.sites):
                 raise ValueError("LocalTerm site is outside the Hilbert space.")
 
-    def to_netket(self) -> "nk.operator.LocalOperator":
-        """Convert to NetKet's LocalOperator.
+    def _connected_elements_bits_for_term(
+        self,
+        state_bits: int,
+        term: LocalTerm,
+    ) -> list[ConnectedElementBits]:
+        if term._fast_kind is not None:
+            return self._fast_connected_elements_bits(state_bits, term)
+        return self._matrix_connected_elements_bits(state_bits, term)
 
-        This compatibility helper intentionally performs a lazy NetKet import so
-        the ordinary project-owned runtime path stays NetKet-free. Calling this
-        method still requires NetKet to be installed.
-        """
+    def _fast_connected_elements_bits(
+        self,
+        state_bits: int,
+        term: LocalTerm,
+    ) -> list[ConnectedElementBits]:
+        coefficient = complex(term.coefficient)
+        if coefficient == 0:
+            return []
+        if term._fast_kind == "sx":
+            site = term.sites[0]
+            return [(state_bits ^ (1 << site), coefficient)]
 
+        i, j = term.sites
+        bit_i = (state_bits >> i) & 1
+        bit_j = (state_bits >> j) & 1
+        equal_bits = bit_i == bit_j
+        flipped_bits = state_bits ^ ((1 << i) | (1 << j))
+
+        if term._fast_kind == "szsz":
+            return [(state_bits, coefficient if equal_bits else -coefficient)]
+        if term._fast_kind == "sxsx":
+            return [(flipped_bits, coefficient)]
+        if term._fast_kind == "sysy":
+            return [(flipped_bits, -coefficient if equal_bits else coefficient)]
+        if term._fast_kind == "heisenberg":
+            elements: list[ConnectedElementBits] = [(state_bits, coefficient if equal_bits else -coefficient)]
+            if not equal_bits:
+                elements.append((flipped_bits, 2.0 * coefficient))
+            return elements
+        raise ValueError(f"Unsupported fast-term kind: {term._fast_kind!r}.")
+
+    def _matrix_connected_elements_bits(
+        self,
+        state_bits: int,
+        term: LocalTerm,
+    ) -> list[ConnectedElementBits]:
+        local_index = self._local_index_bits(state_bits, term.sites)
+        column = term.matrix[:, local_index]
+        nonzero_rows = np.flatnonzero(np.abs(column) > 0)
+        return [
+            (
+                self._write_local_bits(state_bits, term.sites, int(row)),
+                complex(term.coefficient * column[row]),
+            )
+            for row in nonzero_rows
+        ]
+
+    def _connected_elements_batched_for_term(
+        self,
+        state_array: SpinStateBatch,
+        sample_indices: npt.NDArray[np.int64],
+        term: LocalTerm,
+    ) -> tuple[npt.NDArray[np.int64], SpinStateBatch, npt.NDArray[np.complex128]]:
+        if term._fast_kind is not None:
+            return self._fast_connected_elements_batched(state_array, sample_indices, term)
+        return self._matrix_connected_elements_batched(state_array, sample_indices, term)
+
+    def _fast_connected_elements_batched(
+        self,
+        state_array: SpinStateBatch,
+        sample_indices: npt.NDArray[np.int64],
+        term: LocalTerm,
+    ) -> tuple[npt.NDArray[np.int64], SpinStateBatch, npt.NDArray[np.complex128]]:
+        coefficient = complex(term.coefficient)
+        if coefficient == 0:
+            return self._empty_batched_connected_elements()
+        if term._fast_kind == "sx":
+            connected_states = state_array.copy()
+            connected_states[:, term.sites[0]] ^= 1
+            coefficients = np.full(sample_indices.shape, coefficient, dtype=np.complex128)
+            return sample_indices.copy(), connected_states, coefficients
+
+        i, j = term.sites
+        equal_mask = state_array[:, i] == state_array[:, j]
+
+        if term._fast_kind == "szsz":
+            coefficients = np.where(equal_mask, coefficient, -coefficient).astype(np.complex128, copy=False)
+            return sample_indices.copy(), state_array.copy(), coefficients
+
+        if term._fast_kind == "sxsx":
+            connected_states = state_array.copy()
+            connected_states[:, i] ^= 1
+            connected_states[:, j] ^= 1
+            coefficients = np.full(sample_indices.shape, coefficient, dtype=np.complex128)
+            return sample_indices.copy(), connected_states, coefficients
+
+        if term._fast_kind == "sysy":
+            connected_states = state_array.copy()
+            connected_states[:, i] ^= 1
+            connected_states[:, j] ^= 1
+            coefficients = np.where(equal_mask, -coefficient, coefficient).astype(np.complex128, copy=False)
+            return sample_indices.copy(), connected_states, coefficients
+
+        if term._fast_kind == "heisenberg":
+            diagonal_states = state_array.copy()
+            diagonal_coefficients = np.where(equal_mask, coefficient, -coefficient).astype(np.complex128, copy=False)
+
+            differing_mask = ~equal_mask
+            if not np.any(differing_mask):
+                return sample_indices.copy(), diagonal_states, diagonal_coefficients
+
+            offdiagonal_indices = sample_indices[differing_mask]
+            offdiagonal_states = state_array[differing_mask].copy()
+            offdiagonal_states[:, i] ^= 1
+            offdiagonal_states[:, j] ^= 1
+            offdiagonal_coefficients = np.full(offdiagonal_indices.shape, 2.0 * coefficient, dtype=np.complex128)
+
+            return (
+                np.concatenate((sample_indices, offdiagonal_indices)),
+                np.concatenate((diagonal_states, offdiagonal_states), axis=0),
+                np.concatenate((diagonal_coefficients, offdiagonal_coefficients)),
+            )
+
+        raise ValueError(f"Unsupported fast-term kind: {term._fast_kind!r}.")
+
+    def _matrix_connected_elements_batched(
+        self,
+        state_array: SpinStateBatch,
+        sample_indices: npt.NDArray[np.int64],
+        term: LocalTerm,
+    ) -> tuple[npt.NDArray[np.int64], SpinStateBatch, npt.NDArray[np.complex128]]:
+        sites = np.asarray(term.sites, dtype=np.intp)
+        local_weights = (1 << np.arange(len(term.sites), dtype=np.int64)).reshape(1, -1)
+        local_columns = np.sum(
+            state_array[:, sites].astype(np.int64, copy=False) * local_weights,
+            axis=1,
+            dtype=np.int64,
+        )
+
+        connected_states_chunks: list[SpinStateBatch] = []
+        sample_index_chunks: list[npt.NDArray[np.int64]] = []
+        coefficient_chunks: list[npt.NDArray[np.complex128]] = []
+
+        for column_index in range(term.matrix.shape[1]):
+            matching_samples = sample_indices[local_columns == column_index]
+            if matching_samples.size == 0:
+                continue
+
+            column = term.matrix[:, column_index]
+            nonzero_rows = np.flatnonzero(np.abs(column) > 0)
+            if nonzero_rows.size == 0:
+                continue
+
+            repeated_states = np.repeat(state_array[matching_samples], nonzero_rows.size, axis=0)
+            repeated_sample_indices = np.repeat(matching_samples, nonzero_rows.size)
+            local_row_bits = ((nonzero_rows[:, None] >> np.arange(len(term.sites))) & 1).astype(np.uint8)
+            repeated_states[:, sites] = np.tile(local_row_bits, (matching_samples.size, 1))
+            repeated_coefficients = np.tile(
+                np.asarray(term.coefficient * column[nonzero_rows], dtype=np.complex128),
+                matching_samples.size,
+            )
+
+            connected_states_chunks.append(repeated_states)
+            sample_index_chunks.append(repeated_sample_indices)
+            coefficient_chunks.append(repeated_coefficients)
+
+        if not connected_states_chunks:
+            return self._empty_batched_connected_elements()
+
+        return (
+            np.concatenate(sample_index_chunks),
+            np.concatenate(connected_states_chunks, axis=0),
+            np.concatenate(coefficient_chunks),
+        )
+
+    def _empty_batched_connected_elements(
+        self,
+    ) -> tuple[npt.NDArray[np.int64], SpinStateBatch, npt.NDArray[np.complex128]]:
+        return (
+            np.zeros(0, dtype=np.int64),
+            np.zeros((0, self.hilbert.size), dtype=np.uint8),
+            np.zeros(0, dtype=np.complex128),
+        )
+
+    def to_netket(self):
         try:
             import netket as nk
         except ImportError as exc:
             raise ImportError("Operator.to_netket() requires NetKet to be installed.") from exc
 
         netket_hilbert = nk.hilbert.Spin(s=0.5, N=self.hilbert.size)
-        operators = cast(
-            list[NetKetArray],
-            [np.asarray(term.matrix, dtype=np.complex128) * term.coefficient for term in self.terms],
-        )
+        operators = [np.asarray(term.matrix, dtype=np.complex128) * term.coefficient for term in self.terms]
         acting_on = [list(term.sites) for term in self.terms]
         return nk.operator.LocalOperator(netket_hilbert, operators=operators, acting_on=acting_on)
 

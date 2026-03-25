@@ -1,5 +1,6 @@
 import sys
 import unittest
+import json
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +37,12 @@ class NotebookSurfaceTests(unittest.TestCase):
 
         self.assertTrue(hasattr(nqs, "graph"))
         self.assertTrue(hasattr(nqs.workflows, "run_vmc_experiment"))
+
+    def test_exercise_3_notebook_does_not_depend_on_saved_exercise_2_csv_artifacts(self) -> None:
+        notebook = json.loads((PROJECT_ROOT / "demos" / "exercise_3.ipynb").read_text(encoding="utf-8"))
+        notebook_source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
+
+        self.assertNotIn("exercise_2_architecture_summary.csv", notebook_source)
 
 
 if __name__ == "__main__":

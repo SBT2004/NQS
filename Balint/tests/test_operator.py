@@ -10,7 +10,7 @@ from nqs.exact_diag import exact_ground_state, exact_ground_state_energy, sparse
 from nqs.exact_diag_debug import dense_debug_operator_matrix
 from nqs.graph import SquareLattice
 from nqs.hilbert import SpinHilbert
-from nqs.operator import LocalTerm, Operator, heisenberg_term, j1_j2, local_matrix, sigmax, sigmaz, tfim
+from nqs.operator import LocalTerm, Operator, heisenberg_term, j1_j2, local_matrix, sigmax, sigmaz, sx_term, tfim
 
 
 class OperatorTests(unittest.TestCase):
@@ -68,6 +68,18 @@ class OperatorTests(unittest.TestCase):
         np.testing.assert_array_equal(connected[0][0], np.array([1, 1, 1], dtype=np.uint8))
         self.assertEqual(connected[0][1], 1.5)
 
+    def test_builtin_sx_term_matches_matrix_fallback_for_all_basis_states(self) -> None:
+        hilbert = SpinHilbert(4)
+        fast_operator = Operator(hilbert, [sx_term(2, coefficient=1.5)])
+        matrix_operator = Operator(hilbert, [LocalTerm((2,), sigmax(), coefficient=1.5)])
+
+        for state_bits in range(hilbert.n_states):
+            with self.subTest(state_bits=state_bits):
+                self.assertEqual(
+                    fast_operator.connected_elements_bits(state_bits),
+                    matrix_operator.connected_elements_bits(state_bits),
+                )
+
     def test_bitmap_connected_elements_match_array_path(self) -> None:
         hilbert = SpinHilbert(4)
         op = Operator(
@@ -91,6 +103,40 @@ class OperatorTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             op.connected_elements_bits(8)
+
+    def test_batched_connected_elements_match_per_sample_contract(self) -> None:
+        hilbert = SpinHilbert(4)
+        op = Operator(
+            hilbert,
+            [
+                LocalTerm((0,), sigmax(), coefficient=2.0),
+                LocalTerm((1, 3), local_matrix([[1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 1]])),
+            ],
+        )
+        samples = np.array(
+            [
+                [1, 0, 0, 1],
+                [0, 1, 1, 0],
+            ],
+            dtype=np.uint8,
+        )
+
+        batched = op.connected_elements_batched(samples)
+        actual = [
+            (int(sample_index), tuple(state.tolist()), complex(value))
+            for sample_index, state, value in zip(
+                batched.sample_indices,
+                batched.connected_states,
+                batched.coefficients,
+            )
+        ]
+        expected = [
+            (sample_index, tuple(connected_state.tolist()), complex(value))
+            for sample_index, sample in enumerate(samples)
+            for connected_state, value in op.connected_elements(sample)
+        ]
+
+        self.assertCountEqual(actual, expected)
 
     def test_reject_repeated_sites(self) -> None:
         with self.assertRaises(ValueError):
@@ -142,6 +188,76 @@ class OperatorTests(unittest.TestCase):
         self.assertEqual(sum(1 for term in operator.terms if term.coefficient == -0.25), 4)
         self.assertEqual(sum(1 for term in operator.terms if len(term.sites) == 2), 4)
         self.assertEqual(sum(1 for term in operator.terms if len(term.sites) == 1), 4)
+
+    def test_heisenberg_fast_path_matches_matrix_fallback_for_all_basis_states(self) -> None:
+        hilbert = SpinHilbert(3)
+        fast_term = heisenberg_term(0, 2, coefficient=0.75)
+        fast_operator = Operator(hilbert, [fast_term])
+        matrix_operator = Operator(hilbert, [LocalTerm(fast_term.sites, fast_term.matrix, coefficient=fast_term.coefficient)])
+
+        for state_bits in range(hilbert.n_states):
+            with self.subTest(state_bits=state_bits):
+                self.assertEqual(
+                    fast_operator.connected_elements_bits(state_bits),
+                    matrix_operator.connected_elements_bits(state_bits),
+                )
+
+    def test_mixed_fast_and_matrix_batched_paths_match_matrix_only_reference(self) -> None:
+        hilbert = SpinHilbert(4)
+        fast_heisenberg = heisenberg_term(1, 2, coefficient=0.5)
+        swap = local_matrix(
+            [
+                [1, 0, 0, 0],
+                [0, 0, 1, 0],
+                [0, 1, 0, 0],
+                [0, 0, 0, 1],
+            ]
+        )
+        fast_operator = Operator(
+            hilbert,
+            [
+                sx_term(0, coefficient=-0.7),
+                fast_heisenberg,
+                LocalTerm((0, 3), swap, coefficient=0.25),
+            ],
+        )
+        matrix_operator = Operator(
+            hilbert,
+            [
+                LocalTerm((0,), sigmax(), coefficient=-0.7),
+                LocalTerm(fast_heisenberg.sites, fast_heisenberg.matrix, coefficient=fast_heisenberg.coefficient),
+                LocalTerm((0, 3), swap, coefficient=0.25),
+            ],
+        )
+        samples = np.array(
+            [
+                [0, 0, 1, 1],
+                [1, 1, 0, 0],
+                [1, 0, 1, 0],
+            ],
+            dtype=np.uint8,
+        )
+
+        fast_batched = fast_operator.connected_elements_batched(samples)
+        matrix_batched = matrix_operator.connected_elements_batched(samples)
+        fast_entries = [
+            (int(sample_index), tuple(state.tolist()), complex(value))
+            for sample_index, state, value in zip(
+                fast_batched.sample_indices,
+                fast_batched.connected_states,
+                fast_batched.coefficients,
+            )
+        ]
+        matrix_entries = [
+            (int(sample_index), tuple(state.tolist()), complex(value))
+            for sample_index, state, value in zip(
+                matrix_batched.sample_indices,
+                matrix_batched.connected_states,
+                matrix_batched.coefficients,
+            )
+        ]
+
+        self.assertCountEqual(fast_entries, matrix_entries)
 
     def test_exact_diag_matrix_matches_operator_action(self) -> None:
         hilbert = SpinHilbert(2)

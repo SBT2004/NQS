@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Sequence, cast
 
@@ -15,10 +17,23 @@ from ..exact_diag import exact_ground_state, solve_sparse_ground_state, sparse_o
 from ..graph import SquareLattice
 from ..hilbert import SpinHilbert
 from ..operator import j1_j2, tfim
+from ..sampler import MetropolisLocal, _metropolis_step
 from ..vmc_setup import build_model, build_variational_state, build_vmc_experiment
 
 if TYPE_CHECKING:
     from ..observables import SupportsSamplingAndLogValue
+
+_EXACT_STATEVECTOR_UNAVAILABLE_MESSAGE = "exact_statevector is only available for small full-summation states."
+
+
+@dataclass
+class _TFIM5x5VMCBenchmarkContext:
+    system: dict[str, Any]
+    model: Any
+    variational_state: Any
+    vmc_driver: Any
+    benchmark_states: jax.Array | None = None
+    benchmark_sample_batch: Any | None = None
 
 
 def half_subsystem(n_sites: int) -> tuple[int, ...]:
@@ -231,6 +246,334 @@ def run_incremental_exercise_1_ed_benchmark(
     return pd.DataFrame(rows)
 
 
+def _block_until_ready(value: Any) -> None:
+    leaves = jax.tree_util.tree_leaves(value)
+    if not leaves and hasattr(value, "block_until_ready"):
+        value.block_until_ready()
+        return
+    for leaf in leaves:
+        if hasattr(leaf, "block_until_ready"):
+            leaf.block_until_ready()
+
+
+def _timed_ms(fn: Any) -> tuple[Any, float]:
+    start = perf_counter()
+    result = fn()
+    _block_until_ready(result)
+    return result, (perf_counter() - start) * 1_000.0
+
+
+def _build_tfim_5x5_vmc_benchmark_context(
+    *,
+    seed: int,
+    model_kwargs: dict[str, Any],
+    learning_rate: float,
+    n_samples: int,
+    n_discard_per_chain: int,
+    n_chains: int,
+    h: float,
+) -> _TFIM5x5VMCBenchmarkContext:
+    system = build_system(
+        lattice_shape=(5, 5),
+        pbc=False,
+        hamiltonian="tfim",
+        h=h,
+    )
+    model, variational_state, vmc_driver = build_vmc_experiment(
+        hilbert=system["hilbert"],
+        operator=system["operator"],
+        learning_rate=learning_rate,
+        seed=seed,
+        n_samples=n_samples,
+        n_discard_per_chain=n_discard_per_chain,
+        n_chains=n_chains,
+        model_name="RBM",
+        model_kwargs=model_kwargs,
+        lattice_shape=(5, 5),
+        exact_backend_max_states=0,
+    )
+    return _TFIM5x5VMCBenchmarkContext(
+        system=system,
+        model=model,
+        variational_state=variational_state,
+        vmc_driver=vmc_driver,
+    )
+
+
+def _prepare_model_eval_states(
+    context: _TFIM5x5VMCBenchmarkContext,
+    *,
+    seed: int,
+    n_states: int,
+) -> None:
+    if context.benchmark_states is not None:
+        return
+    key = jax.random.PRNGKey(seed)
+    context.benchmark_states = jax.random.bernoulli(
+        key,
+        p=0.5,
+        shape=(n_states, context.system["hilbert"].size),
+    ).astype(jnp.uint8)
+
+
+def _prepare_fixed_sample_batch(
+    context: _TFIM5x5VMCBenchmarkContext,
+    *,
+    seed_offset: int,
+) -> None:
+    if context.benchmark_sample_batch is not None:
+        return
+    # Use an independent batch so local-energy diagnostics can be timed
+    # without mutating the stateful sampler benchmark path.
+    context.benchmark_sample_batch = context.variational_state.independent_sample_with_log_values(
+        seed_offset=seed_offset
+    )
+
+
+def _fixed_batch_local_energy_gradient(
+    context: _TFIM5x5VMCBenchmarkContext,
+) -> dict[str, Any]:
+    backend = cast(Any, context.variational_state)._expectation_backend
+    sample_batch = context.benchmark_sample_batch
+    params = context.variational_state.parameters
+    operator = context.system["operator"]
+    if sample_batch is None:
+        raise ValueError("benchmark_sample_batch must be prepared before gradient timing.")
+
+    local_energies = jax.lax.stop_gradient(
+        backend._local_energies(
+            operator,
+            params,
+            sample_batch.states,
+            sample_log_values=sample_batch.log_values,
+        )
+    )
+
+    def surrogate_loss(current_params: Any) -> jax.Array:
+        log_values = jnp.asarray(context.model.log_psi(current_params, sample_batch.states))
+        centered_local_energies = local_energies - jnp.mean(local_energies)
+        return 2.0 * jnp.real(jnp.mean(jnp.conj(log_values) * centered_local_energies))
+
+    grads = jax.grad(surrogate_loss)(params)
+    return {"local_energies": local_energies, "grads": grads}
+
+
+def _measure_tfim_5x5_vmc_stage(
+    *,
+    stage: str,
+    scope: str,
+    prepare_context: Any,
+    run_stage: Any,
+    build_context: Any,
+    warmed_repeats: int,
+) -> dict[str, Any]:
+    context = build_context()
+    prepare_context(context)
+    _, cold_start_ms = _timed_ms(lambda: run_stage(context))
+
+    warmed_runs_ms: list[float] = []
+    for _ in range(warmed_repeats):
+        _, warmed_ms = _timed_ms(lambda: run_stage(context))
+        warmed_runs_ms.append(warmed_ms)
+
+    warmed_mean_ms = float(np.mean(warmed_runs_ms))
+    warmed_min_ms = float(np.min(warmed_runs_ms))
+    return {
+        "stage": stage,
+        "scope": scope,
+        "cold_start_ms": float(cold_start_ms),
+        "warmed_mean_ms": warmed_mean_ms,
+        "warmed_min_ms": warmed_min_ms,
+        "cold_to_warm_ratio": float(cold_start_ms / warmed_mean_ms) if warmed_mean_ms > 0.0 else np.nan,
+        "warmed_repeats": warmed_repeats,
+        "regression_metric": "warmed_mean_ms",
+        "suggested_max_regression_ratio": 1.25,
+    }
+
+
+def run_tfim_5x5_vmc_performance_benchmark(
+    *,
+    rbm_alpha: int = 2,
+    learning_rate: float = 1e-2,
+    n_samples: int = 256,
+    n_discard_per_chain: int = 16,
+    n_chains: int = 8,
+    h: float = 1.0,
+    seed: int = 0,
+    warmed_repeats: int = 3,
+    model_eval_batch_size: int = 256,
+) -> dict[str, Any]:
+    if warmed_repeats <= 0:
+        raise ValueError("warmed_repeats must be positive.")
+    if model_eval_batch_size <= 0:
+        raise ValueError("model_eval_batch_size must be positive.")
+
+    model_kwargs = {"alpha": int(rbm_alpha)}
+
+    def build_context() -> _TFIM5x5VMCBenchmarkContext:
+        return _build_tfim_5x5_vmc_benchmark_context(
+            seed=seed,
+            model_kwargs=model_kwargs,
+            learning_rate=learning_rate,
+            n_samples=n_samples,
+            n_discard_per_chain=n_discard_per_chain,
+            n_chains=n_chains,
+            h=h,
+        )
+
+    stage_rows = [
+        _measure_tfim_5x5_vmc_stage(
+            stage="model_log_psi",
+            scope="fixed state batch",
+            build_context=build_context,
+            prepare_context=lambda context: _prepare_model_eval_states(
+                context,
+                seed=seed + 1_001,
+                n_states=model_eval_batch_size,
+            ),
+            run_stage=lambda context: context.model.log_psi(
+                context.variational_state.parameters,
+                context.benchmark_states,
+            ),
+            warmed_repeats=warmed_repeats,
+        ),
+        _measure_tfim_5x5_vmc_stage(
+            stage="sampler_draw",
+            scope="stateful sampled batch",
+            build_context=build_context,
+            prepare_context=lambda context: None,
+            run_stage=lambda context: context.variational_state.sample_with_log_values(),
+            warmed_repeats=warmed_repeats,
+        ),
+        _measure_tfim_5x5_vmc_stage(
+            stage="local_energy",
+            scope="fixed independent sample batch",
+            build_context=build_context,
+            prepare_context=lambda context: _prepare_fixed_sample_batch(
+                context,
+                seed_offset=30_000,
+            ),
+            run_stage=lambda context: cast(Any, context.variational_state)._expectation_backend._local_energies(
+                context.system["operator"],
+                context.variational_state.parameters,
+                context.benchmark_sample_batch.states,
+                sample_log_values=context.benchmark_sample_batch.log_values,
+            ),
+            warmed_repeats=warmed_repeats,
+        ),
+        _measure_tfim_5x5_vmc_stage(
+            stage="local_energy_gradient",
+            scope="fixed independent sample batch",
+            build_context=build_context,
+            prepare_context=lambda context: _prepare_fixed_sample_batch(
+                context,
+                seed_offset=30_000,
+            ),
+            run_stage=_fixed_batch_local_energy_gradient,
+            warmed_repeats=warmed_repeats,
+        ),
+        _measure_tfim_5x5_vmc_stage(
+            stage="vmc_step",
+            scope="stateful end-to-end sampled step",
+            build_context=build_context,
+            prepare_context=lambda context: None,
+            run_stage=lambda context: context.vmc_driver.step(),
+            warmed_repeats=warmed_repeats,
+        ),
+    ]
+
+    timing_table = pd.DataFrame(stage_rows)
+    regression_gate_table = timing_table[
+        [
+            "stage",
+            "scope",
+            "cold_start_ms",
+            "warmed_mean_ms",
+            "regression_metric",
+            "suggested_max_regression_ratio",
+        ]
+    ].copy()
+    regression_gate_table["gate_description"] = regression_gate_table.apply(
+        lambda row: (
+            f"Flag regressions when future {row['regression_metric']} exceeds "
+            f"{float(row['warmed_mean_ms']):.3f} ms by more than "
+            f"{float(row['suggested_max_regression_ratio']):.2f}x; "
+            "track cold_start_ms separately for compile/tracing drift."
+        ),
+        axis=1,
+    )
+
+    return {
+        "benchmark_label": "tfim_5x5_open_rbm_vmc",
+        "system_label": "tfim_5x5_open",
+        "model_name": "RBM",
+        "model_kwargs": model_kwargs,
+        "lattice_shape": (5, 5),
+        "hamiltonian": "tfim",
+        "pbc": False,
+        "seed": seed,
+        "n_sites": 25,
+        "n_samples": n_samples,
+        "n_discard_per_chain": n_discard_per_chain,
+        "n_chains": n_chains,
+        "learning_rate": learning_rate,
+        "h": h,
+        "model_eval_batch_size": model_eval_batch_size,
+        "warmed_repeats": warmed_repeats,
+        "timing_table": timing_table,
+        "regression_gate_table": regression_gate_table,
+        "notes": [
+            "cold_start_ms is measured on a fresh benchmark context and includes first-call tracing/compilation for that stage.",
+            "warmed_mean_ms and warmed_min_ms are measured by rerunning the same stage on the warmed context.",
+            "local_energy and local_energy_gradient use a fixed independently sampled batch so expectation cost can be compared separately from sampler cost.",
+            "vmc_step measures the full sampled driver.step() path, including sampling, local-energy evaluation, gradient construction, and parameter update.",
+        ],
+    }
+
+
+def format_tfim_5x5_vmc_performance_report(benchmark: dict[str, Any]) -> str:
+    timing_table = cast(pd.DataFrame, benchmark["timing_table"])
+    regression_gate_table = cast(pd.DataFrame, benchmark["regression_gate_table"])
+    timing_lines = timing_table.to_string(
+        index=False,
+        formatters={
+            "cold_start_ms": lambda value: f"{float(value):.3f}",
+            "warmed_mean_ms": lambda value: f"{float(value):.3f}",
+            "warmed_min_ms": lambda value: f"{float(value):.3f}",
+            "cold_to_warm_ratio": lambda value: f"{float(value):.2f}",
+            "suggested_max_regression_ratio": lambda value: f"{float(value):.2f}",
+        },
+    )
+    gate_lines = regression_gate_table.to_string(
+        index=False,
+        formatters={
+            "cold_start_ms": lambda value: f"{float(value):.3f}",
+            "warmed_mean_ms": lambda value: f"{float(value):.3f}",
+            "suggested_max_regression_ratio": lambda value: f"{float(value):.2f}",
+        },
+    )
+    notes = "\n".join(f"- {note}" for note in benchmark["notes"])
+    return "\n".join(
+        [
+            (
+                f"Benchmark: {benchmark['benchmark_label']} "
+                f"(system={benchmark['system_label']}, model={benchmark['model_name']}, "
+                f"alpha={benchmark['model_kwargs']['alpha']}, samples={benchmark['n_samples']}, "
+                f"chains={benchmark['n_chains']}, warmed_repeats={benchmark['warmed_repeats']})"
+            ),
+            "",
+            "Stage timings (ms):",
+            timing_lines,
+            "",
+            "Regression gates:",
+            gate_lines,
+            "",
+            "Notes:",
+            notes,
+        ]
+    )
+
+
 def history_table(history: list[dict[str, Any]]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for step_entry in history:
@@ -250,34 +593,195 @@ def history_table(history: list[dict[str, Any]]) -> pd.DataFrame:
     return frame
 
 
+def _independent_sample_batches_with_log_values(
+    variational_state: SupportsSamplingAndLogValue,
+    *,
+    n_independent_runs: int,
+) -> list[Any]:
+    if n_independent_runs <= 0:
+        raise ValueError("n_independent_runs must be positive.")
+    sampling_state = cast(Any, variational_state)
+    if hasattr(sampling_state, "independent_sample_with_log_values"):
+        return [
+            sampling_state.independent_sample_with_log_values(seed_offset=run_index)
+            for run_index in range(n_independent_runs)
+        ]
+    return [
+        np.asarray(variational_state.independent_sample(seed_offset=run_index), dtype=np.uint8)
+        for run_index in range(n_independent_runs)
+    ]
+
+
+def _renyi2_entropy_statistics_from_sample_batches(
+    variational_state: SupportsSamplingAndLogValue,
+    *,
+    subsystem: tuple[int, ...],
+    sample_batches: Sequence[Any],
+    cutoff: float = 1e-12,
+) -> dict[str, float]:
+    if not sample_batches:
+        raise ValueError("sample_batches must not be empty.")
+
+    estimates: list[float] = []
+    for sample_batch in sample_batches:
+        if hasattr(sample_batch, "states") and hasattr(sample_batch, "log_values"):
+            states = sample_batch.states
+            original_log_values = np.asarray(sample_batch.log_values, dtype=np.complex128)
+        else:
+            states = sample_batch
+            original_log_values = None
+        estimates.append(
+            observables._renyi2_entropy_from_samples(
+                variational_state.log_value,
+                np.asarray(states, dtype=np.uint8),
+                subsystem=subsystem,
+                cutoff=cutoff,
+                original_log_values=original_log_values,
+            )
+        )
+
+    estimate_array = np.asarray(estimates, dtype=np.float64)
+    return {
+        "mean": float(np.mean(estimate_array)),
+        "std": float(np.std(estimate_array, ddof=0)),
+        "n_repeats": float(len(estimates)),
+    }
+
+
+def _standard_error(std: Any, count: Any) -> np.ndarray:
+    std_array = np.asarray(std, dtype=np.float64)
+    count_array = np.asarray(count, dtype=np.float64)
+    sem = np.zeros_like(std_array, dtype=np.float64)
+    valid_mask = np.isfinite(std_array) & np.isfinite(count_array) & (count_array > 0.0)
+    sem[valid_mask] = std_array[valid_mask] / np.sqrt(count_array[valid_mask])
+    return sem
+
+
+def _append_confidence_interval_columns(
+    frame: pd.DataFrame,
+    *,
+    mean_column: str,
+    std_column: str,
+    count_column: str,
+    sem_column: str,
+    ci95_column: str,
+) -> pd.DataFrame:
+    result = frame.copy()
+    sem = _standard_error(result[std_column], result[count_column])
+    mean_values = np.asarray(result[mean_column], dtype=np.float64)
+    sem[~np.isfinite(mean_values)] = np.nan
+    result[sem_column] = sem
+    result[ci95_column] = 1.96 * sem
+    return result
+
+
+def _renyi2_entropy_scaling_from_sample_batch(
+    variational_state: SupportsSamplingAndLogValue,
+    *,
+    sample_batch: np.ndarray,
+    subsystem_limit: int,
+    original_log_values: np.ndarray | None = None,
+    cutoff: float = 1e-12,
+) -> list[float]:
+    flattened_samples = np.asarray(sample_batch, dtype=np.uint8).reshape(-1, sample_batch.shape[-1])
+    if flattened_samples.shape[0] < 2:
+        raise ValueError("at least two samples are required for the SWAP estimator.")
+
+    pair_count = flattened_samples.shape[0] // 2
+    paired_samples = flattened_samples[: 2 * pair_count].reshape(pair_count, 2, flattened_samples.shape[1])
+    original_left = paired_samples[:, 0, :]
+    original_right = paired_samples[:, 1, :]
+    if original_log_values is None:
+        original_log = np.asarray(
+            variational_state.log_value(flattened_samples),
+            dtype=np.complex128,
+        ).reshape(-1)
+    else:
+        original_log = np.asarray(original_log_values, dtype=np.complex128).reshape(-1)
+
+    swapped_batches: list[np.ndarray] = []
+    for subsystem_size in range(1, subsystem_limit + 1):
+        subsystem_sites = np.arange(subsystem_size, dtype=np.intp)
+        swapped_left = original_left.copy()
+        swapped_right = original_right.copy()
+        swapped_left[:, subsystem_sites] = original_right[:, subsystem_sites]
+        swapped_right[:, subsystem_sites] = original_left[:, subsystem_sites]
+        swapped_batches.append(np.concatenate([swapped_left, swapped_right], axis=0))
+
+    swapped_log_values = np.asarray(
+        variational_state.log_value(np.concatenate(swapped_batches, axis=0)),
+        dtype=np.complex128,
+    ).reshape(subsystem_limit, 2 * pair_count)
+    left_log = original_log[0 : 2 * pair_count : 2]
+    right_log = original_log[1 : 2 * pair_count : 2]
+
+    entropies: list[float] = []
+    for subsystem_index in range(subsystem_limit):
+        swapped_log = swapped_log_values[subsystem_index]
+        swapped_left_log = swapped_log[:pair_count]
+        swapped_right_log = swapped_log[pair_count:]
+        estimator = np.exp(swapped_left_log + swapped_right_log - left_log - right_log)
+        swap_value = np.real_if_close(np.mean(estimator))
+        swap_magnitude = float(np.abs(np.mean(estimator)))
+        if np.iscomplexobj(swap_value):
+            imag_part = abs(float(np.imag(swap_value)))
+            if imag_part > cutoff:
+                swap_real = swap_magnitude
+            else:
+                swap_real = float(np.real(swap_value))
+        else:
+            swap_real = float(swap_value)
+        if swap_real <= 0:
+            if swap_magnitude <= cutoff:
+                entropies.append(np.nan)
+                continue
+            swap_real = swap_magnitude
+        entropies.append(float(-np.log(swap_real)))
+    return entropies
+
+
 def sampled_entropy_scaling_summary(
     variational_state: SupportsSamplingAndLogValue,
     n_sites: int,
     max_subsystem_size: int | None = None,
     n_independent_runs: int = 1,
+    sample_batches: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     if n_independent_runs <= 0:
         raise ValueError("n_independent_runs must be positive.")
+    if sample_batches is not None and len(sample_batches) < n_independent_runs:
+        raise ValueError("sample_batches must provide at least n_independent_runs entries.")
     subsystem_limit = max(1, n_sites // 2) if max_subsystem_size is None else max_subsystem_size
     run_tables: list[pd.DataFrame] = []
+    sampling_state = cast(Any, variational_state)
     for run_index in range(n_independent_runs):
-        sample_batch = np.asarray(variational_state.independent_sample(seed_offset=run_index))
+        original_log_values: np.ndarray | None = None
+        if sample_batches is not None:
+            sample_with_values = sample_batches[run_index]
+            if hasattr(sample_with_values, "states") and hasattr(sample_with_values, "log_values"):
+                sample_batch = np.asarray(sample_with_values.states, dtype=np.uint8)
+                original_log_values = np.asarray(sample_with_values.log_values, dtype=np.complex128)
+            else:
+                sample_batch = np.asarray(sample_with_values, dtype=np.uint8)
+        elif hasattr(sampling_state, "independent_sample_with_log_values"):
+            sample_with_values = sampling_state.independent_sample_with_log_values(seed_offset=run_index)
+            sample_batch = np.asarray(sample_with_values.states, dtype=np.uint8)
+            original_log_values = np.asarray(sample_with_values.log_values, dtype=np.complex128)
+        else:
+            sample_batch = np.asarray(variational_state.independent_sample(seed_offset=run_index))
+        renyi2_by_size = _renyi2_entropy_scaling_from_sample_batch(
+            variational_state,
+            sample_batch=sample_batch,
+            subsystem_limit=subsystem_limit,
+            original_log_values=original_log_values,
+        )
         entropy_rows: list[dict[str, Any]] = []
         for subsystem_size in range(1, subsystem_limit + 1):
-            subsystem = tuple(range(subsystem_size))
-            try:
-                renyi2 = observables.renyi2_entropy_from_samples(
-                    variational_state.log_value,
-                    sample_batch,
-                    subsystem=subsystem,
-                )
-            except ValueError:
-                renyi2 = np.nan
             entropy_rows.append(
                 {
                     "subsystem_size": subsystem_size,
                     "run_index": run_index,
-                    "renyi2": renyi2,
+                    "renyi2": renyi2_by_size[subsystem_size - 1],
                 }
             )
         run_tables.append(pd.DataFrame(entropy_rows))
@@ -286,10 +790,22 @@ def sampled_entropy_scaling_summary(
     entropy_table = (
         entropy_samples.groupby("subsystem_size", as_index=False)
         .agg(
+            n_repeats=("run_index", "nunique"),
             renyi2=("renyi2", "mean"),
             renyi2_std=("renyi2", "std"),
         )
         .fillna({"renyi2_std": 0.0})
+    )
+    entropy_table = cast(
+        pd.DataFrame,
+        _append_confidence_interval_columns(
+            cast(pd.DataFrame, entropy_table),
+            mean_column="renyi2",
+            std_column="renyi2_std",
+            count_column="n_repeats",
+            sem_column="renyi2_sem",
+            ci95_column="renyi2_ci95",
+        ),
     )
 
     subsystem_sizes = np.asarray(entropy_table["subsystem_size"], dtype=np.float64)
@@ -348,18 +864,30 @@ def _sampled_final_observable_summary(
     *,
     entropy_n_independent_runs: int,
     observable_n_independent_runs: int = 3,
+    sample_batches: Sequence[Any] | None = None,
 ) -> dict[str, float]:
     if observable_n_independent_runs <= 0:
         raise ValueError("observable_n_independent_runs must be positive.")
+    if sample_batches is not None:
+        required_batches = max(observable_n_independent_runs, entropy_n_independent_runs)
+        if len(sample_batches) < required_batches:
+            raise ValueError("sample_batches must cover both observable and entropy runs.")
 
     abs_magnetization_values: list[float] = []
     nn_correlation_values: list[float] = []
     nn_edges = np.asarray(tuple(graph.iter_neighbor_pairs(1)), dtype=np.intp)
     for run_index in range(observable_n_independent_runs):
-        sample_batch = np.asarray(
-            variational_state.independent_sample(seed_offset=1_000 + run_index),
-            dtype=np.uint8,
-        )
+        if sample_batches is not None:
+            current_sample_batch = sample_batches[run_index]
+            if hasattr(current_sample_batch, "states"):
+                sample_batch = np.asarray(current_sample_batch.states, dtype=np.uint8)
+            else:
+                sample_batch = np.asarray(current_sample_batch, dtype=np.uint8)
+        else:
+            sample_batch = np.asarray(
+                variational_state.independent_sample(seed_offset=1_000 + run_index),
+                dtype=np.uint8,
+            )
         spins_pm1 = 2.0 * sample_batch.astype(np.float64) - 1.0
         per_sample_magnetization = np.mean(spins_pm1, axis=1)
         abs_magnetization_values.append(float(np.mean(np.abs(per_sample_magnetization))))
@@ -367,12 +895,19 @@ def _sampled_final_observable_summary(
 
     subsystem = half_subsystem(graph.n_nodes)
     try:
-        entropy_stats = observables.renyi2_entropy_statistics(
-            variational_state,
-            subsystem=subsystem,
-            n_repeats=entropy_n_independent_runs,
-            force_sampled=True,
-        )
+        if sample_batches is not None:
+            entropy_stats = _renyi2_entropy_statistics_from_sample_batches(
+                variational_state,
+                subsystem=subsystem,
+                sample_batches=sample_batches[:entropy_n_independent_runs],
+            )
+        else:
+            entropy_stats = observables.renyi2_entropy_statistics(
+                variational_state,
+                subsystem=subsystem,
+                n_repeats=entropy_n_independent_runs,
+                force_sampled=True,
+            )
         half_partition_renyi2 = float(entropy_stats["mean"])
         half_partition_renyi2_std = float(entropy_stats["std"])
         entropy_success = 1.0
@@ -427,6 +962,7 @@ def run_vmc_experiment(
     callback_every: int = 5,
     entropy_n_independent_runs: int | None = None,
     entropy_force_sampled: bool = False,
+    compute_exact: bool = True,
     seed: int = 0,
 ) -> dict[str, Any]:
     system = build_system(
@@ -461,7 +997,14 @@ def run_vmc_experiment(
         callback_every=callback_every,
     )
     history_df = history_table(history)
-    exact = exact_observables_summary(system["operator"])
+    if compute_exact:
+        exact = exact_observables_summary(system["operator"])
+    else:
+        exact = {
+            "ground_energy": float("nan"),
+            "half_partition_renyi2": float("nan"),
+            "entropy_table": pd.DataFrame(),
+        }
     final_energy = float(np.asarray(variational_state.energy(system["operator"])))
     independent_run_count = entropy_n_independent_runs
     if independent_run_count is None:
@@ -500,7 +1043,7 @@ def run_vmc_experiment(
         "parameter_count": _count_model_parameters(variational_state.parameters),
         "final_energy": final_energy,
         "final_entropy": final_entropy,
-        "energy_error": final_energy - exact["ground_energy"],
+        "energy_error": final_energy - float(exact["ground_energy"]),
         "entropy_scan_table": entropy_scan["entropy_table"],
         "entropy_scan_samples": entropy_scan["entropy_samples"],
         "entropy_scan_fit": entropy_scan["scaling_fit"],
@@ -509,6 +1052,7 @@ def run_vmc_experiment(
         "sampled_scaling_fit": sampled_entropy["scaling_fit"],
         "entropy_n_independent_runs": independent_run_count,
         "entropy_force_sampled": entropy_force_sampled,
+        "compute_exact": compute_exact,
     }
 
 
@@ -530,29 +1074,409 @@ def _count_model_parameters(params: Any) -> int:
     return int(sum(np.asarray(leaf).size for leaf in jax.tree_util.tree_leaves(params)))
 
 
-def _zero_phase_parameters(params: Any) -> Any:
-    if isinstance(params, dict):
+def _scale_parameter_tree(tree: Any, factor: float) -> Any:
+    return jax.tree_util.tree_map(lambda leaf: jnp.asarray(leaf) * factor, tree)
+
+
+def _transform_initial_parameters(
+    params: Any,
+    *,
+    parameter_scale: float = 1.0,
+    phase_scale: float = 1.0,
+) -> Any:
+    if isinstance(params, Mapping):
         updated: dict[str, Any] = {}
         for key, value in params.items():
             lower_key = key.lower()
             if "phase" in lower_key:
-                updated[key] = jax.tree_util.tree_map(lambda leaf: jnp.zeros_like(leaf), value)
+                updated[key] = _scale_parameter_tree(value, float(parameter_scale) * float(phase_scale))
                 continue
             if key.startswith("Dense_") and isinstance(value, dict):
                 dense_update: dict[str, Any] = {}
                 for leaf_name, leaf in value.items():
                     leaf_array = jnp.asarray(leaf)
                     if leaf_name == "bias" and leaf_array.shape == (2,):
-                        dense_update[leaf_name] = leaf_array.at[1].set(0)
+                        scaled_leaf = leaf_array * float(parameter_scale)
+                        dense_update[leaf_name] = scaled_leaf.at[1].set(
+                            leaf_array[1] * float(parameter_scale) * float(phase_scale)
+                        )
                     elif leaf_name == "kernel" and leaf_array.shape[-1] == 2:
-                        dense_update[leaf_name] = leaf_array.at[..., 1].set(0)
+                        scaled_leaf = leaf_array * float(parameter_scale)
+                        dense_update[leaf_name] = scaled_leaf.at[..., 1].set(
+                            leaf_array[..., 1] * float(parameter_scale) * float(phase_scale)
+                        )
                     else:
-                        dense_update[leaf_name] = _zero_phase_parameters(leaf)
+                        dense_update[leaf_name] = _transform_initial_parameters(
+                            leaf,
+                            parameter_scale=parameter_scale,
+                            phase_scale=phase_scale,
+                        )
                 updated[key] = dense_update
                 continue
-            updated[key] = _zero_phase_parameters(value)
+            updated[key] = _transform_initial_parameters(
+                value,
+                parameter_scale=parameter_scale,
+                phase_scale=phase_scale,
+            )
         return updated
-    return params
+    return jnp.asarray(params) * float(parameter_scale)
+
+
+def _zero_phase_parameters(params: Any) -> Any:
+    return _transform_initial_parameters(params, phase_scale=0.0)
+
+
+def initialize_random_parameters(
+    model: Any,
+    hilbert: SpinHilbert,
+    *,
+    seed: int,
+    parameter_scale: float = 1.0,
+    phase_scale: float = 1.0,
+) -> Any:
+    base_params = model.init(jax.random.PRNGKey(seed), hilbert)
+    return _transform_initial_parameters(
+        base_params,
+        parameter_scale=parameter_scale,
+        phase_scale=phase_scale,
+    )
+
+
+def _initialization_label(
+    *,
+    parameter_scale: float,
+    phase_scale: float,
+    explicit_label: str | None = None,
+) -> str:
+    if explicit_label is not None:
+        return explicit_label
+    labels: list[str] = []
+    if not np.isclose(parameter_scale, 1.0):
+        labels.append(f"scale={parameter_scale:g}")
+    if np.isclose(phase_scale, 0.0):
+        labels.append("real-amplitude")
+    elif not np.isclose(phase_scale, 1.0):
+        labels.append(f"phase_scale={phase_scale:g}")
+    if not labels:
+        return "default"
+    return ", ".join(labels)
+
+
+def _normalize_random_architecture_entry(
+    model_label: str,
+    config: Mapping[str, Any],
+    *,
+    real_amplitude_only: bool,
+) -> dict[str, Any]:
+    if "model_name" in config:
+        model_name = str(config["model_name"])
+        model_kwargs = dict(config.get("model_kwargs", {}))
+        init_config = dict(config.get("initialization", {}))
+        normalized_label = str(config.get("label", model_label))
+    else:
+        model_name = model_label
+        model_kwargs = dict(config)
+        init_config = {}
+        normalized_label = model_label
+
+    if bool(init_config.pop("real_amplitude_only", False)):
+        init_config.setdefault("phase_scale", 0.0)
+    if real_amplitude_only and "phase_scale" not in init_config:
+        init_config["phase_scale"] = 0.0
+
+    parameter_scale = float(init_config.get("parameter_scale", 1.0))
+    phase_scale = float(init_config.get("phase_scale", 1.0))
+    initialization_label = _initialization_label(
+        parameter_scale=parameter_scale,
+        phase_scale=phase_scale,
+        explicit_label=cast(str | None, init_config.get("label")),
+    )
+    return {
+        "model": normalized_label,
+        "architecture_family": model_name,
+        "model_kwargs": model_kwargs,
+        "parameter_scale": parameter_scale,
+        "phase_scale": phase_scale,
+        "initialization_label": initialization_label,
+    }
+
+
+def _is_exact_entropy_unavailable_error(exc: ValueError) -> bool:
+    return str(exc) == _EXACT_STATEVECTOR_UNAVAILABLE_MESSAGE
+
+
+def sampler_acceptance_diagnostics(
+    variational_state: SupportsSamplingAndLogValue,
+    *,
+    n_steps: int | None = None,
+    seed_offset: int = 0,
+) -> dict[str, Any]:
+    sampling_state = cast(Any, variational_state)
+    if not hasattr(sampling_state, "sampler") or not hasattr(sampling_state, "model") or not hasattr(
+        sampling_state,
+        "parameters",
+    ):
+        raise TypeError("variational_state must expose sampler, model, and parameters for diagnostics.")
+    sampler = sampling_state.sampler
+    if not isinstance(sampler, MetropolisLocal):
+        raise TypeError("sampler diagnostics require a MetropolisLocal sampler.")
+
+    total_steps = sampler.n_discard_per_chain + sampler._steps_per_chain() if n_steps is None else int(n_steps)
+    if total_steps <= 0:
+        raise ValueError("n_steps must be positive.")
+
+    rng_key = jax.random.PRNGKey(sampler.seed + seed_offset + 1)
+    init_key, step_key = jax.random.split(rng_key)
+    states = sampler._random_states(init_key)
+    log_values = jnp.asarray(sampling_state.model.log_psi(sampling_state.parameters, states))
+
+    rows: list[dict[str, Any]] = []
+    for step_index in range(total_steps):
+        previous_states = states
+        states, log_values, step_key = _metropolis_step(
+            sampling_state.model.log_psi,
+            sampling_state.parameters,
+            states=states,
+            log_values=log_values,
+            rng_key=step_key,
+            n_chains=sampler.n_chains,
+            n_sites=sampler.hilbert.size,
+        )
+        accepted = np.any(np.asarray(states) != np.asarray(previous_states), axis=1)
+        rows.append(
+            {
+                "step": step_index + 1,
+                "phase": "burn_in" if step_index < sampler.n_discard_per_chain else "sampling",
+                "acceptance_rate": float(np.mean(accepted)),
+            }
+        )
+
+    acceptance_table = pd.DataFrame(rows)
+    summary_table = cast(
+        pd.DataFrame,
+        cast(Any, acceptance_table)
+        .groupby("phase", as_index=False)
+        .agg(
+            steps=("step", "count"),
+            mean_acceptance=("acceptance_rate", "mean"),
+            min_acceptance=("acceptance_rate", "min"),
+            max_acceptance=("acceptance_rate", "max"),
+        )
+        .sort_values(by="phase")
+        .reset_index(drop=True),
+    )
+    config_table = pd.DataFrame(
+        [
+            {"parameter": "n_sites", "value": sampler.hilbert.size},
+            {"parameter": "n_chains", "value": sampler.n_chains},
+            {"parameter": "n_samples", "value": sampler.n_samples},
+            {"parameter": "n_discard_per_chain", "value": sampler.n_discard_per_chain},
+            {"parameter": "steps_per_chain", "value": sampler._steps_per_chain()},
+            {"parameter": "diagnostic_steps", "value": total_steps},
+        ]
+    )
+    return {
+        "config_table": config_table,
+        "acceptance_table": acceptance_table,
+        "summary_table": summary_table,
+        "overall_acceptance": float(acceptance_table["acceptance_rate"].mean()),
+    }
+
+
+def _autocorrelation(values: np.ndarray, max_lag: int) -> tuple[np.ndarray, float]:
+    series = np.asarray(values, dtype=np.float64).reshape(-1)
+    if series.size == 0:
+        raise ValueError("values must contain at least one entry.")
+    if max_lag < 0:
+        raise ValueError("max_lag must be non-negative.")
+
+    centered = series - float(np.mean(series))
+    variance = float(np.dot(centered, centered))
+    if variance <= 0.0:
+        lags = np.arange(min(max_lag, series.size - 1) + 1, dtype=np.int64)
+        autocorr = np.ones_like(lags, dtype=np.float64)
+        return autocorr, 0.5
+
+    lags = np.arange(min(max_lag, series.size - 1) + 1, dtype=np.int64)
+    autocorr = np.empty_like(lags, dtype=np.float64)
+    autocorr[0] = 1.0
+    for lag in lags[1:]:
+        autocorr[lag] = float(np.dot(centered[:-lag], centered[lag:]) / variance)
+
+    tau_int = 0.5
+    for value in autocorr[1:]:
+        if value <= 0.0:
+            break
+        tau_int += float(value)
+    return autocorr, tau_int
+
+
+def sampler_mixing_diagnostics(
+    variational_state: SupportsSamplingAndLogValue,
+    *,
+    n_steps: int | None = None,
+    max_lag: int = 8,
+    seed_offset: int = 0,
+) -> dict[str, Any]:
+    sampling_state = cast(Any, variational_state)
+    if not hasattr(sampling_state, "sampler") or not hasattr(sampling_state, "model") or not hasattr(
+        sampling_state,
+        "parameters",
+    ):
+        raise TypeError("variational_state must expose sampler, model, and parameters for diagnostics.")
+    sampler = sampling_state.sampler
+    if not isinstance(sampler, MetropolisLocal):
+        raise TypeError("sampler diagnostics require a MetropolisLocal sampler.")
+
+    total_steps = sampler.n_discard_per_chain + sampler._steps_per_chain() if n_steps is None else int(n_steps)
+    if total_steps <= 1:
+        raise ValueError("n_steps must be greater than one for mixing diagnostics.")
+
+    rng_key = jax.random.PRNGKey(sampler.seed + seed_offset + 101)
+    init_key, step_key = jax.random.split(rng_key)
+    states = sampler._random_states(init_key)
+    log_values = jnp.asarray(sampling_state.model.log_psi(sampling_state.parameters, states))
+
+    rows: list[dict[str, Any]] = []
+    for step_index in range(total_steps):
+        previous_states = states
+        states, log_values, step_key = _metropolis_step(
+            sampling_state.model.log_psi,
+            sampling_state.parameters,
+            states=states,
+            log_values=log_values,
+            rng_key=step_key,
+            n_chains=sampler.n_chains,
+            n_sites=sampler.hilbert.size,
+        )
+        states_np = np.asarray(states, dtype=np.uint8)
+        accepted = np.any(states_np != np.asarray(previous_states, dtype=np.uint8), axis=1)
+        spin_states = (2.0 * states_np.astype(np.float64)) - 1.0
+        chain_magnetization = np.mean(spin_states, axis=1)
+        rows.append(
+            {
+                "step": step_index + 1,
+                "phase": "burn_in" if step_index < sampler.n_discard_per_chain else "sampling",
+                "acceptance_rate": float(np.mean(accepted)),
+                "mean_magnetization": float(np.mean(chain_magnetization)),
+                "abs_mean_magnetization": float(np.mean(np.abs(chain_magnetization))),
+                "unique_state_fraction": float(np.unique(states_np, axis=0).shape[0] / sampler.n_chains),
+            }
+        )
+
+    trace_table = pd.DataFrame(rows)
+    sampling_trace = trace_table.loc[trace_table["phase"] == "sampling"].reset_index(drop=True)
+    autocorr_values, tau_int = _autocorrelation(
+        sampling_trace["mean_magnetization"].to_numpy(),
+        max_lag=max_lag,
+    )
+    autocorrelation_table = pd.DataFrame(
+        {
+            "lag": np.arange(len(autocorr_values), dtype=np.int64),
+            "mean_magnetization_autocorrelation": autocorr_values,
+        }
+    )
+    summary_table = pd.DataFrame(
+        [
+            {"metric": "sampling_steps", "value": float(len(sampling_trace))},
+            {"metric": "mean_sampling_acceptance", "value": float(sampling_trace["acceptance_rate"].mean())},
+            {"metric": "mean_abs_magnetization", "value": float(sampling_trace["abs_mean_magnetization"].mean())},
+            {"metric": "mean_unique_state_fraction", "value": float(sampling_trace["unique_state_fraction"].mean())},
+            {"metric": "integrated_autocorrelation_time", "value": float(tau_int)},
+        ]
+    )
+    return {
+        "trace_table": trace_table,
+        "autocorrelation_table": autocorrelation_table,
+        "summary_table": summary_table,
+        "integrated_autocorrelation_time": float(tau_int),
+    }
+
+
+def swap_estimator_diagnostics(
+    variational_state: SupportsSamplingAndLogValue,
+    n_sites: int,
+    *,
+    max_subsystem_size: int | None = None,
+    n_independent_runs: int = 1,
+    sample_batches: Sequence[Any] | None = None,
+) -> dict[str, Any]:
+    sampled = sampled_entropy_scaling_summary(
+        variational_state,
+        n_sites=n_sites,
+        max_subsystem_size=max_subsystem_size,
+        n_independent_runs=n_independent_runs,
+        sample_batches=sample_batches,
+    )
+    subsystem_limit = max(1, n_sites // 2) if max_subsystem_size is None else max_subsystem_size
+    try:
+        exact = renyi2_subsystem_scan_summary(
+            variational_state,
+            n_sites=n_sites,
+            max_subsystem_size=subsystem_limit,
+            n_independent_runs=1,
+            force_sampled=False,
+        )
+        exact_available = True
+        exact_table = exact["entropy_table"].copy().rename(columns={"renyi2": "exact_renyi2"})
+    except ValueError as exc:
+        if not _is_exact_entropy_unavailable_error(exc):
+            raise
+        exact_available = False
+        exact_table = pd.DataFrame(
+            {
+                "subsystem_size": np.arange(1, subsystem_limit + 1, dtype=np.int64),
+                "exact_renyi2": np.full(subsystem_limit, np.nan, dtype=np.float64),
+            }
+        )
+
+    diagnostics_table = sampled["entropy_table"].copy().rename(
+        columns={"renyi2": "sampled_renyi2", "renyi2_std": "sampled_renyi2_std"}
+    )
+    diagnostics_table = diagnostics_table.merge(exact_table[["subsystem_size", "exact_renyi2"]], on="subsystem_size")
+    diagnostics_table["exact_available"] = exact_available
+    diagnostics_table["abs_error"] = np.abs(diagnostics_table["sampled_renyi2"] - diagnostics_table["exact_renyi2"])
+    diagnostics_table["within_one_sigma"] = (
+        diagnostics_table["exact_available"]
+        & np.isfinite(diagnostics_table["abs_error"])
+        & (diagnostics_table["abs_error"] <= (diagnostics_table["sampled_renyi2_std"] + 1e-8))
+    )
+    finite_abs_error = diagnostics_table["abs_error"].to_numpy(dtype=np.float64)
+    has_finite_abs_error = bool(np.isfinite(finite_abs_error).any())
+    summary_table = pd.DataFrame(
+        [
+            {"metric": "exact_available", "value": float(exact_available)},
+            {
+                "metric": "valid_subsystem_fraction",
+                "value": float(np.mean(np.isfinite(diagnostics_table["sampled_renyi2"]))),
+            },
+            {
+                "metric": "mean_abs_error",
+                "value": float(np.nanmean(finite_abs_error))
+                if exact_available and has_finite_abs_error
+                else np.nan,
+            },
+            {
+                "metric": "max_abs_error",
+                "value": float(np.nanmax(finite_abs_error))
+                if exact_available and has_finite_abs_error
+                else np.nan,
+            },
+            {
+                "metric": "subsystems_within_one_sigma_fraction",
+                "value": float(np.mean(diagnostics_table["within_one_sigma"]))
+                if exact_available
+                else np.nan,
+            },
+        ]
+    )
+    return {
+        "diagnostics_table": diagnostics_table,
+        "summary_table": summary_table,
+        "sampled_entropy_table": sampled["entropy_table"],
+        "sampled_entropy_samples": sampled["entropy_samples"],
+        "exact_available": exact_available,
+    }
 
 
 def renyi2_subsystem_scan_summary(
@@ -846,6 +1770,7 @@ def run_random_architecture_study(
     entropy_n_independent_runs: int = 4,
     max_subsystem_size: int | None = None,
     real_amplitude_only: bool = False,
+    include_support_diagnostics: bool = False,
 ) -> dict[str, Any]:
     if not architecture_configs:
         raise ValueError("architecture_configs must not be empty.")
@@ -868,16 +1793,28 @@ def run_random_architecture_study(
     trial_rows: list[dict[str, Any]] = []
     entropy_scan_rows: list[pd.DataFrame] = []
     trial_results: list[dict[str, Any]] = []
-    for model_name, model_kwargs in architecture_configs.items():
+    for raw_model_label, raw_config in architecture_configs.items():
+        entry = _normalize_random_architecture_entry(
+            raw_model_label,
+            raw_config,
+            real_amplitude_only=real_amplitude_only,
+        )
+        model_name = str(entry["architecture_family"])
+        model_label = str(entry["model"])
+        model_kwargs = dict(cast(dict[str, Any], entry["model_kwargs"]))
         model = build_model(
             model_name=model_name,
             model_kwargs=model_kwargs,
             lattice_shape=lattice_shape,
         )
         for seed in seed_values:
-            params = model.init(jax.random.PRNGKey(seed), hilbert)
-            if real_amplitude_only:
-                params = _zero_phase_parameters(params)
+            params = initialize_random_parameters(
+                model,
+                hilbert,
+                seed=seed,
+                parameter_scale=float(entry["parameter_scale"]),
+                phase_scale=float(entry["phase_scale"]),
+            )
             variational_state = build_variational_state(
                 model=model,
                 hilbert=hilbert,
@@ -887,28 +1824,70 @@ def run_random_architecture_study(
                 n_chains=n_chains,
                 params=params,
             )
-            exact_entropy_scan = renyi2_subsystem_scan_summary(
-                variational_state,
-                hilbert.size,
-                max_subsystem_size=subsystem_limit,
-                n_independent_runs=1,
-                force_sampled=False,
-            )
+            exact_entropy_scan: dict[str, Any] | None
+            try:
+                exact_entropy_scan = renyi2_subsystem_scan_summary(
+                    variational_state,
+                    hilbert.size,
+                    max_subsystem_size=subsystem_limit,
+                    n_independent_runs=1,
+                    force_sampled=False,
+                )
+                exact_available = True
+            except ValueError as exc:
+                if not _is_exact_entropy_unavailable_error(exc):
+                    raise
+                exact_entropy_scan = None
+                exact_available = False
             sampled_entropy_scan = sampled_entropy_scaling_summary(
                 variational_state,
                 hilbert.size,
                 max_subsystem_size=subsystem_limit,
                 n_independent_runs=entropy_n_independent_runs,
             )
+            if include_support_diagnostics:
+                diagnostic_batch = variational_state.independent_sample_with_log_values(seed_offset=10_000 + seed)
+                diagnostic_states = np.asarray(diagnostic_batch.states, dtype=np.uint8)
+                diagnostic_log_values = np.asarray(diagnostic_batch.log_values, dtype=np.complex128).reshape(-1)
+                acceptance_diagnostics = sampler_acceptance_diagnostics(variational_state, seed_offset=20_000 + seed)
+                mixing_diagnostics = sampler_mixing_diagnostics(variational_state, seed_offset=30_000 + seed)
+                diagnostic_log_amplitude_std = float(np.std(np.real(diagnostic_log_values), ddof=0))
+                diagnostic_phase_std = float(np.std(np.imag(diagnostic_log_values), ddof=0))
+                diagnostic_unique_state_fraction = float(
+                    np.unique(diagnostic_states.reshape(diagnostic_states.shape[0], -1), axis=0).shape[0]
+                    / diagnostic_states.shape[0]
+                )
+                diagnostic_acceptance = float(acceptance_diagnostics["overall_acceptance"])
+                diagnostic_tau_int = float(mixing_diagnostics["integrated_autocorrelation_time"])
+            else:
+                diagnostic_log_amplitude_std = np.nan
+                diagnostic_phase_std = np.nan
+                diagnostic_unique_state_fraction = np.nan
+                diagnostic_acceptance = np.nan
+                diagnostic_tau_int = np.nan
             parameter_count = _count_model_parameters(variational_state.parameters)
 
             sampled_table = sampled_entropy_scan["entropy_table"].copy()
-            sampled_table["model"] = model_name
+            sampled_table["model"] = model_label
+            sampled_table["architecture_family"] = model_name
             sampled_table["seed"] = seed
             sampled_table["parameter_count"] = parameter_count
-            exact_table = exact_entropy_scan["entropy_table"].copy().rename(
-                columns={"renyi2": "exact_renyi2", "renyi2_std": "exact_renyi2_std"}
-            )
+            sampled_table["parameter_scale"] = float(entry["parameter_scale"])
+            sampled_table["phase_scale"] = float(entry["phase_scale"])
+            sampled_table["initialization_label"] = str(entry["initialization_label"])
+            sampled_table["exact_available"] = exact_available
+            if exact_entropy_scan is None:
+                exact_table = pd.DataFrame(
+                    {
+                        "subsystem_size": sampled_table["subsystem_size"].to_numpy(),
+                        "exact_renyi2": np.full(len(sampled_table), np.nan, dtype=np.float64),
+                        "exact_renyi2_std": np.full(len(sampled_table), np.nan, dtype=np.float64),
+                    }
+                )
+            else:
+                exact_table = exact_entropy_scan["entropy_table"].copy().rename(
+                    columns={"renyi2": "exact_renyi2", "renyi2_std": "exact_renyi2_std"}
+                )
             sampled_table = sampled_table.merge(
                 exact_table[["subsystem_size", "exact_renyi2", "exact_renyi2_std"]],
                 on="subsystem_size",
@@ -918,29 +1897,53 @@ def run_random_architecture_study(
 
             max_partition = int(sampled_table["subsystem_size"].max())
             half_partition_row = sampled_table.loc[sampled_table["subsystem_size"] == max_partition].iloc[0]
+            valid_entropy_points = int(np.count_nonzero(np.isfinite(sampled_table["renyi2"])))
             trial_rows.append(
                 {
-                    "model": model_name,
+                    "model": model_label,
+                    "architecture_family": model_name,
                     "seed": seed,
                     "parameter_count": parameter_count,
+                    "parameter_scale": float(entry["parameter_scale"]),
+                    "phase_scale": float(entry["phase_scale"]),
+                    "initialization_label": str(entry["initialization_label"]),
+                    "exact_available": exact_available,
                     "max_subsystem_size": max_partition,
+                    "valid_entropy_points": valid_entropy_points,
+                    "valid_entropy_fraction": valid_entropy_points / max_partition if max_partition > 0 else np.nan,
                     "half_partition_exact_renyi2": float(half_partition_row["exact_renyi2"]),
                     "half_partition_sampled_renyi2": float(half_partition_row["renyi2"]),
                     "half_partition_sampled_std": float(half_partition_row["renyi2_std"]),
                     "sampled_minus_exact": float(half_partition_row["renyi2"] - half_partition_row["exact_renyi2"]),
+                    "diagnostic_log_amplitude_std": diagnostic_log_amplitude_std,
+                    "diagnostic_phase_std": diagnostic_phase_std,
+                    "diagnostic_unique_state_fraction": diagnostic_unique_state_fraction,
+                    "diagnostic_acceptance": diagnostic_acceptance,
+                    "diagnostic_tau_int": diagnostic_tau_int,
                 }
             )
             trial_results.append(
                 {
                     "model_name": model_name,
+                    "model_label": model_label,
                     "model_kwargs": dict(model_kwargs),
                     "seed": seed,
                     "parameter_count": parameter_count,
+                    "parameter_scale": float(entry["parameter_scale"]),
+                    "phase_scale": float(entry["phase_scale"]),
+                    "initialization_label": str(entry["initialization_label"]),
                     "system": system,
-                    "exact_entropy_scan_table": exact_entropy_scan["entropy_table"],
+                    "exact_available": exact_available,
+                    "exact_entropy_scan_table": None if exact_entropy_scan is None else exact_entropy_scan["entropy_table"],
                     "sampled_entropy_scan_table": sampled_entropy_scan["entropy_table"],
                     "sampled_entropy_scan_samples": sampled_entropy_scan["entropy_samples"],
                     "real_amplitude_only": real_amplitude_only,
+                    "include_support_diagnostics": include_support_diagnostics,
+                    "diagnostic_log_amplitude_std": diagnostic_log_amplitude_std,
+                    "diagnostic_phase_std": diagnostic_phase_std,
+                    "diagnostic_unique_state_fraction": diagnostic_unique_state_fraction,
+                    "diagnostic_acceptance": diagnostic_acceptance,
+                    "diagnostic_tau_int": diagnostic_tau_int,
                 }
             )
 
@@ -948,9 +1951,12 @@ def run_random_architecture_study(
     entropy_scan_table = cast(
         Any,
         pd.concat(entropy_scan_rows, ignore_index=True)
-        .groupby(["model", "subsystem_size"], as_index=False)
+        .groupby(["model", "architecture_family", "initialization_label", "subsystem_size"], as_index=False)
         .agg(
             parameter_count=("parameter_count", "first"),
+            parameter_scale=("parameter_scale", "first"),
+            phase_scale=("phase_scale", "first"),
+            exact_available=("exact_available", "max"),
             n_trials=("seed", "nunique"),
             exact_renyi2=("exact_renyi2", "mean"),
             sampled_renyi2=("renyi2", "mean"),
@@ -959,20 +1965,52 @@ def run_random_architecture_study(
         )
         .fillna({"sampled_renyi2_std": 0.0, "estimator_std": 0.0})
     ).sort_values(by=["model", "subsystem_size"]).reset_index(drop=True)
+    entropy_scan_table = cast(
+        pd.DataFrame,
+        _append_confidence_interval_columns(
+            cast(pd.DataFrame, entropy_scan_table),
+            mean_column="sampled_renyi2",
+            std_column="sampled_renyi2_std",
+            count_column="n_trials",
+            sem_column="sampled_renyi2_sem",
+            ci95_column="sampled_renyi2_ci95",
+        ),
+    )
     summary_table = cast(
         Any,
-        trial_table.groupby("model", as_index=False)
+        trial_table.groupby(["model", "architecture_family", "initialization_label"], as_index=False)
         .agg(
             parameter_count=("parameter_count", "first"),
+            parameter_scale=("parameter_scale", "first"),
+            phase_scale=("phase_scale", "first"),
+            exact_available=("exact_available", "max"),
             n_trials=("seed", "nunique"),
+            valid_entropy_points=("valid_entropy_points", "mean"),
+            valid_entropy_fraction=("valid_entropy_fraction", "mean"),
             half_partition_exact_renyi2=("half_partition_exact_renyi2", "mean"),
             half_partition_sampled_renyi2=("half_partition_sampled_renyi2", "mean"),
             half_partition_sampled_std=("half_partition_sampled_renyi2", "std"),
             estimator_std=("half_partition_sampled_std", "mean"),
             sampled_minus_exact=("sampled_minus_exact", "mean"),
+            diagnostic_log_amplitude_std=("diagnostic_log_amplitude_std", "mean"),
+            diagnostic_phase_std=("diagnostic_phase_std", "mean"),
+            diagnostic_unique_state_fraction=("diagnostic_unique_state_fraction", "mean"),
+            diagnostic_acceptance=("diagnostic_acceptance", "mean"),
+            diagnostic_tau_int=("diagnostic_tau_int", "mean"),
         )
         .fillna({"half_partition_sampled_std": 0.0, "estimator_std": 0.0})
     ).sort_values(by="model").reset_index(drop=True)
+    summary_table = cast(
+        pd.DataFrame,
+        _append_confidence_interval_columns(
+            cast(pd.DataFrame, summary_table),
+            mean_column="half_partition_sampled_renyi2",
+            std_column="half_partition_sampled_std",
+            count_column="n_trials",
+            sem_column="half_partition_sampled_sem",
+            ci95_column="half_partition_sampled_ci95",
+        ),
+    )
     return {
         "system": system,
         "trial_table": trial_table,
@@ -981,6 +2019,7 @@ def run_random_architecture_study(
         "trial_results": trial_results,
         "entropy_n_independent_runs": entropy_n_independent_runs,
         "real_amplitude_only": real_amplitude_only,
+        "include_support_diagnostics": include_support_diagnostics,
     }
 
 
@@ -1072,7 +2111,6 @@ def run_non_ed_vmc_benchmark(
                 callback_runtime_seconds += perf_counter() - callback_start
                 return result
 
-            benchmark_start = perf_counter()
             run_start = perf_counter()
             history = vmc_driver.run(
                 n_iter,
@@ -1080,9 +2118,25 @@ def run_non_ed_vmc_benchmark(
                 callback_every=callback_every,
             )
             run_runtime_seconds = perf_counter() - run_start
-            runtime_seconds = max(0.0, run_runtime_seconds - callback_runtime_seconds)
+            training_runtime_seconds = max(0.0, run_runtime_seconds - callback_runtime_seconds)
             history_df = history_table(history)
-            final_energy = float(np.asarray(variational_state.energy(system["operator"])))
+            postprocessing_start = perf_counter()
+            observable_summary_runs = 3
+            shared_diagnostic_samples = _independent_sample_batches_with_log_values(
+                variational_state,
+                n_independent_runs=max(observable_summary_runs, entropy_n_independent_runs),
+            )
+            if hasattr(variational_state, "energy_on_sample_batch"):
+                final_energy = float(
+                    np.asarray(
+                        cast(Any, variational_state).energy_on_sample_batch(
+                            system["operator"],
+                            shared_diagnostic_samples[0],
+                        )
+                    )
+                )
+            else:
+                final_energy = float(np.asarray(variational_state.energy(system["operator"])))
             final_row: dict[str, Any] = {
                 column: np.nan
                 for column in history_df.columns
@@ -1109,12 +2163,15 @@ def run_non_ed_vmc_benchmark(
             history_df["seed"] = seed
             history_frames.append(history_df)
 
+            entropy_scan_start = perf_counter()
             entropy_scan = sampled_entropy_scaling_summary(
                 variational_state,
                 hilbert.size,
                 max_subsystem_size=max_entropy_subsystem_size,
                 n_independent_runs=entropy_n_independent_runs,
+                sample_batches=shared_diagnostic_samples[:entropy_n_independent_runs],
             )
+            entropy_scan_runtime_seconds = perf_counter() - entropy_scan_start
             entropy_table = entropy_scan["entropy_table"].copy()
             entropy_table["benchmark_label"] = benchmark_label
             entropy_table["model"] = model_name
@@ -1130,12 +2187,24 @@ def run_non_ed_vmc_benchmark(
                 variational_state,
                 system["graph"],
                 entropy_n_independent_runs=entropy_n_independent_runs,
+                observable_n_independent_runs=observable_summary_runs,
+                sample_batches=shared_diagnostic_samples,
             )
-            total_runtime_seconds = perf_counter() - benchmark_start
+            postprocessing_runtime_seconds = max(
+                0.0,
+                perf_counter() - postprocessing_start - entropy_scan_runtime_seconds,
+            )
+            report_runtime_seconds = (
+                callback_runtime_seconds
+                + postprocessing_runtime_seconds
+                + entropy_scan_runtime_seconds
+            )
+            total_runtime_seconds = training_runtime_seconds + report_runtime_seconds
 
             summary_rows.append(
                 {
                     "benchmark_label": benchmark_label,
+                    "benchmark_mode": "sampled",
                     "model": model_name,
                     "model_kwargs": model_kwargs,
                     "system_label": system_label,
@@ -1146,9 +2215,12 @@ def run_non_ed_vmc_benchmark(
                     "parameter_count": parameter_count,
                     "final_energy": final_energy,
                     "final_energy_per_site": final_energy / hilbert.size,
-                    "runtime_seconds": runtime_seconds,
-                    "mean_step_time_seconds": runtime_seconds / max(1, n_iter),
+                    "training_runtime_seconds": training_runtime_seconds,
+                    "mean_training_step_time_seconds": training_runtime_seconds / max(1, n_iter),
                     "callback_runtime_seconds": callback_runtime_seconds,
+                    "postprocessing_runtime_seconds": postprocessing_runtime_seconds,
+                    "entropy_scan_runtime_seconds": entropy_scan_runtime_seconds,
+                    "report_runtime_seconds": report_runtime_seconds,
                     "total_runtime_seconds": total_runtime_seconds,
                     "history_points": len(history_df),
                     "valid_entropy_points": valid_entropy_points,
@@ -1159,6 +2231,7 @@ def run_non_ed_vmc_benchmark(
             benchmark_results.append(
                 {
                     "benchmark_label": benchmark_label,
+                    "benchmark_mode": "sampled",
                     "model_name": model_name,
                     "model_kwargs": model_kwargs,
                     "system_label": system_label,
@@ -1170,7 +2243,12 @@ def run_non_ed_vmc_benchmark(
                     "entropy_scan_table": entropy_table,
                     "parameter_count": parameter_count,
                     "final_energy": final_energy,
-                    "runtime_seconds": runtime_seconds,
+                    "training_runtime_seconds": training_runtime_seconds,
+                    "callback_runtime_seconds": callback_runtime_seconds,
+                    "postprocessing_runtime_seconds": postprocessing_runtime_seconds,
+                    "entropy_scan_runtime_seconds": entropy_scan_runtime_seconds,
+                    "report_runtime_seconds": report_runtime_seconds,
+                    "total_runtime_seconds": total_runtime_seconds,
                     "trend_metrics": trend_metrics,
                     "observable_metrics": observable_metrics,
                 }
@@ -1204,6 +2282,7 @@ def run_hamiltonian_system_size_sweep(
     callback_every: int = 5,
     entropy_n_independent_runs: int | None = None,
     entropy_force_sampled: bool = False,
+    compute_exact: bool = True,
     base_seed: int = 0,
 ) -> dict[str, Any]:
     if not sweep_points:
@@ -1245,6 +2324,7 @@ def run_hamiltonian_system_size_sweep(
             callback_every=callback_every,
             entropy_n_independent_runs=entropy_n_independent_runs,
             entropy_force_sampled=entropy_force_sampled,
+            compute_exact=compute_exact,
             seed=seed,
             **point,
         )
@@ -1292,6 +2372,7 @@ def run_hamiltonian_system_size_sweep(
         "model_name": model_name,
         "model_kwargs": dict(model_kwargs),
         "entropy_force_sampled": entropy_force_sampled,
+        "compute_exact": compute_exact,
     }
 
 
@@ -1363,21 +2444,43 @@ def run_ghz_bonus_workflow(
         model_kwargs=model_kwargs,
         lattice_shape=lattice_shape,
     )
-    entropy_logger = observables.entropy_callback(subsystem=half_subsystem(hilbert.size))
+    entropy_logger = observables.entropy_callback(
+        subsystem=half_subsystem(hilbert.size),
+        force_sampled=True,
+    )
     history = vmc_driver.run(
         n_iter,
         callback=entropy_logger,
         callback_every=callback_every,
     )
     history_df = history_table(history)
-    final_statevector = np.asarray(variational_state.exact_statevector(), dtype=np.complex128)
-    metrics = _ghz_state_metrics(final_statevector)
+    final_energy = float(np.asarray(variational_state.energy(system["operator"])))
+    final_statevector: np.ndarray | None
+    target_statevector: np.ndarray | None
+    try:
+        final_statevector = np.asarray(variational_state.exact_statevector(), dtype=np.complex128)
+    except ValueError:
+        final_statevector = None
+        target_statevector = None
+        logged_entropy = history_df["renyi2_entropy"].dropna()
+        metrics = {
+            "ghz_fidelity": float("nan"),
+            "cat_sector_weight": float("nan"),
+            "half_partition_renyi2": float(logged_entropy.iloc[-1]) if not logged_entropy.empty else float("nan"),
+            "used_exact_statevector": 0.0,
+        }
+    else:
+        target_statevector = _ghz_statevector(hilbert.size)
+        metrics = {
+            **_ghz_state_metrics(final_statevector),
+            "used_exact_statevector": 1.0,
+        }
     return {
         "system": system,
         "history": history,
         "history_df": history_df,
-        "final_energy": float(np.asarray(variational_state.energy(system["operator"]))),
-        "target_statevector": _ghz_statevector(hilbert.size),
+        "final_energy": final_energy,
+        "target_statevector": target_statevector,
         "final_statevector": final_statevector,
         "ghz_metrics": metrics,
     }
